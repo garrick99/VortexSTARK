@@ -153,8 +153,8 @@ impl MerkleTree {
     }
 
     /// Build Merkle root from 4-column SoA data (SecureColumn / QM31).
-    /// Fuses leaf hash + first node level into a single kernel, saving one
-    /// kernel launch and eliminating the full leaf hash buffer.
+    /// Uses single-kernel shared-memory reduction for small trees (≤ 2048 leaves),
+    /// or fused leaf+merge + multi-launch tree for larger trees.
     pub fn commit_root_soa4(
         col0: &DeviceBuffer<u32>,
         col1: &DeviceBuffer<u32>,
@@ -164,7 +164,24 @@ impl MerkleTree {
     ) -> [u32; HASH_WORDS] {
         let n_leaves = 1u32 << log_n_leaves;
 
-        // Fused leaf hash + first node merge: produces n_leaves/2 parent hashes
+        // Small tree: single kernel does everything (leaf hash + full tree reduction)
+        if n_leaves <= 2048 {
+            let mut d_root = DeviceBuffer::<u32>::alloc(HASH_WORDS);
+            unsafe {
+                ffi::cuda_merkle_commit_small_soa4(
+                    col0.as_ptr(), col1.as_ptr(),
+                    col2.as_ptr(), col3.as_ptr(),
+                    d_root.as_mut_ptr(),
+                    n_leaves,
+                );
+            }
+            let host = d_root.to_host();
+            let mut root = [0u32; HASH_WORDS];
+            root.copy_from_slice(&host[..HASH_WORDS]);
+            return root;
+        }
+
+        // Large tree: fused leaf+merge kernel + multi-launch node hashing
         let mut current_size = n_leaves / 2;
         let mut current = DeviceBuffer::<u32>::alloc((current_size as usize) * HASH_WORDS);
         unsafe {
