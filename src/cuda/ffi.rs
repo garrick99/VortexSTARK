@@ -100,6 +100,23 @@ unsafe extern "C" {
     );
 }
 
+// Constraint evaluation kernels
+unsafe extern "C" {
+    pub fn cuda_fibonacci_quotient(
+        trace: *const u32,
+        out0: *mut u32, out1: *mut u32, out2: *mut u32, out3: *mut u32,
+        alpha: *const u32, // [4] on host
+        n: u32,
+    );
+
+    pub fn cuda_zero_pad(
+        src: *const u32,
+        dst: *mut u32,
+        src_n: u32,
+        dst_n: u32,
+    );
+}
+
 // Blake2s Merkle tree kernels
 unsafe extern "C" {
     pub fn cuda_merkle_hash_leaves(

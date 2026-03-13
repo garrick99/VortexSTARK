@@ -53,6 +53,34 @@ impl M31 {
         let r = self.0 << 1;
         Self(if r >= P { r - P } else { r })
     }
+
+    /// Batch inverse using Montgomery's trick: O(n) muls + 1 inverse.
+    pub fn batch_inverse(values: &[Self]) -> Vec<Self> {
+        let n = values.len();
+        if n == 0 {
+            return vec![];
+        }
+
+        // Prefix products
+        let mut prefix = Vec::with_capacity(n);
+        prefix.push(values[0]);
+        for i in 1..n {
+            prefix.push(prefix[i - 1] * values[i]);
+        }
+
+        // Invert the total product
+        let mut inv = prefix[n - 1].inverse();
+        let mut result = vec![Self::ZERO; n];
+
+        // Unwind
+        for i in (1..n).rev() {
+            result[i] = prefix[i - 1] * inv;
+            inv = inv * values[i];
+        }
+        result[0] = inv;
+
+        result
+    }
 }
 
 impl Add for M31 {

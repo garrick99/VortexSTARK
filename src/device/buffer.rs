@@ -97,6 +97,24 @@ impl<T> DeviceBuffer<T> {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+
+    /// Copy device data into a new device buffer (D2D).
+    pub fn clone_device(&self) -> Self {
+        let new_buf = Self::alloc(self.len);
+        if self.len > 0 {
+            let bytes = self.len * std::mem::size_of::<T>();
+            let err = unsafe {
+                ffi::cudaMemcpy(
+                    new_buf.ptr as *mut c_void,
+                    self.ptr as *const c_void,
+                    bytes,
+                    ffi::MEMCPY_D2D,
+                )
+            };
+            assert!(err == 0, "cudaMemcpy D2D failed: error {err}");
+        }
+        new_buf
+    }
 }
 
 impl<T> Drop for DeviceBuffer<T> {

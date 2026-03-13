@@ -7,7 +7,7 @@
 use crate::circle::Coset;
 use crate::cuda::ffi;
 use crate::device::DeviceBuffer;
-use crate::field::QM31;
+use crate::field::{M31, QM31};
 
 /// A secure (QM31) column in SoA layout: 4 separate M31 columns.
 pub struct SecureColumn {
@@ -63,34 +63,30 @@ impl SecureColumn {
 }
 
 /// Compute fold twiddles for fold_line: inverse x-coordinates of domain points.
-/// Domain points are in bit-reversed order; we take pairs (2i, 2i+1).
+/// Uses batch inverse (Montgomery's trick) for O(n) instead of O(n log p).
 fn compute_fold_line_twiddles(domain: &Coset) -> Vec<u32> {
-    let n = domain.size();
-    let half_n = n / 2;
+    let half_n = domain.size() / 2;
     let log_size = domain.log_size;
+    let points = domain.all_points();
 
-    (0..half_n)
-        .map(|i| {
-            let bit_rev_idx = bit_reverse(i << 1, log_size);
-            let point = domain.at(bit_rev_idx);
-            point.x.inverse().0
-        })
-        .collect()
+    let xs: Vec<M31> = (0..half_n)
+        .map(|i| points[bit_reverse(i << 1, log_size)].x)
+        .collect();
+
+    M31::batch_inverse(&xs).iter().map(|v| v.0).collect()
 }
 
 /// Compute fold twiddles for fold_circle: inverse y-coordinates.
 fn compute_fold_circle_twiddles(domain: &Coset) -> Vec<u32> {
-    let n = domain.size();
-    let half_n = n / 2;
+    let half_n = domain.size() / 2;
     let log_size = domain.log_size;
+    let points = domain.all_points();
 
-    (0..half_n)
-        .map(|i| {
-            let bit_rev_idx = bit_reverse(i << 1, log_size);
-            let point = domain.at(bit_rev_idx);
-            point.y.inverse().0
-        })
-        .collect()
+    let ys: Vec<M31> = (0..half_n)
+        .map(|i| points[bit_reverse(i << 1, log_size)].y)
+        .collect();
+
+    M31::batch_inverse(&ys).iter().map(|v| v.0).collect()
 }
 
 /// FRI fold_circle_into_line on GPU.

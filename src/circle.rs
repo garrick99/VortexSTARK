@@ -127,6 +127,19 @@ impl Coset {
     pub fn at(&self, i: usize) -> CirclePoint {
         self.initial.mul(self.step.mul_scalar(i as u32))
     }
+
+    /// Generate all coset points at once using sequential multiplication.
+    /// O(n) circle multiplications instead of O(n log n).
+    pub fn all_points(&self) -> Vec<CirclePoint> {
+        let n = self.size();
+        let mut points = Vec::with_capacity(n);
+        let mut current = self.initial;
+        for _ in 0..n {
+            points.push(current);
+            current = current.mul(self.step);
+        }
+        points
+    }
 }
 
 /// Compute twiddle factors for the Circle NTT.
@@ -147,8 +160,8 @@ pub fn compute_twiddles(
     let mut layer_offsets = Vec::new();
     let mut layer_sizes = Vec::new();
 
-    // Compute all domain points
-    let points: Vec<CirclePoint> = (0..n).map(|i| coset.at(i)).collect();
+    // Compute all domain points (O(n) via sequential multiplication)
+    let points = coset.all_points();
 
     // Circle twiddles: y-coordinates of first half of points
     let half_n = n / 2;
@@ -193,12 +206,20 @@ pub fn compute_itwiddles(
 ) -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>) {
     let (mut line_twids, mut circle_twids, offsets, sizes) = compute_twiddles(coset);
 
-    // Invert all twiddle values
-    for t in &mut line_twids {
-        *t = M31(*t).inverse().0;
+    // Batch invert all twiddle values (Montgomery's trick: 1 inverse + O(n) muls)
+    if !line_twids.is_empty() {
+        let vals: Vec<M31> = line_twids.iter().map(|&t| M31(t)).collect();
+        let invs = M31::batch_inverse(&vals);
+        for (t, inv) in line_twids.iter_mut().zip(invs.iter()) {
+            *t = inv.0;
+        }
     }
-    for t in &mut circle_twids {
-        *t = M31(*t).inverse().0;
+    if !circle_twids.is_empty() {
+        let vals: Vec<M31> = circle_twids.iter().map(|&t| M31(t)).collect();
+        let invs = M31::batch_inverse(&vals);
+        for (t, inv) in circle_twids.iter_mut().zip(invs.iter()) {
+            *t = inv.0;
+        }
     }
 
     (line_twids, circle_twids, offsets, sizes)

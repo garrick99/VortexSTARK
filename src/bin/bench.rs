@@ -113,6 +113,9 @@ fn main() {
         let a = kraken_stark::field::M31(1);
         let b = kraken_stark::field::M31(1);
 
+        // Warmup
+        let _ = kraken_stark::prover::prove(a, b, log_n);
+
         let t0 = Instant::now();
         let proof = kraken_stark::prover::prove(a, b, log_n);
         let prove_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -123,6 +126,14 @@ fn main() {
             proof.fri_commitments.len(),
         );
     }
+
+    // Detailed timing for log_n=16
+    println!("\n--- Detailed Profile (log_n=16) ---");
+    let _ = kraken_stark::prover::prove_timed(
+        kraken_stark::field::M31(1),
+        kraken_stark::field::M31(1),
+        16,
+    );
 
     println!("\nDone.");
 }
