@@ -2,7 +2,7 @@
 //!
 //! Wraps the CUDA circle_ntt kernels with twiddle factor management.
 
-use crate::circle::{compute_itwiddles, compute_twiddles, Coset};
+use crate::circle::{compute_both_twiddles_gpu, Coset};
 use crate::cuda::ffi;
 use crate::device::DeviceBuffer;
 
@@ -24,19 +24,19 @@ pub struct TwiddleCache {
 impl TwiddleCache {
     /// Build and upload twiddle factors for a coset of given log_size.
     pub fn new(coset: &Coset) -> Self {
-        let (line_twids, circle_twids, offsets, sizes) = compute_twiddles(coset);
-        let (iline_twids, icircle_twids, ioffsets, isizes) = compute_itwiddles(coset);
+        let (d_twiddles, d_circle_twids, d_itwiddles, d_circle_itwids, offsets, sizes) =
+            compute_both_twiddles_gpu(coset);
 
         Self {
             log_n: coset.log_size,
-            d_twiddles: DeviceBuffer::from_host(&line_twids),
-            d_circle_twids: DeviceBuffer::from_host(&circle_twids),
-            layer_offsets: offsets,
-            layer_sizes: sizes,
-            d_itwiddles: DeviceBuffer::from_host(&iline_twids),
-            d_circle_itwids: DeviceBuffer::from_host(&icircle_twids),
-            ilayer_offsets: ioffsets,
-            ilayer_sizes: isizes,
+            d_twiddles,
+            d_circle_twids,
+            layer_offsets: offsets.clone(),
+            layer_sizes: sizes.clone(),
+            d_itwiddles,
+            d_circle_itwids,
+            ilayer_offsets: offsets,
+            ilayer_sizes: sizes,
         }
     }
 }

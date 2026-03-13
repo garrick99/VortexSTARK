@@ -7,7 +7,7 @@
 use crate::circle::Coset;
 use crate::cuda::ffi;
 use crate::device::DeviceBuffer;
-use crate::field::{M31, QM31};
+use crate::field::QM31;
 
 /// A secure (QM31) column in SoA layout: 4 separate M31 columns.
 pub struct SecureColumn {
@@ -62,49 +62,66 @@ impl SecureColumn {
     }
 }
 
-/// Compute fold twiddles for fold_line: inverse x-coordinates of domain points.
-/// Uses batch inverse (Montgomery's trick) for O(n) instead of O(n log p).
-fn compute_fold_line_twiddles(domain: &Coset) -> Vec<u32> {
+/// Compute fold twiddles on GPU: domain points → batch inverse, all on device.
+/// `extract_y`: false = x-coordinates (line fold), true = y-coordinates (circle fold).
+fn compute_fold_twiddles_gpu(domain: &Coset, extract_y: bool) -> DeviceBuffer<u32> {
     let half_n = domain.size() / 2;
-    let log_size = domain.log_size;
-    let points = domain.all_points();
+    let n = domain.size();
+    let log_n = domain.log_size;
 
-    let xs: Vec<M31> = (0..half_n)
-        .map(|i| points[bit_reverse(i << 1, log_size)].x)
-        .collect();
+    // GPU kernel computes bit-reversed domain points (half_n values)
+    let mut d_sources = DeviceBuffer::<u32>::alloc(half_n);
+    unsafe {
+        ffi::cuda_compute_fold_twiddle_sources(
+            domain.initial.x.0,
+            domain.initial.y.0,
+            domain.step.x.0,
+            domain.step.y.0,
+            d_sources.as_mut_ptr(),
+            n as u32,
+            log_n,
+            if extract_y { 1 } else { 0 },
+        );
+    }
 
-    M31::batch_inverse(&xs).iter().map(|v| v.0).collect()
+    // GPU batch inverse (Montgomery's trick on device)
+    let mut d_result = DeviceBuffer::<u32>::alloc(half_n);
+    unsafe {
+        ffi::cuda_batch_inverse_m31(d_sources.as_ptr(), d_result.as_mut_ptr(), half_n as u32);
+        ffi::cuda_device_sync();
+    }
+
+    d_result
 }
 
-/// Compute fold twiddles for fold_circle: inverse y-coordinates.
-fn compute_fold_circle_twiddles(domain: &Coset) -> Vec<u32> {
-    let half_n = domain.size() / 2;
-    let log_size = domain.log_size;
-    let points = domain.all_points();
+/// Precompute FRI fold twiddles for all layers on GPU. Returns device buffers
+/// for circle fold (index 0) and line folds (indices 1..n).
+pub fn precompute_fri_twiddles(start_log_size: u32, stop_log_size: u32) -> Vec<DeviceBuffer<u32>> {
+    let mut result = Vec::new();
 
-    let ys: Vec<M31> = (0..half_n)
-        .map(|i| points[bit_reverse(i << 1, log_size)].y)
-        .collect();
+    // Circle fold twiddles (first layer) — inverse y-coordinates
+    let domain = Coset::half_coset(start_log_size);
+    result.push(compute_fold_twiddles_gpu(&domain, true));
 
-    M31::batch_inverse(&ys).iter().map(|v| v.0).collect()
+    // Line fold twiddles (subsequent layers) — inverse x-coordinates
+    let mut log_size = start_log_size - 1;
+    while log_size > stop_log_size {
+        let domain = Coset::half_coset(log_size);
+        result.push(compute_fold_twiddles_gpu(&domain, false));
+        log_size -= 1;
+    }
+
+    result
 }
 
-/// FRI fold_circle_into_line on GPU.
-///
-/// First FRI step: folds a circle evaluation (n QM31 elements in SoA)
-/// into a line evaluation (n/2 QM31 elements in SoA).
-///
-/// dst[i] += (f0+f1) + alpha * inv_y[i] * (f0-f1)
-/// where f0 = src[2i], f1 = src[2i+1]
-pub fn fold_circle_into_line(
+/// FRI fold_circle_into_line on GPU with pre-uploaded twiddles.
+pub fn fold_circle_into_line_with_twiddles(
     dst: &mut SecureColumn,
     src: &SecureColumn,
     alpha: QM31,
-    domain: &Coset,
+    d_twiddles: &DeviceBuffer<u32>,
 ) {
     let half_n = src.len / 2;
-    let twiddles = compute_fold_circle_twiddles(domain);
-    let d_twiddles = DeviceBuffer::from_host(&twiddles);
 
     let alpha_arr = alpha.to_u32_array();
     let alpha_sq = alpha * alpha;
@@ -129,21 +146,13 @@ pub fn fold_circle_into_line(
     }
 }
 
-/// FRI fold_line on GPU.
-///
-/// Subsequent FRI steps: folds a line evaluation (n QM31 elements in SoA)
-/// into a line evaluation (n/2 QM31 elements in SoA).
-///
-/// result[i] = (f0+f1) + alpha * inv_x[i] * (f0-f1)
-pub fn fold_line(
+/// FRI fold_line on GPU with pre-uploaded twiddles.
+pub fn fold_line_with_twiddles(
     eval: &SecureColumn,
     alpha: QM31,
-    domain: &Coset,
+    d_twiddles: &DeviceBuffer<u32>,
 ) -> SecureColumn {
     let half_n = eval.len / 2;
-    let twiddles = compute_fold_line_twiddles(domain);
-    let d_twiddles = DeviceBuffer::from_host(&twiddles);
-
     let alpha_arr = alpha.to_u32_array();
 
     let mut out = SecureColumn {
@@ -171,18 +180,38 @@ pub fn fold_line(
     out
 }
 
-/// Bit-reverse an index within a given number of bits.
-fn bit_reverse(mut val: usize, bits: u32) -> usize {
-    let mut result = 0usize;
-    for _ in 0..bits {
-        result = (result << 1) | (val & 1);
-        val >>= 1;
-    }
-    result
+/// FRI fold_circle_into_line on GPU.
+///
+/// First FRI step: folds a circle evaluation (n QM31 elements in SoA)
+/// into a line evaluation (n/2 QM31 elements in SoA).
+///
+/// dst[i] += (f0+f1) + alpha * inv_y[i] * (f0-f1)
+/// where f0 = src[2i], f1 = src[2i+1]
+pub fn fold_circle_into_line(
+    dst: &mut SecureColumn,
+    src: &SecureColumn,
+    alpha: QM31,
+    domain: &Coset,
+) {
+    let d_twiddles = compute_fold_twiddles_gpu(domain, true);
+    fold_circle_into_line_with_twiddles(dst, src, alpha, &d_twiddles);
 }
 
-/// Add FRI FFI bindings
-/// Update cuda/ffi.rs with fold_line_soa and fold_circle_into_line_soa
+/// FRI fold_line on GPU.
+///
+/// Subsequent FRI steps: folds a line evaluation (n QM31 elements in SoA)
+/// into a line evaluation (n/2 QM31 elements in SoA).
+///
+/// result[i] = (f0+f1) + alpha * inv_x[i] * (f0-f1)
+pub fn fold_line(
+    eval: &SecureColumn,
+    alpha: QM31,
+    domain: &Coset,
+) -> SecureColumn {
+    let d_twiddles = compute_fold_twiddles_gpu(domain, false);
+    fold_line_with_twiddles(eval, alpha, &d_twiddles)
+}
+
 
 #[cfg(test)]
 mod tests {

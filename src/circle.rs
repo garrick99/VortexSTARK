@@ -3,6 +3,8 @@
 //! The circle group is { (x,y) : x^2 + y^2 = 1 } over M31.
 //! The generator has order 2^31, matching the M31 field structure.
 
+use crate::cuda::ffi;
+use crate::device::DeviceBuffer;
 use crate::field::M31;
 
 /// A point on the circle x^2 + y^2 = 1 over M31.
@@ -142,7 +144,7 @@ impl Coset {
     }
 }
 
-/// Compute twiddle factors for the Circle NTT.
+/// Compute twiddle factors for the Circle NTT on GPU.
 /// Returns (line_twiddles, circle_twiddles, layer_offsets, layer_sizes).
 ///
 /// Line twiddles: for each layer l (l = n_line_layers-1 down to 0),
@@ -156,73 +158,187 @@ pub fn compute_twiddles(
     let n = coset.size();
     let n_line_layers = if log_n > 0 { log_n - 1 } else { 0 };
 
-    let mut line_twiddles = Vec::new();
+    // Compute all coset points on GPU in parallel
+    let mut d_x = DeviceBuffer::<u32>::alloc(n);
+    let mut d_y = DeviceBuffer::<u32>::alloc(n);
+    unsafe {
+        ffi::cuda_compute_coset_points(
+            coset.initial.x.0, coset.initial.y.0,
+            coset.step.x.0, coset.step.y.0,
+            d_x.as_mut_ptr(), d_y.as_mut_ptr(),
+            n as u32,
+        );
+        ffi::cuda_device_sync();
+    }
+
+    // Circle twiddles: y-coordinates of first half
+    let half_n = n / 2;
+    let all_y = d_y.to_host();
+    let circle_twids: Vec<u32> = all_y[..half_n].to_vec();
+    drop(d_y);
+
+    // Build line twiddles entirely on GPU — no per-layer downloads
+    // Total twiddle count: n/2 + n/4 + ... + 1 = n - 1
+    let total_twiddles = n - 1;
+    let mut d_line_twiddles = DeviceBuffer::<u32>::alloc(total_twiddles);
+
     let mut layer_offsets = Vec::new();
     let mut layer_sizes = Vec::new();
-
-    // Compute all domain points (O(n) via sequential multiplication)
-    let points = coset.all_points();
-
-    // Circle twiddles: y-coordinates of first half of points
-    let half_n = n / 2;
-    let circle_twids: Vec<u32> = (0..half_n).map(|i| points[i].y.0).collect();
-
-    // Line layers: process from the perspective of the butterfly structure
-    // After the circle layer, we work with x-coordinates only.
-    // For each line layer, twiddles are the x-coordinates at the appropriate stride.
-
-    // Build line twiddles layer by layer
-    // Layer l has 2^(log_n - l - 2) twiddle values (half the pairs at that level)
-    let mut xs: Vec<M31> = points.iter().map(|p| p.x).collect();
+    let mut d_current = d_x;
+    let mut current_n = n;
+    let mut write_offset = 0usize;
 
     for _layer in 0..n_line_layers as usize {
-        let layer_size = xs.len() / 2;
-        let offset = line_twiddles.len();
-        layer_offsets.push(offset as u32);
+        let layer_size = current_n / 2;
+        layer_offsets.push(write_offset as u32);
         layer_sizes.push(layer_size as u32);
 
-        // Twiddle for this layer: x-coordinates of the first element of each pair
-        for i in 0..layer_size {
-            line_twiddles.push(xs[2 * i].0);
+        // Extract even-indexed x values as twiddles + squash for next layer, all on GPU
+        let mut d_squashed = DeviceBuffer::<u32>::alloc(layer_size);
+        unsafe {
+            ffi::cuda_extract_and_squash(
+                d_current.as_ptr(),
+                d_line_twiddles.as_mut_ptr().add(write_offset),
+                d_squashed.as_mut_ptr(),
+                layer_size as u32,
+            );
         }
 
-        // Squash: x' = 2*x^2 - 1 (circle doubling x-coordinate)
-        let new_xs: Vec<M31> = (0..layer_size)
-            .map(|i| {
-                let x = xs[2 * i];
-                x * x + x * x - M31::ONE
-            })
-            .collect();
-        xs = new_xs;
+        write_offset += layer_size;
+        d_current = d_squashed;
+        current_n = layer_size;
     }
+    unsafe { ffi::cuda_device_sync(); }
+
+    // Single download of the complete twiddle array
+    let line_twiddles = d_line_twiddles.to_host();
 
     (line_twiddles, circle_twids, layer_offsets, layer_sizes)
 }
 
-/// Compute inverse twiddle factors.
+/// Compute inverse twiddle factors using GPU batch inverse.
 /// For iNTT, twiddles need to be the inverses of the forward twiddles.
 pub fn compute_itwiddles(
     coset: &Coset,
 ) -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>) {
-    let (mut line_twids, mut circle_twids, offsets, sizes) = compute_twiddles(coset);
+    let (line_twids, circle_twids, offsets, sizes) = compute_twiddles(coset);
 
-    // Batch invert all twiddle values (Montgomery's trick: 1 inverse + O(n) muls)
-    if !line_twids.is_empty() {
-        let vals: Vec<M31> = line_twids.iter().map(|&t| M31(t)).collect();
-        let invs = M31::batch_inverse(&vals);
-        for (t, inv) in line_twids.iter_mut().zip(invs.iter()) {
-            *t = inv.0;
-        }
-    }
-    if !circle_twids.is_empty() {
-        let vals: Vec<M31> = circle_twids.iter().map(|&t| M31(t)).collect();
-        let invs = M31::batch_inverse(&vals);
-        for (t, inv) in circle_twids.iter_mut().zip(invs.iter()) {
-            *t = inv.0;
-        }
+    // Batch invert on GPU (Montgomery's trick)
+    let inv_line = gpu_batch_inverse(&line_twids);
+    let inv_circle = gpu_batch_inverse(&circle_twids);
+
+    (inv_line, inv_circle, offsets, sizes)
+}
+
+/// Compute both forward and inverse twiddles, returning DeviceBuffers (no host round-trip).
+pub fn compute_both_twiddles_gpu(
+    coset: &Coset,
+) -> (DeviceBuffer<u32>, DeviceBuffer<u32>, DeviceBuffer<u32>, DeviceBuffer<u32>, Vec<u32>, Vec<u32>) {
+    let log_n = coset.log_size;
+    let n = coset.size();
+    let n_line_layers = if log_n > 0 { log_n - 1 } else { 0 };
+
+    // Compute all coset points on GPU in parallel
+    let mut d_x = DeviceBuffer::<u32>::alloc(n);
+    let mut d_y = DeviceBuffer::<u32>::alloc(n);
+    unsafe {
+        ffi::cuda_compute_coset_points(
+            coset.initial.x.0, coset.initial.y.0,
+            coset.step.x.0, coset.step.y.0,
+            d_x.as_mut_ptr(), d_y.as_mut_ptr(),
+            n as u32,
+        );
+        ffi::cuda_device_sync();
     }
 
-    (line_twids, circle_twids, offsets, sizes)
+    // Circle twiddles: y-coordinates of first half (stay on device)
+    let half_n = n / 2;
+    let mut d_circle_twids = DeviceBuffer::<u32>::alloc(half_n);
+    unsafe {
+        ffi::cudaMemcpy(
+            d_circle_twids.as_mut_ptr() as *mut std::ffi::c_void,
+            d_y.as_ptr() as *const std::ffi::c_void,
+            half_n * std::mem::size_of::<u32>(),
+            ffi::MEMCPY_D2D,
+        );
+    }
+    drop(d_y);
+
+    // Build line twiddles on GPU
+    let total_twiddles = n - 1;
+    let mut d_line_twiddles = DeviceBuffer::<u32>::alloc(total_twiddles);
+
+    let mut layer_offsets = Vec::new();
+    let mut layer_sizes = Vec::new();
+    let mut d_current = d_x;
+    let mut current_n = n;
+    let mut write_offset = 0usize;
+
+    for _layer in 0..n_line_layers as usize {
+        let layer_size = current_n / 2;
+        layer_offsets.push(write_offset as u32);
+        layer_sizes.push(layer_size as u32);
+
+        let mut d_squashed = DeviceBuffer::<u32>::alloc(layer_size);
+        unsafe {
+            ffi::cuda_extract_and_squash(
+                d_current.as_ptr(),
+                d_line_twiddles.as_mut_ptr().add(write_offset),
+                d_squashed.as_mut_ptr(),
+                layer_size as u32,
+            );
+        }
+
+        write_offset += layer_size;
+        d_current = d_squashed;
+        current_n = layer_size;
+    }
+    unsafe { ffi::cuda_device_sync(); }
+
+    // Inverse twiddles via GPU batch inverse (device → device)
+    let mut d_iline_twiddles = DeviceBuffer::<u32>::alloc(total_twiddles);
+    let mut d_icircle_twids = DeviceBuffer::<u32>::alloc(half_n);
+    unsafe {
+        ffi::cuda_batch_inverse_m31(
+            d_line_twiddles.as_ptr(), d_iline_twiddles.as_mut_ptr(), total_twiddles as u32,
+        );
+        ffi::cuda_batch_inverse_m31(
+            d_circle_twids.as_ptr(), d_icircle_twids.as_mut_ptr(), half_n as u32,
+        );
+        ffi::cuda_device_sync();
+    }
+
+    // Returns: (fwd_line, fwd_circle, inv_line, inv_circle, offsets, sizes)
+    (d_line_twiddles, d_circle_twids, d_iline_twiddles, d_icircle_twids, layer_offsets, layer_sizes)
+}
+
+/// Compute both forward and inverse twiddles in one pass (avoids double coset computation).
+pub fn compute_both_twiddles(
+    coset: &Coset,
+) -> ((Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>), (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>)) {
+    let (line_twids, circle_twids, offsets, sizes) = compute_twiddles(coset);
+
+    let inv_line = gpu_batch_inverse(&line_twids);
+    let inv_circle = gpu_batch_inverse(&circle_twids);
+
+    (
+        (line_twids, circle_twids, offsets.clone(), sizes.clone()),
+        (inv_line, inv_circle, offsets, sizes),
+    )
+}
+
+/// Batch inverse via GPU kernel.
+fn gpu_batch_inverse(values: &[u32]) -> Vec<u32> {
+    if values.is_empty() {
+        return Vec::new();
+    }
+    let d_input = DeviceBuffer::from_host(values);
+    let mut d_output = DeviceBuffer::<u32>::alloc(values.len());
+    unsafe {
+        ffi::cuda_batch_inverse_m31(d_input.as_ptr(), d_output.as_mut_ptr(), values.len() as u32);
+        ffi::cuda_device_sync();
+    }
+    d_output.to_host()
 }
 
 #[cfg(test)]

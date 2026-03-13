@@ -127,13 +127,15 @@ fn main() {
         );
     }
 
-    // Detailed timing for log_n=16
-    println!("\n--- Detailed Profile (log_n=16) ---");
-    let _ = kraken_stark::prover::prove_timed(
-        kraken_stark::field::M31(1),
-        kraken_stark::field::M31(1),
-        16,
-    );
+    // Detailed timing for log_n=16 and log_n=20
+    for profile_log_n in [16u32, 20] {
+        println!("\n--- Detailed Profile (log_n={profile_log_n}) ---");
+        let _ = kraken_stark::prover::prove_timed(
+            kraken_stark::field::M31(1),
+            kraken_stark::field::M31(1),
+            profile_log_n,
+        );
+    }
 
     println!("\nDone.");
 }

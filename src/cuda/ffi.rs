@@ -100,6 +100,35 @@ unsafe extern "C" {
     );
 }
 
+// Twiddle computation kernels
+unsafe extern "C" {
+    pub fn cuda_compute_fold_twiddle_sources(
+        initial_x: u32, initial_y: u32,
+        step_x: u32, step_y: u32,
+        output: *mut u32,
+        n: u32, log_n: u32,
+        extract_y: i32,
+    );
+
+    pub fn cuda_batch_inverse_m31(input: *const u32, output: *mut u32, n: u32);
+
+    pub fn cuda_compute_coset_points(
+        initial_x: u32, initial_y: u32,
+        step_x: u32, step_y: u32,
+        output_x: *mut u32, output_y: *mut u32,
+        n: u32,
+    );
+
+    pub fn cuda_squash_x(input: *const u32, output: *mut u32, out_n: u32);
+
+    pub fn cuda_extract_and_squash(
+        input: *const u32,
+        twiddle_out: *mut u32,
+        squash_out: *mut u32,
+        half_n: u32,
+    );
+}
+
 // Constraint evaluation kernels
 unsafe extern "C" {
     pub fn cuda_fibonacci_quotient(

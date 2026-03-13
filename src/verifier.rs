@@ -6,7 +6,8 @@
 //! 3. Verifying the final FRI value matches a constant polynomial
 
 use crate::channel::Channel;
-use crate::field::{M31, QM31};
+#[cfg(test)]
+use crate::field::M31;
 use crate::prover::StarkProof;
 
 /// Verify a STARK proof for the Fibonacci AIR.

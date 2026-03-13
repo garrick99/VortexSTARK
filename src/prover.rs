@@ -58,6 +58,16 @@ fn prove_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
 
     let t_total = Instant::now();
 
+    // --- Precompute twiddle caches (both domains) ---
+    let t0 = Instant::now();
+    let trace_domain = Coset::half_coset(log_n);
+    let eval_domain = Coset::half_coset(log_eval_size);
+    let trace_cache = TwiddleCache::new(&trace_domain);
+    let eval_cache = TwiddleCache::new(&eval_domain);
+    if timed {
+        eprintln!("  twiddle_setup: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+    }
+
     // --- Step 1: Generate trace (CPU) → upload once ---
     let t0 = Instant::now();
     let trace = air::fibonacci_trace(a, b, log_n);
@@ -70,10 +80,7 @@ fn prove_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
 
     // --- Step 2: Interpolate on GPU ---
     let t0 = Instant::now();
-    let trace_domain = Coset::half_coset(log_n);
-    let trace_cache = TwiddleCache::new(&trace_domain);
     ntt::interpolate(&mut d_trace, &trace_cache);
-    // d_trace now holds coefficients on GPU — never download
     if timed {
         unsafe { ffi::cuda_device_sync() };
         eprintln!("  interpolate: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
@@ -85,11 +92,7 @@ fn prove_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     unsafe {
         ffi::cuda_zero_pad(d_trace.as_ptr(), d_eval.as_mut_ptr(), n as u32, eval_size as u32);
     }
-
-    let eval_domain = Coset::half_coset(log_eval_size);
-    let eval_cache = TwiddleCache::new(&eval_domain);
     ntt::evaluate(&mut d_eval, &eval_cache);
-    // d_eval has trace evaluated on blowup domain, stays on GPU
     if timed {
         unsafe { ffi::cuda_device_sync() };
         eprintln!("  blowup_eval: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
@@ -146,16 +149,24 @@ fn prove_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     }
 
     // --- Step 7: FRI (all GPU) ---
+    // Precompute all FRI twiddles upfront
+    let t0 = Instant::now();
+    let fri_twiddles = fri::precompute_fri_twiddles(log_eval_size, 3);
+    if timed {
+        eprintln!("  fri_twiddle_setup: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+    }
+
     let t0 = Instant::now();
     let mut fri_commitments = Vec::new();
     let mut current_eval = quotient_col;
     let mut current_log_size = log_eval_size;
-    let mut current_domain = eval_domain;
 
-    // First fold: circle → line
+    // First fold: circle → line (uses twiddles[0])
     let fri_alpha = channel.draw_felt();
     let mut line_eval = SecureColumn::zeros(current_eval.len / 2);
-    fri::fold_circle_into_line(&mut line_eval, &current_eval, fri_alpha, &current_domain);
+    fri::fold_circle_into_line_with_twiddles(
+        &mut line_eval, &current_eval, fri_alpha, &fri_twiddles[0],
+    );
     current_log_size -= 1;
 
     let fri_tree = MerkleTree::commit(&line_eval.cols, current_log_size);
@@ -164,11 +175,14 @@ fn prove_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     channel.mix_digest(&fri_root);
     current_eval = line_eval;
 
-    // Subsequent folds: line → line
+    // Subsequent folds: line → line (uses twiddles[1..])
+    let mut twid_idx = 1;
     while current_log_size > 3 {
         let fold_alpha = channel.draw_felt();
-        current_domain = Coset::half_coset(current_log_size);
-        let folded = fri::fold_line(&current_eval, fold_alpha, &current_domain);
+        let folded = fri::fold_line_with_twiddles(
+            &current_eval, fold_alpha, &fri_twiddles[twid_idx],
+        );
+        twid_idx += 1;
         current_log_size -= 1;
 
         let fri_tree = MerkleTree::commit(&folded.cols, current_log_size);
@@ -182,7 +196,7 @@ fn prove_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     let final_values = current_eval.to_qm31();
     let fri_final = final_values[0];
     if timed {
-        eprintln!("  fri: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+        eprintln!("  fri_fold+commit: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
     }
 
     if timed {
