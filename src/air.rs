@@ -22,6 +22,20 @@ pub fn fibonacci_trace(a: M31, b: M31, log_n: u32) -> Vec<M31> {
     trace
 }
 
+/// Fibonacci trace as raw u32 values (avoids M31 → u32 conversion step).
+pub fn fibonacci_trace_raw(a: M31, b: M31, log_n: u32) -> Vec<u32> {
+    let n = 1usize << log_n;
+    let p = crate::field::m31::P as u64;
+    let mut trace = vec![0u32; n];
+    trace[0] = a.0;
+    trace[1] = b.0;
+    for i in 2..n {
+        let sum = trace[i - 1] as u64 + trace[i - 2] as u64;
+        trace[i] = (sum % p) as u32;
+    }
+    trace
+}
+
 /// Evaluate the transition constraint at a single point.
 /// Returns t[i+2] - t[i+1] - t[i] (should be 0 for valid trace).
 #[inline]

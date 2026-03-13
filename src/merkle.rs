@@ -71,8 +71,7 @@ impl MerkleTree {
             current_size = parent_size;
         }
 
-        // Sync after all GPU work
-        unsafe { ffi::cuda_device_sync() };
+        // No explicit sync needed — root() calls to_host() which syncs via cudaMemcpy D2H
 
         // Current is the root (1 hash)
         // Layers: root first, leaves last
@@ -107,6 +106,47 @@ impl MerkleTree {
     /// Get the root hash (downloaded to host).
     pub fn root(&self) -> [u32; HASH_WORDS] {
         let host = self.layers[0].to_host();
+        let mut root = [0u32; HASH_WORDS];
+        root.copy_from_slice(&host[..HASH_WORDS]);
+        root
+    }
+
+    /// Build a Merkle tree and return only the root hash (no layer storage).
+    /// Skips storing intermediate layers, freeing memory sooner.
+    pub fn commit_root_only<C: AsRef<DeviceBuffer<u32>>>(columns: &[C], log_n_leaves: u32) -> [u32; HASH_WORDS] {
+        let n_leaves = 1u32 << log_n_leaves;
+        let n_cols = columns.len() as u32;
+
+        let col_ptrs: Vec<*const u32> = columns.iter().map(|c| c.as_ref().as_ptr()).collect();
+        let d_col_ptrs = DeviceBuffer::from_host(&col_ptrs);
+
+        let mut current = DeviceBuffer::<u32>::alloc((n_leaves as usize) * HASH_WORDS);
+        unsafe {
+            ffi::cuda_merkle_hash_leaves(
+                d_col_ptrs.as_ptr() as *const *const u32,
+                current.as_mut_ptr(),
+                n_cols,
+                n_leaves,
+            );
+        }
+
+        let mut current_size = n_leaves;
+        while current_size > 1 {
+            let parent_size = current_size / 2;
+            let mut parents = DeviceBuffer::<u32>::alloc((parent_size as usize) * HASH_WORDS);
+            unsafe {
+                ffi::cuda_merkle_hash_nodes(
+                    current.as_ptr(),
+                    parents.as_mut_ptr(),
+                    parent_size,
+                );
+            }
+            current = parents;
+            current_size = parent_size;
+        }
+
+        // cudaMemcpy D2H in to_host() implicitly syncs the default stream
+        let host = current.to_host();
         let mut root = [0u32; HASH_WORDS];
         root.copy_from_slice(&host[..HASH_WORDS]);
         root

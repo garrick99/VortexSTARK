@@ -40,6 +40,28 @@ pub struct StarkProof {
     pub public_inputs: (M31, M31),
 }
 
+/// Pre-computed caches that can be reused across multiple proofs of the same size.
+pub struct ProverCache {
+    pub trace_cache: TwiddleCache,
+    pub eval_cache: TwiddleCache,
+    pub fri_twiddles: Vec<DeviceBuffer<u32>>,
+    pub log_n: u32,
+    pub log_eval_size: u32,
+}
+
+impl ProverCache {
+    /// Build caches for proving traces of size 2^log_n.
+    pub fn new(log_n: u32) -> Self {
+        let log_eval_size = log_n + BLOWUP_BITS;
+        let trace_domain = Coset::half_coset(log_n);
+        let eval_domain = Coset::half_coset(log_eval_size);
+        let trace_cache = TwiddleCache::new(&trace_domain);
+        let eval_cache = TwiddleCache::new(&eval_domain);
+        let fri_twiddles = fri::precompute_fri_twiddles(log_eval_size, 3);
+        ProverCache { trace_cache, eval_cache, fri_twiddles, log_n, log_eval_size }
+    }
+}
+
 /// Generate a STARK proof for the Fibonacci sequence.
 pub fn prove(a: M31, b: M31, log_n: u32) -> StarkProof {
     prove_inner(a, b, log_n, false)
@@ -48,6 +70,11 @@ pub fn prove(a: M31, b: M31, log_n: u32) -> StarkProof {
 /// Generate a STARK proof with optional timing output.
 pub fn prove_timed(a: M31, b: M31, log_n: u32) -> StarkProof {
     prove_inner(a, b, log_n, true)
+}
+
+/// Generate a STARK proof using pre-computed caches (amortized setup).
+pub fn prove_cached(a: M31, b: M31, cache: &ProverCache) -> StarkProof {
+    prove_with_cache(a, b, cache, false)
 }
 
 fn prove_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
@@ -70,8 +97,7 @@ fn prove_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
 
     // --- Step 1: Generate trace (CPU) → upload once ---
     let t0 = Instant::now();
-    let trace = air::fibonacci_trace(a, b, log_n);
-    let trace_raw: Vec<u32> = trace.iter().map(|v| v.0).collect();
+    let trace_raw = air::fibonacci_trace_raw(a, b, log_n);
     let mut d_trace = DeviceBuffer::from_host(&trace_raw);
     if timed {
         unsafe { ffi::cuda_device_sync() };
@@ -92,16 +118,17 @@ fn prove_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     unsafe {
         ffi::cuda_zero_pad(d_trace.as_ptr(), d_eval.as_mut_ptr(), n as u32, eval_size as u32);
     }
+    drop(d_trace); // free trace coefficients early
     ntt::evaluate(&mut d_eval, &eval_cache);
     if timed {
         unsafe { ffi::cuda_device_sync() };
         eprintln!("  blowup_eval: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
     }
 
-    // --- Step 4: Commit trace (GPU Merkle) ---
+    // --- Step 4: Commit trace (GPU Merkle, no clone — use eval directly) ---
     let t0 = Instant::now();
-    let trace_tree = MerkleTree::commit(&[d_eval.clone_device()], log_eval_size);
-    let trace_commitment = trace_tree.root();
+    let trace_ref = [&d_eval];
+    let trace_commitment = MerkleTree::commit_root_only(&trace_ref, log_eval_size);
     if timed {
         eprintln!("  trace_commit: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
     }
@@ -128,21 +155,21 @@ fn prove_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
             alpha_arr.as_ptr(),
             eval_size as u32,
         );
-        ffi::cuda_device_sync();
     }
+    drop(d_eval); // free trace evaluation early
 
     let quotient_col = SecureColumn {
         cols: [q0, q1, q2, q3],
         len: eval_size,
     };
     if timed {
+        unsafe { ffi::cuda_device_sync() };
         eprintln!("  quotient_gpu: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
     }
 
     // --- Step 6: Commit quotient (GPU Merkle) ---
     let t0 = Instant::now();
-    let quotient_tree = MerkleTree::commit(&quotient_col.cols, log_eval_size);
-    let quotient_commitment = quotient_tree.root();
+    let quotient_commitment = MerkleTree::commit_root_only(&quotient_col.cols, log_eval_size);
     channel.mix_digest(&quotient_commitment);
     if timed {
         eprintln!("  quotient_commit: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
@@ -167,10 +194,10 @@ fn prove_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     fri::fold_circle_into_line_with_twiddles(
         &mut line_eval, &current_eval, fri_alpha, &fri_twiddles[0],
     );
+    drop(current_eval); // free source data after fold
     current_log_size -= 1;
 
-    let fri_tree = MerkleTree::commit(&line_eval.cols, current_log_size);
-    let fri_root = fri_tree.root();
+    let fri_root = MerkleTree::commit_root_only(&line_eval.cols, current_log_size);
     fri_commitments.push(fri_root);
     channel.mix_digest(&fri_root);
     current_eval = line_eval;
@@ -182,11 +209,11 @@ fn prove_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
         let folded = fri::fold_line_with_twiddles(
             &current_eval, fold_alpha, &fri_twiddles[twid_idx],
         );
+        drop(current_eval); // free source data after fold
         twid_idx += 1;
         current_log_size -= 1;
 
-        let fri_tree = MerkleTree::commit(&folded.cols, current_log_size);
-        let fri_root = fri_tree.root();
+        let fri_root = MerkleTree::commit_root_only(&folded.cols, current_log_size);
         fri_commitments.push(fri_root);
         channel.mix_digest(&fri_root);
 
@@ -200,6 +227,122 @@ fn prove_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     }
 
     if timed {
+        eprintln!("  TOTAL: {:.1}ms", t_total.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    StarkProof {
+        trace_commitment,
+        quotient_commitment,
+        fri_commitments,
+        fri_final,
+        log_trace_size: log_n,
+        public_inputs: (a, b),
+    }
+}
+
+fn prove_with_cache(a: M31, b: M31, cache: &ProverCache, timed: bool) -> StarkProof {
+    let log_n = cache.log_n;
+    assert!(log_n >= 4, "trace too small");
+    let n = 1usize << log_n;
+    let log_eval_size = cache.log_eval_size;
+    let eval_size = 1usize << log_eval_size;
+
+    let t_total = Instant::now();
+
+    // --- Step 1: Generate trace (CPU) → upload ---
+    let t0 = Instant::now();
+    let trace_raw = air::fibonacci_trace_raw(a, b, log_n);
+    let mut d_trace = DeviceBuffer::from_host(&trace_raw);
+    if timed {
+        unsafe { ffi::cuda_device_sync() };
+        eprintln!("  trace_gen+upload: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    // --- Step 2: Interpolate ---
+    ntt::interpolate(&mut d_trace, &cache.trace_cache);
+
+    // --- Step 3: Zero-pad + evaluate on blowup domain ---
+    let mut d_eval = DeviceBuffer::<u32>::alloc(eval_size);
+    unsafe {
+        ffi::cuda_zero_pad(d_trace.as_ptr(), d_eval.as_mut_ptr(), n as u32, eval_size as u32);
+    }
+    drop(d_trace);
+    ntt::evaluate(&mut d_eval, &cache.eval_cache);
+
+    // --- Step 4: Commit trace ---
+    let trace_ref = [&d_eval];
+    let trace_commitment = MerkleTree::commit_root_only(&trace_ref, log_eval_size);
+
+    // --- Step 5: Quotient ---
+    let mut channel = Channel::new();
+    channel.mix_digest(&trace_commitment);
+    let alpha = channel.draw_felt();
+    let alpha_arr = alpha.to_u32_array();
+
+    let mut q0 = DeviceBuffer::<u32>::alloc(eval_size);
+    let mut q1 = DeviceBuffer::<u32>::alloc(eval_size);
+    let mut q2 = DeviceBuffer::<u32>::alloc(eval_size);
+    let mut q3 = DeviceBuffer::<u32>::alloc(eval_size);
+    unsafe {
+        ffi::cuda_fibonacci_quotient(
+            d_eval.as_ptr(),
+            q0.as_mut_ptr(), q1.as_mut_ptr(), q2.as_mut_ptr(), q3.as_mut_ptr(),
+            alpha_arr.as_ptr(),
+            eval_size as u32,
+        );
+    }
+    drop(d_eval);
+
+    let quotient_col = SecureColumn {
+        cols: [q0, q1, q2, q3],
+        len: eval_size,
+    };
+
+    // --- Step 6: Commit quotient ---
+    let quotient_commitment = MerkleTree::commit_root_only(&quotient_col.cols, log_eval_size);
+    channel.mix_digest(&quotient_commitment);
+
+    // --- Step 7: FRI ---
+    let t0 = Instant::now();
+    let mut fri_commitments = Vec::new();
+    let mut current_eval = quotient_col;
+    let mut current_log_size = log_eval_size;
+
+    // Circle fold
+    let fri_alpha = channel.draw_felt();
+    let mut line_eval = SecureColumn::zeros(current_eval.len / 2);
+    fri::fold_circle_into_line_with_twiddles(
+        &mut line_eval, &current_eval, fri_alpha, &cache.fri_twiddles[0],
+    );
+    drop(current_eval);
+    current_log_size -= 1;
+
+    let fri_root = MerkleTree::commit_root_only(&line_eval.cols, current_log_size);
+    fri_commitments.push(fri_root);
+    channel.mix_digest(&fri_root);
+    current_eval = line_eval;
+
+    // Line folds
+    let mut twid_idx = 1;
+    while current_log_size > 3 {
+        let fold_alpha = channel.draw_felt();
+        let folded = fri::fold_line_with_twiddles(
+            &current_eval, fold_alpha, &cache.fri_twiddles[twid_idx],
+        );
+        drop(current_eval);
+        twid_idx += 1;
+        current_log_size -= 1;
+
+        let fri_root = MerkleTree::commit_root_only(&folded.cols, current_log_size);
+        fri_commitments.push(fri_root);
+        channel.mix_digest(&fri_root);
+        current_eval = folded;
+    }
+
+    let final_values = current_eval.to_qm31();
+    let fri_final = final_values[0];
+    if timed {
+        eprintln!("  prove_body: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
         eprintln!("  TOTAL: {:.1}ms", t_total.elapsed().as_secs_f64() * 1000.0);
     }
 

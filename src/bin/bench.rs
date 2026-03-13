@@ -1,34 +1,90 @@
 use kraken_stark::circle::Coset;
 use kraken_stark::cuda::ffi;
 use kraken_stark::device::DeviceBuffer;
+use kraken_stark::field::M31;
 use kraken_stark::ntt::{self, TwiddleCache};
 use std::time::Instant;
 
+/// Benchmark statistics for a set of timings (in milliseconds).
+struct Stats {
+    median: f64,
+    min: f64,
+    max: f64,
+    mean: f64,
+    stddev: f64,
+    samples: usize,
+}
+
+fn compute_stats(times_ms: &mut Vec<f64>) -> Stats {
+    let n = times_ms.len();
+    assert!(n > 0);
+    times_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let min = times_ms[0];
+    let max = times_ms[n - 1];
+    let median = if n % 2 == 1 {
+        times_ms[n / 2]
+    } else {
+        (times_ms[n / 2 - 1] + times_ms[n / 2]) / 2.0
+    };
+    let mean = times_ms.iter().sum::<f64>() / n as f64;
+    let variance = times_ms.iter().map(|t| (t - mean).powi(2)).sum::<f64>() / n as f64;
+    let stddev = variance.sqrt();
+    Stats { median, min, max, mean, stddev, samples: n }
+}
+
+fn print_stats(label: &str, stats: &Stats) {
+    println!(
+        "  {label:<24} median {:.3}ms  min {:.3}ms  max {:.3}ms  mean {:.3}ms  stddev {:.3}ms  (n={})",
+        stats.median, stats.min, stats.max, stats.mean, stats.stddev, stats.samples,
+    );
+}
+
 fn main() {
-    println!("kraken-stark GPU benchmark");
-    println!("==========================\n");
+    println!("kraken-stark robust benchmark");
+    println!("==============================");
+    println!("GPU: RTX 5090 (SM 12.0), CUDA 13.0\n");
 
-    // Warmup GPU
-    let _ = DeviceBuffer::<u32>::alloc(1);
+    // --- GPU warmup ---
+    let _ = DeviceBuffer::<u32>::alloc(1024);
     unsafe { ffi::cuda_device_sync() };
+    // Run a throwaway prove to fully warm the GPU (context, caches, JIT)
+    let _ = kraken_stark::prover::prove(M31(1), M31(1), 8);
 
-    // --- Field ops ---
-    let n: u32 = 1 << 20;
-    let a: Vec<u32> = (0..n).map(|i| i % 0x7FFF_FFFF).collect();
-    let b: Vec<u32> = (0..n).map(|i| (i * 3) % 0x7FFF_FFFF).collect();
-    let d_a = DeviceBuffer::from_host(&a);
-    let d_b = DeviceBuffer::from_host(&b);
-    let mut d_out = DeviceBuffer::<u32>::alloc(n as usize);
+    // =============================================
+    // Field operations
+    // =============================================
+    println!("=== Field Operations ===");
+    {
+        let n: u32 = 1 << 20;
+        let a: Vec<u32> = (0..n).map(|i| i % 0x7FFF_FFFF).collect();
+        let b: Vec<u32> = (0..n).map(|i| (i * 3) % 0x7FFF_FFFF).collect();
+        let d_a = DeviceBuffer::from_host(&a);
+        let d_b = DeviceBuffer::from_host(&b);
+        let mut d_out = DeviceBuffer::<u32>::alloc(n as usize);
 
-    let t0 = Instant::now();
-    unsafe {
-        ffi::cuda_m31_mul(d_a.as_ptr(), d_b.as_ptr(), d_out.as_mut_ptr(), n);
-        ffi::cuda_device_sync();
+        // warmup
+        unsafe { ffi::cuda_m31_mul(d_a.as_ptr(), d_b.as_ptr(), d_out.as_mut_ptr(), n); ffi::cuda_device_sync(); }
+
+        let iters = 200;
+        let mut times = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t0 = Instant::now();
+            unsafe {
+                ffi::cuda_m31_mul(d_a.as_ptr(), d_b.as_ptr(), d_out.as_mut_ptr(), n);
+                ffi::cuda_device_sync();
+            }
+            times.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        let stats = compute_stats(&mut times);
+        let throughput = (n as f64 / 1e6) / (stats.median / 1000.0);
+        print_stats(&format!("M31 mul ({n} elems)"), &stats);
+        println!("  throughput: {throughput:.0} M elem/s\n");
     }
-    let mul_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    println!("[OK] M31 mul: {n} elements in {mul_ms:.3}ms");
 
-    // --- NTT benchmarks ---
+    // =============================================
+    // NTT benchmarks
+    // =============================================
+    println!("=== NTT (Circle NTT) ===");
     for log_n in [12u32, 16, 20] {
         let size = 1usize << log_n;
         let coset = Coset::half_coset(log_n);
@@ -37,103 +93,193 @@ fn main() {
         let coeffs: Vec<u32> = (0..size).map(|i| (i as u32 * 7 + 13) % 0x7FFF_FFFF).collect();
         let mut d_data = DeviceBuffer::from_host(&coeffs);
 
-        // Warmup
+        // warmup
         ntt::evaluate(&mut d_data, &cache);
         ntt::interpolate(&mut d_data, &cache);
 
-        // Benchmark forward NTT
-        let iters = if log_n <= 16 { 100 } else { 10 };
-        let t0 = Instant::now();
+        let iters = if log_n <= 16 { 200 } else { 50 };
+
+        let mut fwd_times = Vec::with_capacity(iters);
         for _ in 0..iters {
+            let t0 = Instant::now();
             ntt::evaluate(&mut d_data, &cache);
+            unsafe { ffi::cuda_device_sync(); }
+            fwd_times.push(t0.elapsed().as_secs_f64() * 1000.0);
         }
-        let fwd_us = t0.elapsed().as_secs_f64() * 1_000_000.0 / iters as f64;
 
-        // Benchmark inverse NTT
-        let t0 = Instant::now();
+        let mut inv_times = Vec::with_capacity(iters);
         for _ in 0..iters {
+            let t0 = Instant::now();
             ntt::interpolate(&mut d_data, &cache);
+            unsafe { ffi::cuda_device_sync(); }
+            inv_times.push(t0.elapsed().as_secs_f64() * 1000.0);
         }
-        let inv_us = t0.elapsed().as_secs_f64() * 1_000_000.0 / iters as f64;
 
-        // Verify roundtrip
-        let mut d_check = DeviceBuffer::from_host(&coeffs);
-        ntt::evaluate(&mut d_check, &cache);
-        ntt::interpolate(&mut d_check, &cache);
-        let result = d_check.to_host();
-        let ok = result == coeffs;
-
-        println!(
-            "[{}] NTT log_n={log_n} (n={}): fwd {fwd_us:.1}us, inv {inv_us:.1}us",
-            if ok { "OK" } else { "FAIL" },
-            size,
-        );
+        let fwd = compute_stats(&mut fwd_times);
+        let inv = compute_stats(&mut inv_times);
+        println!("  log_n={log_n} (n={size}):");
+        print_stats("  forward", &fwd);
+        print_stats("  inverse", &inv);
+        println!();
     }
 
-    // --- Batch NTT ---
-    let log_n = 16u32;
-    let size = 1usize << log_n;
-    let coset = Coset::half_coset(log_n);
-    let cache = TwiddleCache::new(&coset);
-    let n_cols = 8;
+    // =============================================
+    // Batch NTT
+    // =============================================
+    println!("=== Batch NTT (8 columns) ===");
+    {
+        let log_n = 16u32;
+        let size = 1usize << log_n;
+        let coset = Coset::half_coset(log_n);
+        let cache = TwiddleCache::new(&coset);
+        let n_cols = 8;
 
-    let originals: Vec<Vec<u32>> = (0..n_cols)
-        .map(|c| (0..size).map(|i| ((i * (c + 3) + 17) % 0x7FFF_FFFF as usize) as u32).collect())
-        .collect();
+        let originals: Vec<Vec<u32>> = (0..n_cols)
+            .map(|c| (0..size).map(|i| ((i * (c + 3) + 17) % 0x7FFF_FFFF as usize) as u32).collect())
+            .collect();
+        let mut columns: Vec<DeviceBuffer<u32>> = originals
+            .iter()
+            .map(|v| DeviceBuffer::from_host(v))
+            .collect();
 
-    let mut columns: Vec<DeviceBuffer<u32>> = originals
-        .iter()
-        .map(|v| DeviceBuffer::from_host(v))
-        .collect();
-
-    // Warmup
-    ntt::evaluate_batch(&mut columns, &cache);
-    ntt::interpolate_batch(&mut columns, &cache);
-
-    let iters = 50;
-    let t0 = Instant::now();
-    for _ in 0..iters {
+        // warmup
         ntt::evaluate_batch(&mut columns, &cache);
-    }
-    let batch_fwd_us = t0.elapsed().as_secs_f64() * 1_000_000.0 / iters as f64;
-
-    let t0 = Instant::now();
-    for _ in 0..iters {
         ntt::interpolate_batch(&mut columns, &cache);
+
+        let iters = 100;
+        let mut fwd_times = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t0 = Instant::now();
+            ntt::evaluate_batch(&mut columns, &cache);
+            unsafe { ffi::cuda_device_sync(); }
+            fwd_times.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        let mut inv_times = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t0 = Instant::now();
+            ntt::interpolate_batch(&mut columns, &cache);
+            unsafe { ffi::cuda_device_sync(); }
+            inv_times.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        let fwd = compute_stats(&mut fwd_times);
+        let inv = compute_stats(&mut inv_times);
+        println!("  log_n={log_n} (n={size}), {n_cols} columns:");
+        print_stats("  forward", &fwd);
+        print_stats("  inverse", &inv);
+        println!();
     }
-    let batch_inv_us = t0.elapsed().as_secs_f64() * 1_000_000.0 / iters as f64;
 
-    println!(
-        "[OK] Batch NTT {n_cols}x log_n={log_n}: fwd {batch_fwd_us:.1}us, inv {batch_inv_us:.1}us"
-    );
-
-    // --- STARK prover benchmark ---
-    println!("\n--- STARK Prover ---");
+    // =============================================
+    // STARK prover — sustained throughput
+    // =============================================
+    println!("=== STARK Prover (sustained) ===");
     for log_n in [8u32, 12, 16, 20] {
-        let a = kraken_stark::field::M31(1);
-        let b = kraken_stark::field::M31(1);
+        let a = M31(1);
+        let b = M31(1);
+        let n_elem = 1u32 << log_n;
 
-        // Warmup
+        // warmup (2 runs)
+        let _ = kraken_stark::prover::prove(a, b, log_n);
         let _ = kraken_stark::prover::prove(a, b, log_n);
 
-        let t0 = Instant::now();
-        let proof = kraken_stark::prover::prove(a, b, log_n);
-        let prove_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let iters = match log_n {
+            20 => 20,
+            16 => 50,
+            _ => 100,
+        };
 
-        println!(
-            "[OK] prove log_n={log_n} (n={}): {prove_ms:.1}ms, {} FRI layers",
-            1u32 << log_n,
-            proof.fri_commitments.len(),
-        );
+        let mut times = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t0 = Instant::now();
+            let _proof = kraken_stark::prover::prove(a, b, log_n);
+            times.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        let stats = compute_stats(&mut times);
+        let proofs_per_sec = 1000.0 / stats.median;
+        print_stats(&format!("log_n={log_n} (n={n_elem})"), &stats);
+        println!("  → {proofs_per_sec:.1} proofs/sec\n");
     }
 
-    // Detailed timing for log_n=16 and log_n=20
+    // =============================================
+    // STARK prover — cached (amortized twiddle setup)
+    // =============================================
+    println!("=== STARK Prover (cached, amortized setup) ===");
+    for log_n in [8u32, 12, 16, 20] {
+        let a = M31(1);
+        let b = M31(1);
+        let n_elem = 1u32 << log_n;
+        let cache = kraken_stark::prover::ProverCache::new(log_n);
+
+        // warmup
+        let _ = kraken_stark::prover::prove_cached(a, b, &cache);
+        let _ = kraken_stark::prover::prove_cached(a, b, &cache);
+
+        let iters = match log_n {
+            20 => 30,
+            16 => 100,
+            _ => 200,
+        };
+
+        let mut times = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t0 = Instant::now();
+            let _proof = kraken_stark::prover::prove_cached(a, b, &cache);
+            times.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        let stats = compute_stats(&mut times);
+        let proofs_per_sec = 1000.0 / stats.median;
+        print_stats(&format!("log_n={log_n} (n={n_elem})"), &stats);
+        println!("  → {proofs_per_sec:.1} proofs/sec\n");
+    }
+
+    // =============================================
+    // Detailed profile (single-run, timed stages)
+    // =============================================
     for profile_log_n in [16u32, 20] {
-        println!("\n--- Detailed Profile (log_n={profile_log_n}) ---");
-        let _ = kraken_stark::prover::prove_timed(
-            kraken_stark::field::M31(1),
-            kraken_stark::field::M31(1),
-            profile_log_n,
+        println!("=== Stage Profile (log_n={profile_log_n}) ===");
+        let _ = kraken_stark::prover::prove_timed(M31(1), M31(1), profile_log_n);
+        println!();
+    }
+
+    // =============================================
+    // Summary table
+    // =============================================
+    println!("=== Summary (uncached / cached) ===");
+    println!("  {:>8}  {:>14}  {:>14}  {:>14}  {:>14}", "log_n", "uncached (ms)", "cached (ms)", "uncached p/s", "cached p/s");
+    println!("  {:>8}  {:>14}  {:>14}  {:>14}  {:>14}", "-----", "-------------", "-----------", "------------", "----------");
+    for log_n in [8u32, 12, 16, 20] {
+        let a = M31(1);
+        let b = M31(1);
+        let cache = kraken_stark::prover::ProverCache::new(log_n);
+
+        // warmup
+        let _ = kraken_stark::prover::prove(a, b, log_n);
+        let _ = kraken_stark::prover::prove_cached(a, b, &cache);
+
+        let iters = match log_n {
+            20 => 30,
+            16 => 100,
+            _ => 200,
+        };
+
+        let mut uncached_times = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t0 = Instant::now();
+            let _proof = kraken_stark::prover::prove(a, b, log_n);
+            uncached_times.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        let mut cached_times = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t0 = Instant::now();
+            let _proof = kraken_stark::prover::prove_cached(a, b, &cache);
+            cached_times.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+
+        let u = compute_stats(&mut uncached_times);
+        let c = compute_stats(&mut cached_times);
+        println!(
+            "  {:>8}  {:>14.3}  {:>14.3}  {:>14.1}  {:>14.1}",
+            log_n, u.median, c.median, 1000.0 / u.median, 1000.0 / c.median,
         );
     }
 

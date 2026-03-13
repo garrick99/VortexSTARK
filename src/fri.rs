@@ -16,6 +16,12 @@ pub struct SecureColumn {
 }
 
 impl SecureColumn {
+    /// Allocate an uninitialized secure column (use when all elements will be written).
+    pub fn alloc(len: usize) -> Self {
+        let cols = std::array::from_fn(|_| DeviceBuffer::<u32>::alloc(len));
+        Self { cols, len }
+    }
+
     /// Allocate a zero-initialized secure column of given length.
     pub fn zeros(len: usize) -> Self {
         let mut cols = std::array::from_fn(|_| DeviceBuffer::<u32>::alloc(len));
@@ -142,7 +148,6 @@ pub fn fold_circle_into_line_with_twiddles(
             alpha_sq_arr.as_ptr(),
             half_n as u32,
         );
-        ffi::cuda_device_sync();
     }
 }
 
@@ -174,7 +179,6 @@ pub fn fold_line_with_twiddles(
             alpha_arr.as_ptr(),
             half_n as u32,
         );
-        ffi::cuda_device_sync();
     }
 
     out

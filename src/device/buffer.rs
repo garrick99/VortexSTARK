@@ -117,6 +117,12 @@ impl<T> DeviceBuffer<T> {
     }
 }
 
+impl<T> AsRef<DeviceBuffer<T>> for DeviceBuffer<T> {
+    fn as_ref(&self) -> &DeviceBuffer<T> {
+        self
+    }
+}
+
 impl<T> Drop for DeviceBuffer<T> {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
