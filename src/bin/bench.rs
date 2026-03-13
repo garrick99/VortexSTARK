@@ -239,8 +239,15 @@ fn main() {
     // Detailed profile (single-run, timed stages)
     // =============================================
     for profile_log_n in [16u32, 20] {
-        println!("=== Stage Profile (log_n={profile_log_n}) ===");
+        println!("=== Stage Profile uncached (log_n={profile_log_n}) ===");
         let _ = kraken_stark::prover::prove_timed(M31(1), M31(1), profile_log_n);
+        println!();
+    }
+    for profile_log_n in [16u32, 20] {
+        println!("=== Stage Profile cached (log_n={profile_log_n}) ===");
+        let cache = kraken_stark::prover::ProverCache::new(profile_log_n);
+        let _ = kraken_stark::prover::prove_cached(M31(1), M31(1), &cache); // warmup
+        let _ = kraken_stark::prover::prove_cached_timed(M31(1), M31(1), &cache);
         println!();
     }
 

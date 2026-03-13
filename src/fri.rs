@@ -7,7 +7,7 @@
 use crate::circle::Coset;
 use crate::cuda::ffi;
 use crate::device::DeviceBuffer;
-use crate::field::QM31;
+use crate::field::{M31, QM31};
 
 /// A secure (QM31) column in SoA layout: 4 separate M31 columns.
 pub struct SecureColumn {
@@ -215,6 +215,80 @@ pub fn fold_line(
     fold_line_with_twiddles(eval, alpha, &d_twiddles)
 }
 
+
+// --- CPU-side FRI operations for small tail iterations ---
+// When data is small (≤1024 elements), GPU kernel launch + D2H sync overhead
+// exceeds the actual compute time. CPU avoids ~60μs/iteration overhead.
+
+/// FRI fold_line on CPU (small data path).
+/// result[i] = (f0 + f1) + alpha * twiddle[i] * (f0 - f1)
+pub fn fold_line_cpu(
+    eval: &[QM31],
+    alpha: QM31,
+    twiddles: &[u32],
+) -> Vec<QM31> {
+    let half_n = eval.len() / 2;
+    (0..half_n)
+        .map(|i| {
+            let f0 = eval[2 * i];
+            let f1 = eval[2 * i + 1];
+            let sum = f0 + f1;
+            let diff = f0 - f1;
+            let tw_diff = diff * M31(twiddles[i]);
+            sum + alpha * tw_diff
+        })
+        .collect()
+}
+
+/// CPU Merkle root for QM31 SoA4 data. Returns 8-word Blake2s root.
+/// Produces the same hashes as the GPU Merkle kernels.
+pub fn merkle_root_cpu(values: &[QM31]) -> [u32; 8] {
+    use crate::channel::blake2s_hash;
+
+    let n = values.len();
+    assert!(n.is_power_of_two() && n >= 1);
+
+    // Hash leaves: each QM31 → 4 u32 → 16-byte message → Blake2s
+    let mut hashes: Vec<[u8; 32]> = values
+        .iter()
+        .map(|v| {
+            let arr = v.to_u32_array();
+            let mut input = [0u8; 64]; // padded to 64 bytes
+            for (i, &w) in arr.iter().enumerate() {
+                input[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+            }
+            // Blake2s with t=16 (4 words × 4 bytes)
+            // The blake2s_hash function uses input.len() as t, but we need t=16.
+            // Pass a 16-byte slice to get the correct t value.
+            blake2s_hash(&input[..16])
+        })
+        .collect();
+
+    // Hash nodes bottom-up
+    while hashes.len() > 1 {
+        let parent_count = hashes.len() / 2;
+        hashes = (0..parent_count)
+            .map(|i| {
+                let mut input = [0u8; 64];
+                input[..32].copy_from_slice(&hashes[2 * i]);
+                input[32..64].copy_from_slice(&hashes[2 * i + 1]);
+                blake2s_hash(&input)
+            })
+            .collect();
+    }
+
+    // Convert [u8; 32] → [u32; 8]
+    let mut root = [0u32; 8];
+    for i in 0..8 {
+        root[i] = u32::from_le_bytes([
+            hashes[0][i * 4],
+            hashes[0][i * 4 + 1],
+            hashes[0][i * 4 + 2],
+            hashes[0][i * 4 + 3],
+        ]);
+    }
+    root
+}
 
 #[cfg(test)]
 mod tests {

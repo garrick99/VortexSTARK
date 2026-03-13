@@ -46,11 +46,16 @@ pub struct StarkProof {
     pub public_inputs: (M31, M31),
 }
 
+/// Log size threshold below which FRI iterations run on CPU (avoids kernel launch overhead).
+const FRI_CPU_TAIL_LOG: u32 = 10;
+
 /// Pre-computed caches that can be reused across multiple proofs of the same size.
 pub struct ProverCache {
     pub trace_cache: TwiddleCache,
     pub eval_cache: TwiddleCache,
     pub fri_twiddles: Vec<DeviceBuffer<u32>>,
+    /// Host copies of FRI twiddles for CPU tail iterations.
+    pub fri_twiddles_host: Vec<Vec<u32>>,
     pub log_n: u32,
     pub log_eval_size: u32,
     /// Pre-allocated pinned host memory for trace generation (avoids per-proof allocation).
@@ -70,13 +75,16 @@ impl ProverCache {
         let eval_cache = TwiddleCache::new(&eval_domain);
         let fri_twiddles = fri::precompute_fri_twiddles(log_eval_size, 3);
 
+        // Download host copies of FRI twiddles for CPU tail iterations
+        let fri_twiddles_host: Vec<Vec<u32>> = fri_twiddles.iter().map(|d| d.to_host()).collect();
+
         let bytes = (1usize << log_n) * std::mem::size_of::<u32>();
         let mut pinned_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         let err = unsafe { ffi::cudaMallocHost(&mut pinned_ptr, bytes) };
         assert!(err == 0, "cudaMallocHost failed: {err}");
 
         ProverCache {
-            trace_cache, eval_cache, fri_twiddles, log_n, log_eval_size,
+            trace_cache, eval_cache, fri_twiddles, fri_twiddles_host, log_n, log_eval_size,
             pinned_trace: pinned_ptr as *mut u32,
         }
     }
@@ -103,6 +111,11 @@ pub fn prove_timed(a: M31, b: M31, log_n: u32) -> StarkProof {
 /// Generate a STARK proof using pre-computed caches (amortized setup).
 pub fn prove_cached(a: M31, b: M31, cache: &ProverCache) -> StarkProof {
     prove_with_cache(a, b, cache, false)
+}
+
+/// Generate a STARK proof using pre-computed caches with per-stage timing.
+pub fn prove_cached_timed(a: M31, b: M31, cache: &ProverCache) -> StarkProof {
+    prove_with_cache(a, b, cache, true)
 }
 
 fn prove_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
@@ -239,14 +252,14 @@ fn prove_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     channel.mix_digest(&fri_root);
     current_eval = line_eval;
 
-    // Subsequent folds: line → line (uses twiddles[1..])
+    // Subsequent folds: line → line (GPU path for large sizes)
     let mut twid_idx = 1;
-    while current_log_size > 3 {
+    while current_log_size > FRI_CPU_TAIL_LOG.max(3) {
         let fold_alpha = channel.draw_felt();
         let folded = fri::fold_line_with_twiddles(
             &current_eval, fold_alpha, &fri_twiddles[twid_idx],
         );
-        drop(current_eval); // free source data after fold
+        drop(current_eval);
         twid_idx += 1;
         current_log_size -= 1;
 
@@ -257,12 +270,26 @@ fn prove_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
         );
         fri_commitments.push(fri_root);
         channel.mix_digest(&fri_root);
-
         current_eval = folded;
     }
 
-    let final_values = current_eval.to_qm31();
-    let fri_final = final_values[0];
+    // CPU tail: download only the small tail twiddles (avoids downloading all twiddles)
+    let mut cpu_eval = current_eval.to_qm31();
+    drop(current_eval);
+
+    while current_log_size > 3 {
+        let fold_alpha = channel.draw_felt();
+        let host_tw = fri_twiddles[twid_idx].to_host();
+        cpu_eval = fri::fold_line_cpu(&cpu_eval, fold_alpha, &host_tw);
+        twid_idx += 1;
+        current_log_size -= 1;
+
+        let fri_root = fri::merkle_root_cpu(&cpu_eval);
+        fri_commitments.push(fri_root);
+        channel.mix_digest(&fri_root);
+    }
+
+    let fri_final = cpu_eval[0];
     if timed {
         eprintln!("  fri_fold+commit: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
     }
@@ -291,35 +318,50 @@ fn prove_with_cache(a: M31, b: M31, cache: &ProverCache, timed: bool) -> StarkPr
 
     let t_total = Instant::now();
 
-    // --- Step 1: Generate trace into pinned memory → fast upload ---
-    let p = crate::field::m31::P;
-    let trace = cache.pinned_trace;
-    unsafe {
-        *trace.add(0) = a.0;
-        *trace.add(1) = b.0;
-        for i in 2..n {
-            let sum = *trace.add(i - 1) + *trace.add(i - 2);
-            *trace.add(i) = if sum >= p { sum - p } else { sum };
-        }
+    // --- Step 1: Generate trace (parallel) into pinned memory → fast upload ---
+    let t0 = Instant::now();
+    unsafe { air::fibonacci_trace_parallel(a, b, log_n, cache.pinned_trace) };
+    if timed {
+        eprintln!("  trace_gen (cpu): {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
     }
-    let mut d_trace = unsafe { DeviceBuffer::from_pinned(trace as *const u32, n) };
+    let t0b = Instant::now();
+    let mut d_trace = unsafe { DeviceBuffer::from_pinned(cache.pinned_trace as *const u32, n) };
+    if timed {
+        unsafe { ffi::cuda_device_sync() };
+        eprintln!("  trace_upload: {:.1}ms", t0b.elapsed().as_secs_f64() * 1000.0);
+    }
 
     // --- Step 2: Interpolate ---
+    let t0 = Instant::now();
     ntt::interpolate(&mut d_trace, &cache.trace_cache);
+    if timed {
+        unsafe { ffi::cuda_device_sync() };
+        eprintln!("  interpolate: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+    }
 
     // --- Step 3: Zero-pad + evaluate on blowup domain ---
+    let t0 = Instant::now();
     let mut d_eval = DeviceBuffer::<u32>::alloc(eval_size);
     unsafe {
         ffi::cuda_zero_pad(d_trace.as_ptr(), d_eval.as_mut_ptr(), n as u32, eval_size as u32);
     }
     drop(d_trace);
     ntt::evaluate(&mut d_eval, &cache.eval_cache);
+    if timed {
+        unsafe { ffi::cuda_device_sync() };
+        eprintln!("  blowup_eval: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+    }
 
     // --- Step 4: Commit trace ---
+    let t0 = Instant::now();
     let trace_ref = [&d_eval];
     let trace_commitment = MerkleTree::commit_root_only(&trace_ref, log_eval_size);
+    if timed {
+        eprintln!("  trace_commit: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+    }
 
     // --- Step 5: Quotient ---
+    let t0 = Instant::now();
     let mut channel = Channel::new();
     channel.mix_digest(&trace_commitment);
     let alpha = channel.draw_felt();
@@ -343,14 +385,22 @@ fn prove_with_cache(a: M31, b: M31, cache: &ProverCache, timed: bool) -> StarkPr
         cols: [q0, q1, q2, q3],
         len: eval_size,
     };
+    if timed {
+        unsafe { ffi::cuda_device_sync() };
+        eprintln!("  quotient_gpu: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+    }
 
     // --- Step 6: Commit quotient ---
+    let t0 = Instant::now();
     let quotient_commitment = MerkleTree::commit_root_soa4(
         &quotient_col.cols[0], &quotient_col.cols[1],
         &quotient_col.cols[2], &quotient_col.cols[3],
         log_eval_size,
     );
     channel.mix_digest(&quotient_commitment);
+    if timed {
+        eprintln!("  quotient_commit: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+    }
 
     // --- Step 7: FRI ---
     let t0 = Instant::now();
@@ -375,10 +425,15 @@ fn prove_with_cache(a: M31, b: M31, cache: &ProverCache, timed: bool) -> StarkPr
     fri_commitments.push(fri_root);
     channel.mix_digest(&fri_root);
     current_eval = line_eval;
+    if timed {
+        unsafe { ffi::cuda_device_sync() };
+        eprintln!("    fri[0] circle fold+commit (log={}): {:.3}ms", current_log_size, t0.elapsed().as_secs_f64() * 1000.0);
+    }
 
-    // Line folds
+    // Line folds (GPU path for large sizes)
     let mut twid_idx = 1;
-    while current_log_size > 3 {
+    while current_log_size > FRI_CPU_TAIL_LOG.max(3) {
+        let ti = Instant::now();
         let fold_alpha = channel.draw_felt();
         let folded = fri::fold_line_with_twiddles(
             &current_eval, fold_alpha, &cache.fri_twiddles[twid_idx],
@@ -395,12 +450,46 @@ fn prove_with_cache(a: M31, b: M31, cache: &ProverCache, timed: bool) -> StarkPr
         fri_commitments.push(fri_root);
         channel.mix_digest(&fri_root);
         current_eval = folded;
+        if timed {
+            eprintln!("    fri[{}] gpu fold+commit (log={}): {:.3}ms", twid_idx, current_log_size, ti.elapsed().as_secs_f64() * 1000.0);
+        }
     }
 
-    let final_values = current_eval.to_qm31();
-    let fri_final = final_values[0];
+    // CPU tail: avoid kernel launch overhead for small data
+    let mut cpu_eval = if current_log_size > 3 {
+        let ti = Instant::now();
+        let v = current_eval.to_qm31();
+        drop(current_eval);
+        if timed {
+            eprintln!("    fri download for cpu tail: {:.3}ms", ti.elapsed().as_secs_f64() * 1000.0);
+        }
+        v
+    } else {
+        let v = current_eval.to_qm31();
+        drop(current_eval);
+        v
+    };
+
+    while current_log_size > 3 {
+        let ti = Instant::now();
+        let fold_alpha = channel.draw_felt();
+        cpu_eval = fri::fold_line_cpu(
+            &cpu_eval, fold_alpha, &cache.fri_twiddles_host[twid_idx],
+        );
+        twid_idx += 1;
+        current_log_size -= 1;
+
+        let fri_root = fri::merkle_root_cpu(&cpu_eval);
+        fri_commitments.push(fri_root);
+        channel.mix_digest(&fri_root);
+        if timed {
+            eprintln!("    fri[{}] cpu fold+commit (log={}): {:.3}ms", twid_idx, current_log_size, ti.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+
+    let fri_final = cpu_eval[0];
     if timed {
-        eprintln!("  prove_body: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+        eprintln!("  fri_fold+commit: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
         eprintln!("  TOTAL: {:.1}ms", t_total.elapsed().as_secs_f64() * 1000.0);
     }
 
