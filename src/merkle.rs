@@ -131,7 +131,7 @@ impl MerkleTree {
         }
 
         let mut current_size = n_leaves;
-        while current_size > 1 {
+        while current_size > 1024 {
             let parent_size = current_size / 2;
             let mut parents = DeviceBuffer::<u32>::alloc((parent_size as usize) * HASH_WORDS);
             unsafe {
@@ -145,11 +145,25 @@ impl MerkleTree {
             current_size = parent_size;
         }
 
-        // cudaMemcpy D2H in to_host() implicitly syncs the default stream
-        let host = current.to_host();
-        let mut root = [0u32; HASH_WORDS];
-        root.copy_from_slice(&host[..HASH_WORDS]);
-        root
+        if current_size > 1 {
+            let mut d_root = DeviceBuffer::<u32>::alloc(HASH_WORDS);
+            unsafe {
+                ffi::cuda_merkle_reduce_to_root(
+                    current.as_ptr(),
+                    d_root.as_mut_ptr(),
+                    current_size,
+                );
+            }
+            let host = d_root.to_host();
+            let mut root = [0u32; HASH_WORDS];
+            root.copy_from_slice(&host[..HASH_WORDS]);
+            root
+        } else {
+            let host = current.to_host();
+            let mut root = [0u32; HASH_WORDS];
+            root.copy_from_slice(&host[..HASH_WORDS]);
+            root
+        }
     }
 
     /// Build Merkle root from 4-column SoA data (SecureColumn / QM31).
@@ -182,6 +196,7 @@ impl MerkleTree {
         }
 
         // Large tree: fused leaf+merge kernel + multi-launch node hashing
+        // with shared-memory tail reduction for the last ≤ 1024 nodes
         let mut current_size = n_leaves / 2;
         let mut current = DeviceBuffer::<u32>::alloc((current_size as usize) * HASH_WORDS);
         unsafe {
@@ -193,8 +208,8 @@ impl MerkleTree {
             );
         }
 
-        // Continue hashing up the tree
-        while current_size > 1 {
+        // Hash node levels until small enough for single-kernel reduction
+        while current_size > 1024 {
             let parent_size = current_size / 2;
             let mut parents = DeviceBuffer::<u32>::alloc((parent_size as usize) * HASH_WORDS);
             unsafe {
@@ -208,10 +223,26 @@ impl MerkleTree {
             current_size = parent_size;
         }
 
-        let host = current.to_host();
-        let mut root = [0u32; HASH_WORDS];
-        root.copy_from_slice(&host[..HASH_WORDS]);
-        root
+        // Tail reduction: finish the tree in a single kernel launch
+        if current_size > 1 {
+            let mut d_root = DeviceBuffer::<u32>::alloc(HASH_WORDS);
+            unsafe {
+                ffi::cuda_merkle_reduce_to_root(
+                    current.as_ptr(),
+                    d_root.as_mut_ptr(),
+                    current_size,
+                );
+            }
+            let host = d_root.to_host();
+            let mut root = [0u32; HASH_WORDS];
+            root.copy_from_slice(&host[..HASH_WORDS]);
+            root
+        } else {
+            let host = current.to_host();
+            let mut root = [0u32; HASH_WORDS];
+            root.copy_from_slice(&host[..HASH_WORDS]);
+            root
+        }
     }
 
     /// Generate a Merkle authentication path for leaf at `index`.

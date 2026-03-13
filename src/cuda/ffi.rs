@@ -186,6 +186,12 @@ unsafe extern "C" {
         n_parents: u32,
     );
 
+    pub fn cuda_merkle_reduce_to_root(
+        nodes: *const u32,
+        root_out: *mut u32,
+        n_nodes: u32,
+    );
+
     pub fn cuda_merkle_commit_small_soa4(
         col0: *const u32, col1: *const u32,
         col2: *const u32, col3: *const u32,

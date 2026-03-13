@@ -318,6 +318,56 @@ __global__ void merkle_hash_leaves_and_merge_soa4_kernel(
     out[4]=ph4; out[5]=ph5; out[6]=ph6; out[7]=ph7;
 }
 
+// Reduce a small hash array (≤ 1024 nodes) to a single root in shared memory.
+// Input: n_nodes hashes at nodes[], output: 8-word root at root_out[].
+__global__ void merkle_reduce_to_root_kernel(
+    const uint32_t* __restrict__ nodes,
+    uint32_t* __restrict__ root_out,
+    uint32_t n_nodes
+) {
+    extern __shared__ uint32_t smem[];
+    uint32_t tid = threadIdx.x;
+
+    // Load nodes into shared memory
+    if (tid < n_nodes) {
+        const uint32_t* src = &nodes[tid * 8];
+        uint32_t* dst = &smem[tid * 8];
+        dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3];
+        dst[4]=src[4]; dst[5]=src[5]; dst[6]=src[6]; dst[7]=src[7];
+    }
+    __syncthreads();
+
+    // Tree reduction
+    uint32_t level_size = n_nodes;
+    while (level_size > 1) {
+        uint32_t half = level_size / 2;
+        if (tid < half) {
+            const uint32_t* left = &smem[tid * 16];
+            const uint32_t* right = &smem[tid * 16 + 8];
+
+            uint32_t h0=IV0^0x01010020, h1=IV1, h2=IV2, h3=IV3;
+            uint32_t h4=IV4, h5=IV5, h6=IV6, h7=IV7;
+            blake2s_compress(h0,h1,h2,h3,h4,h5,h6,h7,
+                             left[0],left[1],left[2],left[3],
+                             left[4],left[5],left[6],left[7],
+                             right[0],right[1],right[2],right[3],
+                             right[4],right[5],right[6],right[7],
+                             64, 0xFFFFFFFF);
+
+            uint32_t* dst = &smem[tid * 8];
+            dst[0]=h0; dst[1]=h1; dst[2]=h2; dst[3]=h3;
+            dst[4]=h4; dst[5]=h5; dst[6]=h6; dst[7]=h7;
+        }
+        __syncthreads();
+        level_size = half;
+    }
+
+    if (tid == 0) {
+        root_out[0]=smem[0]; root_out[1]=smem[1]; root_out[2]=smem[2]; root_out[3]=smem[3];
+        root_out[4]=smem[4]; root_out[5]=smem[5]; root_out[6]=smem[6]; root_out[7]=smem[7];
+    }
+}
+
 extern "C" {
 
 void cuda_merkle_hash_leaves(
@@ -339,6 +389,16 @@ void cuda_merkle_hash_nodes(
     uint32_t threads = 256;
     uint32_t blocks = (n_parents + threads - 1) / threads;
     merkle_hash_nodes_kernel<<<blocks, threads>>>(children, parents, n_parents);
+}
+
+// Reduce node hash array (≤ 1024 nodes) to root in a single kernel.
+void cuda_merkle_reduce_to_root(
+    const uint32_t* nodes,
+    uint32_t* root_out,
+    uint32_t n_nodes
+) {
+    uint32_t smem_bytes = n_nodes * 8 * sizeof(uint32_t);
+    merkle_reduce_to_root_kernel<<<1, n_nodes, smem_bytes>>>(nodes, root_out, n_nodes);
 }
 
 // Single-kernel small Merkle commit (≤ 2048 leaves).
