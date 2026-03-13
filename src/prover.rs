@@ -53,18 +53,40 @@ pub struct ProverCache {
     pub fri_twiddles: Vec<DeviceBuffer<u32>>,
     pub log_n: u32,
     pub log_eval_size: u32,
+    /// Pre-allocated pinned host memory for trace generation (avoids per-proof allocation).
+    pinned_trace: *mut u32,
 }
+
+unsafe impl Send for ProverCache {}
 
 impl ProverCache {
     /// Build caches for proving traces of size 2^log_n.
     pub fn new(log_n: u32) -> Self {
+        ensure_pool_init();
         let log_eval_size = log_n + BLOWUP_BITS;
         let trace_domain = Coset::half_coset(log_n);
         let eval_domain = Coset::half_coset(log_eval_size);
         let trace_cache = TwiddleCache::new(&trace_domain);
         let eval_cache = TwiddleCache::new(&eval_domain);
         let fri_twiddles = fri::precompute_fri_twiddles(log_eval_size, 3);
-        ProverCache { trace_cache, eval_cache, fri_twiddles, log_n, log_eval_size }
+
+        let bytes = (1usize << log_n) * std::mem::size_of::<u32>();
+        let mut pinned_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let err = unsafe { ffi::cudaMallocHost(&mut pinned_ptr, bytes) };
+        assert!(err == 0, "cudaMallocHost failed: {err}");
+
+        ProverCache {
+            trace_cache, eval_cache, fri_twiddles, log_n, log_eval_size,
+            pinned_trace: pinned_ptr as *mut u32,
+        }
+    }
+}
+
+impl Drop for ProverCache {
+    fn drop(&mut self) {
+        if !self.pinned_trace.is_null() {
+            unsafe { ffi::cudaFreeHost(self.pinned_trace as *mut std::ffi::c_void) };
+        }
     }
 }
 
@@ -102,7 +124,7 @@ fn prove_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
         eprintln!("  twiddle_setup: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
     }
 
-    // --- Step 1: Generate trace (CPU) → upload once ---
+    // --- Step 1: Generate trace (CPU) → upload ---
     let t0 = Instant::now();
     let trace_raw = air::fibonacci_trace_raw(a, b, log_n);
     let mut d_trace = DeviceBuffer::from_host(&trace_raw);
@@ -269,14 +291,18 @@ fn prove_with_cache(a: M31, b: M31, cache: &ProverCache, timed: bool) -> StarkPr
 
     let t_total = Instant::now();
 
-    // --- Step 1: Generate trace (CPU) → upload ---
-    let t0 = Instant::now();
-    let trace_raw = air::fibonacci_trace_raw(a, b, log_n);
-    let mut d_trace = DeviceBuffer::from_host(&trace_raw);
-    if timed {
-        unsafe { ffi::cuda_device_sync() };
-        eprintln!("  trace_gen+upload: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+    // --- Step 1: Generate trace into pinned memory → fast upload ---
+    let p = crate::field::m31::P;
+    let trace = cache.pinned_trace;
+    unsafe {
+        *trace.add(0) = a.0;
+        *trace.add(1) = b.0;
+        for i in 2..n {
+            let sum = *trace.add(i - 1) + *trace.add(i - 2);
+            *trace.add(i) = if sum >= p { sum - p } else { sum };
+        }
     }
+    let mut d_trace = unsafe { DeviceBuffer::from_pinned(trace as *const u32, n) };
 
     // --- Step 2: Interpolate ---
     ntt::interpolate(&mut d_trace, &cache.trace_cache);

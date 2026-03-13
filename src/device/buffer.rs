@@ -36,6 +36,24 @@ impl<T> DeviceBuffer<T> {
         }
     }
 
+    /// Upload from a pinned host buffer (faster DMA transfer).
+    /// The caller must provide a pinned (page-locked) slice allocated via cudaMallocHost.
+    /// SAFETY: `data` must point to pinned host memory.
+    pub unsafe fn from_pinned(data: *const T, len: usize) -> Self {
+        let buf = Self::alloc(len);
+        if len > 0 {
+            let bytes = len * std::mem::size_of::<T>();
+            let err = unsafe { ffi::cudaMemcpy(
+                buf.ptr as *mut c_void,
+                data as *const c_void,
+                bytes,
+                ffi::MEMCPY_H2D,
+            ) };
+            assert!(err == 0, "cudaMemcpy H2D (pinned) failed: error {err}");
+        }
+        buf
+    }
+
     /// Upload host slice to a new GPU buffer.
     pub fn from_host(data: &[T]) -> Self {
         let buf = Self::alloc(data.len());

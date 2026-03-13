@@ -8,7 +8,9 @@
 //!   1. Boundary: t[0] = a, t[1] = b
 //!   2. Transition: t[i+2] - t[i+1] - t[i] = 0 for i in [0, n-2)
 
+use crate::cuda::ffi;
 use crate::field::M31;
+use std::ffi::c_void;
 
 /// Fibonacci trace: one column of M31 values.
 pub fn fibonacci_trace(a: M31, b: M31, log_n: u32) -> Vec<M31> {
@@ -40,6 +42,39 @@ pub fn fibonacci_trace_raw(a: M31, b: M31, log_n: u32) -> Vec<u32> {
         unsafe { *trace.get_unchecked_mut(i) = val };
     }
     trace
+}
+
+/// Generate Fibonacci trace directly into pinned host memory and upload.
+/// Returns a DeviceBuffer containing the trace on GPU.
+/// Pinned memory enables faster DMA transfer (~2x vs pageable).
+pub fn fibonacci_trace_to_device(a: M31, b: M31, log_n: u32) -> crate::device::DeviceBuffer<u32> {
+    let n = 1usize << log_n;
+    let p = crate::field::m31::P;
+    let bytes = n * std::mem::size_of::<u32>();
+
+    // Allocate pinned host memory
+    let mut pinned_ptr: *mut c_void = std::ptr::null_mut();
+    let err = unsafe { ffi::cudaMallocHost(&mut pinned_ptr, bytes) };
+    assert!(err == 0, "cudaMallocHost failed: {err}");
+    let trace = pinned_ptr as *mut u32;
+
+    // Generate Fibonacci trace into pinned buffer
+    unsafe {
+        *trace.add(0) = a.0;
+        *trace.add(1) = b.0;
+        for i in 2..n {
+            let sum = *trace.add(i - 1) + *trace.add(i - 2);
+            *trace.add(i) = if sum >= p { sum - p } else { sum };
+        }
+    }
+
+    // Upload from pinned memory (faster DMA)
+    let buf = unsafe { crate::device::DeviceBuffer::from_pinned(trace as *const u32, n) };
+
+    // Free pinned host memory
+    unsafe { ffi::cudaFreeHost(pinned_ptr) };
+
+    buf
 }
 
 /// Evaluate the transition constraint at a single point.

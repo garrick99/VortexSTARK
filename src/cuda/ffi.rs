@@ -13,6 +13,8 @@ unsafe extern "C" {
     pub fn cudaMemset(dev_ptr: *mut c_void, value: i32, count: usize) -> i32;
     pub fn cudaDeviceSynchronize() -> i32;
     pub fn cudaGetLastError() -> i32;
+    pub fn cudaMallocHost(ptr: *mut *mut c_void, size: usize) -> i32;
+    pub fn cudaFreeHost(ptr: *mut c_void) -> i32;
     pub fn cudaDeviceGetDefaultMemPool(pool: *mut *mut c_void, device: i32) -> i32;
     pub fn cudaMemPoolSetAttribute(pool: *mut c_void, attr: i32, value: *const c_void) -> i32;
 }
