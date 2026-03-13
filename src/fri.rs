@@ -94,7 +94,6 @@ fn compute_fold_twiddles_gpu(domain: &Coset, extract_y: bool) -> DeviceBuffer<u3
     let mut d_result = DeviceBuffer::<u32>::alloc(half_n);
     unsafe {
         ffi::cuda_batch_inverse_m31(d_sources.as_ptr(), d_result.as_mut_ptr(), half_n as u32);
-        ffi::cuda_device_sync();
     }
 
     d_result

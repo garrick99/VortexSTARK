@@ -16,6 +16,7 @@ unsafe impl<T: Send> Send for DeviceBuffer<T> {}
 
 impl<T> DeviceBuffer<T> {
     /// Allocate `len` elements on the GPU (uninitialized).
+    /// Uses cudaMallocAsync for pool-based allocation (near-zero overhead).
     pub fn alloc(len: usize) -> Self {
         if len == 0 {
             return Self {
@@ -26,8 +27,8 @@ impl<T> DeviceBuffer<T> {
         }
         let bytes = len * std::mem::size_of::<T>();
         let mut ptr: *mut c_void = std::ptr::null_mut();
-        let err = unsafe { ffi::cudaMalloc(&mut ptr, bytes) };
-        assert!(err == 0, "cudaMalloc failed: error {err}");
+        let err = unsafe { ffi::cudaMallocAsync(&mut ptr, bytes, std::ptr::null_mut()) };
+        assert!(err == 0, "cudaMallocAsync failed: error {err}");
         Self {
             ptr: ptr as *mut T,
             len,
@@ -126,7 +127,7 @@ impl<T> AsRef<DeviceBuffer<T>> for DeviceBuffer<T> {
 impl<T> Drop for DeviceBuffer<T> {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            unsafe { ffi::cudaFree(self.ptr as *mut c_void) };
+            unsafe { ffi::cudaFreeAsync(self.ptr as *mut c_void, std::ptr::null_mut()) };
         }
     }
 }

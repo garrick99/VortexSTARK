@@ -185,6 +185,53 @@ __global__ void merkle_hash_nodes_kernel(
     out[4]=h4; out[5]=h5; out[6]=h6; out[7]=h7;
 }
 
+// Fused leaf hash + first node level for 4-column SoA (SecureColumn / QM31).
+// Each thread processes a PAIR of leaves: hashes both leaves, then hashes
+// the two leaf hashes together to produce one parent node.
+// Eliminates the leaf hash buffer and one kernel launch.
+__global__ void merkle_hash_leaves_and_merge_soa4_kernel(
+    const uint32_t* __restrict__ col0,
+    const uint32_t* __restrict__ col1,
+    const uint32_t* __restrict__ col2,
+    const uint32_t* __restrict__ col3,
+    uint32_t* __restrict__ parents,
+    uint32_t n_pairs // = n_leaves / 2
+) {
+    uint32_t pair = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pair >= n_pairs) return;
+
+    uint32_t left_idx = pair * 2;
+    uint32_t right_idx = pair * 2 + 1;
+
+    // Hash left leaf (4 words input)
+    uint32_t lh0=IV0^0x01010020, lh1=IV1, lh2=IV2, lh3=IV3;
+    uint32_t lh4=IV4, lh5=IV5, lh6=IV6, lh7=IV7;
+    blake2s_compress(lh0,lh1,lh2,lh3,lh4,lh5,lh6,lh7,
+                     col0[left_idx], col1[left_idx], col2[left_idx], col3[left_idx],
+                     0,0,0,0, 0,0,0,0, 0,0,0,0,
+                     16, 0xFFFFFFFF);
+
+    // Hash right leaf (4 words input)
+    uint32_t rh0=IV0^0x01010020, rh1=IV1, rh2=IV2, rh3=IV3;
+    uint32_t rh4=IV4, rh5=IV5, rh6=IV6, rh7=IV7;
+    blake2s_compress(rh0,rh1,rh2,rh3,rh4,rh5,rh6,rh7,
+                     col0[right_idx], col1[right_idx], col2[right_idx], col3[right_idx],
+                     0,0,0,0, 0,0,0,0, 0,0,0,0,
+                     16, 0xFFFFFFFF);
+
+    // Hash the two leaf hashes together (64 bytes = 16 words input)
+    uint32_t ph0=IV0^0x01010020, ph1=IV1, ph2=IV2, ph3=IV3;
+    uint32_t ph4=IV4, ph5=IV5, ph6=IV6, ph7=IV7;
+    blake2s_compress(ph0,ph1,ph2,ph3,ph4,ph5,ph6,ph7,
+                     lh0,lh1,lh2,lh3,lh4,lh5,lh6,lh7,
+                     rh0,rh1,rh2,rh3,rh4,rh5,rh6,rh7,
+                     64, 0xFFFFFFFF);
+
+    uint32_t* out = &parents[pair * 8];
+    out[0]=ph0; out[1]=ph1; out[2]=ph2; out[3]=ph3;
+    out[4]=ph4; out[5]=ph5; out[6]=ph6; out[7]=ph7;
+}
+
 extern "C" {
 
 void cuda_merkle_hash_leaves(
@@ -206,6 +253,22 @@ void cuda_merkle_hash_nodes(
     uint32_t threads = 256;
     uint32_t blocks = (n_parents + threads - 1) / threads;
     merkle_hash_nodes_kernel<<<blocks, threads>>>(children, parents, n_parents);
+}
+
+// Fused leaf hash + first node merge for 4-column SoA data.
+// Produces n_leaves/2 parent hashes (skipping the leaf hash buffer entirely).
+void cuda_merkle_hash_leaves_merge_soa4(
+    const uint32_t* col0, const uint32_t* col1,
+    const uint32_t* col2, const uint32_t* col3,
+    uint32_t* parents,
+    uint32_t n_leaves
+) {
+    uint32_t n_pairs = n_leaves / 2;
+    uint32_t threads = 256;
+    uint32_t blocks = (n_pairs + threads - 1) / threads;
+    merkle_hash_leaves_and_merge_soa4_kernel<<<blocks, threads>>>(
+        col0, col1, col2, col3, parents, n_pairs
+    );
 }
 
 } // extern "C"

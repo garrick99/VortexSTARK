@@ -44,6 +44,9 @@ fn main() {
     println!("==============================");
     println!("GPU: RTX 5090 (SM 12.0), CUDA 13.0\n");
 
+    // --- Init CUDA memory pool (async alloc/free, zero overhead reuse) ---
+    ffi::init_memory_pool();
+
     // --- GPU warmup ---
     let _ = DeviceBuffer::<u32>::alloc(1024);
     unsafe { ffi::cuda_device_sync() };

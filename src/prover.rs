@@ -19,7 +19,13 @@ use crate::field::{M31, QM31};
 use crate::fri::{self, SecureColumn};
 use crate::merkle::MerkleTree;
 use crate::ntt::{self, TwiddleCache};
+use std::sync::Once;
 use std::time::Instant;
+
+static POOL_INIT: Once = Once::new();
+fn ensure_pool_init() {
+    POOL_INIT.call_once(|| ffi::init_memory_pool());
+}
 
 /// Blowup factor: evaluation domain is 2^BLOWUP_BITS times the trace domain.
 const BLOWUP_BITS: u32 = 1; // blowup factor = 2
@@ -78,6 +84,7 @@ pub fn prove_cached(a: M31, b: M31, cache: &ProverCache) -> StarkProof {
 }
 
 fn prove_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
+    ensure_pool_init();
     assert!(log_n >= 4, "trace too small");
     let n = 1usize << log_n;
     let log_eval_size = log_n + BLOWUP_BITS;
@@ -169,7 +176,11 @@ fn prove_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
 
     // --- Step 6: Commit quotient (GPU Merkle) ---
     let t0 = Instant::now();
-    let quotient_commitment = MerkleTree::commit_root_only(&quotient_col.cols, log_eval_size);
+    let quotient_commitment = MerkleTree::commit_root_soa4(
+        &quotient_col.cols[0], &quotient_col.cols[1],
+        &quotient_col.cols[2], &quotient_col.cols[3],
+        log_eval_size,
+    );
     channel.mix_digest(&quotient_commitment);
     if timed {
         eprintln!("  quotient_commit: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
@@ -197,7 +208,11 @@ fn prove_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     drop(current_eval); // free source data after fold
     current_log_size -= 1;
 
-    let fri_root = MerkleTree::commit_root_only(&line_eval.cols, current_log_size);
+    let fri_root = MerkleTree::commit_root_soa4(
+        &line_eval.cols[0], &line_eval.cols[1],
+        &line_eval.cols[2], &line_eval.cols[3],
+        current_log_size,
+    );
     fri_commitments.push(fri_root);
     channel.mix_digest(&fri_root);
     current_eval = line_eval;
@@ -213,7 +228,11 @@ fn prove_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
         twid_idx += 1;
         current_log_size -= 1;
 
-        let fri_root = MerkleTree::commit_root_only(&folded.cols, current_log_size);
+        let fri_root = MerkleTree::commit_root_soa4(
+            &folded.cols[0], &folded.cols[1],
+            &folded.cols[2], &folded.cols[3],
+            current_log_size,
+        );
         fri_commitments.push(fri_root);
         channel.mix_digest(&fri_root);
 
@@ -241,6 +260,7 @@ fn prove_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
 }
 
 fn prove_with_cache(a: M31, b: M31, cache: &ProverCache, timed: bool) -> StarkProof {
+    ensure_pool_init();
     let log_n = cache.log_n;
     assert!(log_n >= 4, "trace too small");
     let n = 1usize << log_n;
@@ -299,7 +319,11 @@ fn prove_with_cache(a: M31, b: M31, cache: &ProverCache, timed: bool) -> StarkPr
     };
 
     // --- Step 6: Commit quotient ---
-    let quotient_commitment = MerkleTree::commit_root_only(&quotient_col.cols, log_eval_size);
+    let quotient_commitment = MerkleTree::commit_root_soa4(
+        &quotient_col.cols[0], &quotient_col.cols[1],
+        &quotient_col.cols[2], &quotient_col.cols[3],
+        log_eval_size,
+    );
     channel.mix_digest(&quotient_commitment);
 
     // --- Step 7: FRI ---
@@ -317,7 +341,11 @@ fn prove_with_cache(a: M31, b: M31, cache: &ProverCache, timed: bool) -> StarkPr
     drop(current_eval);
     current_log_size -= 1;
 
-    let fri_root = MerkleTree::commit_root_only(&line_eval.cols, current_log_size);
+    let fri_root = MerkleTree::commit_root_soa4(
+        &line_eval.cols[0], &line_eval.cols[1],
+        &line_eval.cols[2], &line_eval.cols[3],
+        current_log_size,
+    );
     fri_commitments.push(fri_root);
     channel.mix_digest(&fri_root);
     current_eval = line_eval;
@@ -333,7 +361,11 @@ fn prove_with_cache(a: M31, b: M31, cache: &ProverCache, timed: bool) -> StarkPr
         twid_idx += 1;
         current_log_size -= 1;
 
-        let fri_root = MerkleTree::commit_root_only(&folded.cols, current_log_size);
+        let fri_root = MerkleTree::commit_root_soa4(
+            &folded.cols[0], &folded.cols[1],
+            &folded.cols[2], &folded.cols[3],
+            current_log_size,
+        );
         fri_commitments.push(fri_root);
         channel.mix_digest(&fri_root);
         current_eval = folded;

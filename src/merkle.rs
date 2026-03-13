@@ -152,6 +152,51 @@ impl MerkleTree {
         root
     }
 
+    /// Build Merkle root from 4-column SoA data (SecureColumn / QM31).
+    /// Fuses leaf hash + first node level into a single kernel, saving one
+    /// kernel launch and eliminating the full leaf hash buffer.
+    pub fn commit_root_soa4(
+        col0: &DeviceBuffer<u32>,
+        col1: &DeviceBuffer<u32>,
+        col2: &DeviceBuffer<u32>,
+        col3: &DeviceBuffer<u32>,
+        log_n_leaves: u32,
+    ) -> [u32; HASH_WORDS] {
+        let n_leaves = 1u32 << log_n_leaves;
+
+        // Fused leaf hash + first node merge: produces n_leaves/2 parent hashes
+        let mut current_size = n_leaves / 2;
+        let mut current = DeviceBuffer::<u32>::alloc((current_size as usize) * HASH_WORDS);
+        unsafe {
+            ffi::cuda_merkle_hash_leaves_merge_soa4(
+                col0.as_ptr(), col1.as_ptr(),
+                col2.as_ptr(), col3.as_ptr(),
+                current.as_mut_ptr(),
+                n_leaves,
+            );
+        }
+
+        // Continue hashing up the tree
+        while current_size > 1 {
+            let parent_size = current_size / 2;
+            let mut parents = DeviceBuffer::<u32>::alloc((parent_size as usize) * HASH_WORDS);
+            unsafe {
+                ffi::cuda_merkle_hash_nodes(
+                    current.as_ptr(),
+                    parents.as_mut_ptr(),
+                    parent_size,
+                );
+            }
+            current = parents;
+            current_size = parent_size;
+        }
+
+        let host = current.to_host();
+        let mut root = [0u32; HASH_WORDS];
+        root.copy_from_slice(&host[..HASH_WORDS]);
+        root
+    }
+
     /// Generate a Merkle authentication path for leaf at `index`.
     /// Returns log_n sibling hashes (each HASH_WORDS u32).
     pub fn auth_path(&self, index: usize) -> Vec<[u32; HASH_WORDS]> {

@@ -6,16 +6,41 @@ use std::ffi::c_void;
 unsafe extern "C" {
     pub fn cudaMalloc(dev_ptr: *mut *mut c_void, size: usize) -> i32;
     pub fn cudaFree(dev_ptr: *mut c_void) -> i32;
+    pub fn cudaMallocAsync(dev_ptr: *mut *mut c_void, size: usize, stream: *mut c_void) -> i32;
+    pub fn cudaFreeAsync(dev_ptr: *mut c_void, stream: *mut c_void) -> i32;
     pub fn cudaMemcpy(dst: *mut c_void, src: *const c_void, count: usize, kind: i32) -> i32;
+    pub fn cudaMemcpyAsync(dst: *mut c_void, src: *const c_void, count: usize, kind: i32, stream: *mut c_void) -> i32;
     pub fn cudaMemset(dev_ptr: *mut c_void, value: i32, count: usize) -> i32;
     pub fn cudaDeviceSynchronize() -> i32;
     pub fn cudaGetLastError() -> i32;
+    pub fn cudaDeviceGetDefaultMemPool(pool: *mut *mut c_void, device: i32) -> i32;
+    pub fn cudaMemPoolSetAttribute(pool: *mut c_void, attr: i32, value: *const c_void) -> i32;
 }
 
 // cudaMemcpyKind
 pub const MEMCPY_H2D: i32 = 1;
 pub const MEMCPY_D2H: i32 = 2;
 pub const MEMCPY_D2D: i32 = 3;
+
+// cudaMemPoolAttr
+pub const MEMPOOL_ATTR_RELEASE_THRESHOLD: i32 = 4;
+
+/// Initialize CUDA memory pool for async allocation. Call once at startup.
+/// Sets the default pool's release threshold to MAX so freed memory stays in the pool.
+pub fn init_memory_pool() {
+    unsafe {
+        let mut pool: *mut std::ffi::c_void = std::ptr::null_mut();
+        let err = cudaDeviceGetDefaultMemPool(&mut pool, 0);
+        assert!(err == 0, "cudaDeviceGetDefaultMemPool failed: {err}");
+        let threshold: u64 = u64::MAX;
+        let err = cudaMemPoolSetAttribute(
+            pool,
+            MEMPOOL_ATTR_RELEASE_THRESHOLD,
+            &threshold as *const u64 as *const std::ffi::c_void,
+        );
+        assert!(err == 0, "cudaMemPoolSetAttribute failed: {err}");
+    }
+}
 
 // Field operation kernels
 unsafe extern "C" {
@@ -159,5 +184,12 @@ unsafe extern "C" {
         children: *const u32,
         parents: *mut u32,
         n_parents: u32,
+    );
+
+    pub fn cuda_merkle_hash_leaves_merge_soa4(
+        col0: *const u32, col1: *const u32,
+        col2: *const u32, col3: *const u32,
+        parents: *mut u32,
+        n_leaves: u32,
     );
 }

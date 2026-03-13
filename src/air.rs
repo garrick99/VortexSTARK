@@ -23,15 +23,21 @@ pub fn fibonacci_trace(a: M31, b: M31, log_n: u32) -> Vec<M31> {
 }
 
 /// Fibonacci trace as raw u32 values (avoids M31 → u32 conversion step).
+/// Uses branchless M31 reduction (no division): sum of two values < P fits in u32,
+/// then subtract P if >= P.
 pub fn fibonacci_trace_raw(a: M31, b: M31, log_n: u32) -> Vec<u32> {
     let n = 1usize << log_n;
-    let p = crate::field::m31::P as u64;
-    let mut trace = vec![0u32; n];
+    let p = crate::field::m31::P;
+    let mut trace = Vec::with_capacity(n);
+    // SAFETY: every element [0..n) is written before read.
+    unsafe { trace.set_len(n) };
     trace[0] = a.0;
     trace[1] = b.0;
     for i in 2..n {
-        let sum = trace[i - 1] as u64 + trace[i - 2] as u64;
-        trace[i] = (sum % p) as u32;
+        // Both values < P = 2^31-1, so sum < 2^32-4, fits in u32.
+        let sum = unsafe { *trace.get_unchecked(i - 1) + *trace.get_unchecked(i - 2) };
+        let val = if sum >= p { sum - p } else { sum };
+        unsafe { *trace.get_unchecked_mut(i) = val };
     }
     trace
 }
