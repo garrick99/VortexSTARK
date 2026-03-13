@@ -107,5 +107,22 @@ fn main() {
         "[OK] Batch NTT {n_cols}x log_n={log_n}: fwd {batch_fwd_us:.1}us, inv {batch_inv_us:.1}us"
     );
 
+    // --- STARK prover benchmark ---
+    println!("\n--- STARK Prover ---");
+    for log_n in [8u32, 12, 16, 20] {
+        let a = kraken_stark::field::M31(1);
+        let b = kraken_stark::field::M31(1);
+
+        let t0 = Instant::now();
+        let proof = kraken_stark::prover::prove(a, b, log_n);
+        let prove_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        println!(
+            "[OK] prove log_n={log_n} (n={}): {prove_ms:.1}ms, {} FRI layers",
+            1u32 << log_n,
+            proof.fri_commitments.len(),
+        );
+    }
+
     println!("\nDone.");
 }

@@ -5,3 +5,6 @@ pub mod circle;
 pub mod ntt;
 pub mod merkle;
 pub mod fri;
+pub mod channel;
+pub mod air;
+pub mod prover;
