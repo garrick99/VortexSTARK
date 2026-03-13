@@ -79,3 +79,39 @@ unsafe extern "C" {
         d_scratch2: *mut u32,
     );
 }
+
+// FRI fold kernels (SoA layout)
+unsafe extern "C" {
+    pub fn cuda_fold_line_soa(
+        in0: *const u32, in1: *const u32, in2: *const u32, in3: *const u32,
+        twiddles: *const u32,
+        out0: *mut u32, out1: *mut u32, out2: *mut u32, out3: *mut u32,
+        alpha: *const u32, // [4] on host
+        half_n: u32,
+    );
+
+    pub fn cuda_fold_circle_into_line_soa(
+        dst0: *mut u32, dst1: *mut u32, dst2: *mut u32, dst3: *mut u32,
+        src0: *const u32, src1: *const u32, src2: *const u32, src3: *const u32,
+        twiddles: *const u32,
+        alpha: *const u32,     // [4] on host
+        alpha_sq: *const u32,  // [4] on host
+        half_n: u32,
+    );
+}
+
+// Blake2s Merkle tree kernels
+unsafe extern "C" {
+    pub fn cuda_merkle_hash_leaves(
+        columns: *const *const u32,
+        hashes: *mut u32,
+        n_cols: u32,
+        n_leaves: u32,
+    );
+
+    pub fn cuda_merkle_hash_nodes(
+        children: *const u32,
+        parents: *mut u32,
+        n_parents: u32,
+    );
+}
