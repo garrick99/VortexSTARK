@@ -236,6 +236,40 @@ fn main() {
     }
 
     // =============================================
+    // STARK prover — pipelined (overlapped trace gen)
+    // =============================================
+    println!("=== STARK Prover (pipelined, overlapped trace gen) ===");
+    for log_n in [8u32, 12, 16, 20] {
+        let n_elem = 1u32 << log_n;
+        let pipeline = kraken_stark::prover::ProverPipeline::new(log_n);
+
+        // warmup
+        let _ = pipeline.prove_batch(&[(M31(1), M31(1)); 3]);
+
+        let batch_size = match log_n {
+            20 => 30,
+            16 => 100,
+            _ => 200,
+        };
+
+        let inputs: Vec<(M31, M31)> = (0..batch_size)
+            .map(|i| (M31((i + 1) as u32), M31((i + 2) as u32)))
+            .collect();
+
+        let t0 = Instant::now();
+        let _proofs = pipeline.prove_batch(&inputs);
+        let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let per_proof = total_ms / batch_size as f64;
+        let proofs_per_sec = 1000.0 / per_proof;
+
+        println!(
+            "  log_n={log_n} (n={n_elem}){:>8}  {per_proof:.3}ms/proof  {proofs_per_sec:.1} proofs/sec  (batch={batch_size})",
+            ""
+        );
+    }
+    println!();
+
+    // =============================================
     // Detailed profile (single-run, timed stages)
     // =============================================
     for profile_log_n in [16u32, 20] {
@@ -254,17 +288,19 @@ fn main() {
     // =============================================
     // Summary table
     // =============================================
-    println!("=== Summary (uncached / cached) ===");
-    println!("  {:>8}  {:>14}  {:>14}  {:>14}  {:>14}", "log_n", "uncached (ms)", "cached (ms)", "uncached p/s", "cached p/s");
-    println!("  {:>8}  {:>14}  {:>14}  {:>14}  {:>14}", "-----", "-------------", "-----------", "------------", "----------");
+    println!("=== Summary (uncached / cached / pipelined) ===");
+    println!("  {:>8}  {:>14}  {:>14}  {:>14}  {:>14}  {:>14}  {:>14}", "log_n", "uncached (ms)", "cached (ms)", "pipeline (ms)", "uncached p/s", "cached p/s", "pipeline p/s");
+    println!("  {:>8}  {:>14}  {:>14}  {:>14}  {:>14}  {:>14}  {:>14}", "-----", "-------------", "-----------", "-------------", "------------", "----------", "------------");
     for log_n in [8u32, 12, 16, 20] {
         let a = M31(1);
         let b = M31(1);
         let cache = kraken_stark::prover::ProverCache::new(log_n);
+        let pipeline = kraken_stark::prover::ProverPipeline::new(log_n);
 
         // warmup
         let _ = kraken_stark::prover::prove(a, b, log_n);
         let _ = kraken_stark::prover::prove_cached(a, b, &cache);
+        let _ = pipeline.prove_batch(&[(a, b); 3]);
 
         let iters = match log_n {
             20 => 30,
@@ -285,11 +321,21 @@ fn main() {
             cached_times.push(t0.elapsed().as_secs_f64() * 1000.0);
         }
 
+        // Pipeline batch
+        let inputs: Vec<(M31, M31)> = (0..iters)
+            .map(|i| (M31((i + 1) as u32), M31((i + 2) as u32)))
+            .collect();
+        let t0 = Instant::now();
+        let _proofs = pipeline.prove_batch(&inputs);
+        let total_pipeline_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let pipeline_per_proof = total_pipeline_ms / iters as f64;
+
         let u = compute_stats(&mut uncached_times);
         let c = compute_stats(&mut cached_times);
         println!(
-            "  {:>8}  {:>14.3}  {:>14.3}  {:>14.1}  {:>14.1}",
-            log_n, u.median, c.median, 1000.0 / u.median, 1000.0 / c.median,
+            "  {:>8}  {:>14.3}  {:>14.3}  {:>14.3}  {:>14.1}  {:>14.1}  {:>14.1}",
+            log_n, u.median, c.median, pipeline_per_proof,
+            1000.0 / u.median, 1000.0 / c.median, 1000.0 / pipeline_per_proof,
         );
     }
 

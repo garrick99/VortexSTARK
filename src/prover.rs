@@ -503,6 +503,220 @@ fn prove_with_cache(a: M31, b: M31, cache: &ProverCache, timed: bool) -> StarkPr
     }
 }
 
+/// Double-buffered prover pipeline. Overlaps CPU trace generation for proof N+1
+/// with GPU processing of proof N, hiding the trace gen latency.
+pub struct ProverPipeline {
+    cache: ProverCache,
+    /// Second pinned buffer for double-buffering.
+    pinned_trace_b: *mut u32,
+}
+
+unsafe impl Send for ProverPipeline {}
+
+impl ProverPipeline {
+    pub fn new(log_n: u32) -> Self {
+        let cache = ProverCache::new(log_n);
+        let bytes = (1usize << log_n) * std::mem::size_of::<u32>();
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let err = unsafe { ffi::cudaMallocHost(&mut ptr, bytes) };
+        assert!(err == 0, "cudaMallocHost failed for pipeline buffer: {err}");
+        Self {
+            cache,
+            pinned_trace_b: ptr as *mut u32,
+        }
+    }
+
+    /// Get a reference to the underlying cache (for non-pipelined use).
+    pub fn cache(&self) -> &ProverCache {
+        &self.cache
+    }
+
+    /// Prove a batch of inputs with pipelined trace generation.
+    /// Returns proofs in order. Throughput is limited by max(trace_gen, gpu_work)
+    /// instead of trace_gen + gpu_work.
+    pub fn prove_batch(&self, inputs: &[(M31, M31)]) -> Vec<StarkProof> {
+        if inputs.is_empty() {
+            return Vec::new();
+        }
+
+        let log_n = self.cache.log_n;
+        let n = 1usize << log_n;
+        let buffers = [self.cache.pinned_trace, self.pinned_trace_b];
+        let mut proofs = Vec::with_capacity(inputs.len());
+
+        // Generate first trace (no overlap possible for the first one)
+        unsafe { air::fibonacci_trace_parallel(inputs[0].0, inputs[0].1, log_n, buffers[0]) };
+
+        for i in 0..inputs.len() {
+            let current_buf = buffers[i % 2];
+
+            if i + 1 < inputs.len() {
+                // Overlap: generate next trace on CPU while GPU processes current proof
+                let next_buf = buffers[(i + 1) % 2];
+                let next_a = inputs[i + 1].0;
+                let next_b = inputs[i + 1].1;
+                let next_buf_addr = next_buf as usize;
+
+                std::thread::scope(|s| {
+                    // Background: generate next trace
+                    s.spawn(move || {
+                        let ptr = next_buf_addr as *mut u32;
+                        unsafe { air::fibonacci_trace_parallel(next_a, next_b, log_n, ptr) };
+                    });
+
+                    // Foreground: process current proof on GPU
+                    let proof = prove_from_pinned(current_buf, n, &self.cache);
+                    proofs.push(proof);
+                });
+            } else {
+                // Last proof: no overlap needed
+                let proof = prove_from_pinned(current_buf, n, &self.cache);
+                proofs.push(proof);
+            }
+        }
+
+        proofs
+    }
+}
+
+impl Drop for ProverPipeline {
+    fn drop(&mut self) {
+        if !self.pinned_trace_b.is_null() {
+            unsafe { ffi::cudaFreeHost(self.pinned_trace_b as *mut std::ffi::c_void) };
+        }
+    }
+}
+
+/// Prove from a pre-filled pinned trace buffer (used by pipeline).
+fn prove_from_pinned(pinned_trace: *const u32, n: usize, cache: &ProverCache) -> StarkProof {
+    let log_n = cache.log_n;
+    let log_eval_size = cache.log_eval_size;
+    let eval_size = 1usize << log_eval_size;
+
+    // Upload from pinned memory
+    let mut d_trace = unsafe { DeviceBuffer::from_pinned(pinned_trace, n) };
+
+    // Interpolate
+    ntt::interpolate(&mut d_trace, &cache.trace_cache);
+
+    // Zero-pad + evaluate on blowup domain
+    let mut d_eval = DeviceBuffer::<u32>::alloc(eval_size);
+    unsafe {
+        ffi::cuda_zero_pad(d_trace.as_ptr(), d_eval.as_mut_ptr(), n as u32, eval_size as u32);
+    }
+    drop(d_trace);
+    ntt::evaluate(&mut d_eval, &cache.eval_cache);
+
+    // Commit trace
+    let trace_ref = [&d_eval];
+    let trace_commitment = MerkleTree::commit_root_only(&trace_ref, log_eval_size);
+
+    // Quotient
+    let mut channel = Channel::new();
+    channel.mix_digest(&trace_commitment);
+    let alpha = channel.draw_felt();
+    let alpha_arr = alpha.to_u32_array();
+
+    let mut q0 = DeviceBuffer::<u32>::alloc(eval_size);
+    let mut q1 = DeviceBuffer::<u32>::alloc(eval_size);
+    let mut q2 = DeviceBuffer::<u32>::alloc(eval_size);
+    let mut q3 = DeviceBuffer::<u32>::alloc(eval_size);
+    unsafe {
+        ffi::cuda_fibonacci_quotient(
+            d_eval.as_ptr(),
+            q0.as_mut_ptr(), q1.as_mut_ptr(), q2.as_mut_ptr(), q3.as_mut_ptr(),
+            alpha_arr.as_ptr(),
+            eval_size as u32,
+        );
+    }
+    drop(d_eval);
+
+    let quotient_col = SecureColumn {
+        cols: [q0, q1, q2, q3],
+        len: eval_size,
+    };
+
+    // Commit quotient
+    let quotient_commitment = MerkleTree::commit_root_soa4(
+        &quotient_col.cols[0], &quotient_col.cols[1],
+        &quotient_col.cols[2], &quotient_col.cols[3],
+        log_eval_size,
+    );
+    channel.mix_digest(&quotient_commitment);
+
+    // FRI
+    let mut fri_commitments = Vec::new();
+    let mut current_eval = quotient_col;
+    let mut current_log_size = log_eval_size;
+
+    // Circle fold
+    let fri_alpha = channel.draw_felt();
+    let mut line_eval = SecureColumn::zeros(current_eval.len / 2);
+    fri::fold_circle_into_line_with_twiddles(
+        &mut line_eval, &current_eval, fri_alpha, &cache.fri_twiddles[0],
+    );
+    drop(current_eval);
+    current_log_size -= 1;
+
+    let fri_root = MerkleTree::commit_root_soa4(
+        &line_eval.cols[0], &line_eval.cols[1],
+        &line_eval.cols[2], &line_eval.cols[3],
+        current_log_size,
+    );
+    fri_commitments.push(fri_root);
+    channel.mix_digest(&fri_root);
+    current_eval = line_eval;
+
+    // Line folds (GPU)
+    let mut twid_idx = 1;
+    while current_log_size > FRI_CPU_TAIL_LOG.max(3) {
+        let fold_alpha = channel.draw_felt();
+        let folded = fri::fold_line_with_twiddles(
+            &current_eval, fold_alpha, &cache.fri_twiddles[twid_idx],
+        );
+        drop(current_eval);
+        twid_idx += 1;
+        current_log_size -= 1;
+
+        let fri_root = MerkleTree::commit_root_soa4(
+            &folded.cols[0], &folded.cols[1],
+            &folded.cols[2], &folded.cols[3],
+            current_log_size,
+        );
+        fri_commitments.push(fri_root);
+        channel.mix_digest(&fri_root);
+        current_eval = folded;
+    }
+
+    // CPU tail
+    let mut cpu_eval = current_eval.to_qm31();
+    drop(current_eval);
+
+    while current_log_size > 3 {
+        let fold_alpha = channel.draw_felt();
+        cpu_eval = fri::fold_line_cpu(
+            &cpu_eval, fold_alpha, &cache.fri_twiddles_host[twid_idx],
+        );
+        twid_idx += 1;
+        current_log_size -= 1;
+
+        let fri_root = fri::merkle_root_cpu(&cpu_eval);
+        fri_commitments.push(fri_root);
+        channel.mix_digest(&fri_root);
+    }
+
+    let fri_final = cpu_eval[0];
+
+    StarkProof {
+        trace_commitment,
+        quotient_commitment,
+        fri_commitments,
+        fri_final,
+        log_trace_size: log_n,
+        public_inputs: (M31(unsafe { *pinned_trace }), M31(unsafe { *pinned_trace.add(1) })),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,5 +753,38 @@ mod tests {
         let proof2 = prove(M31(2), M31(3), 5);
 
         assert_ne!(proof1.trace_commitment, proof2.trace_commitment);
+    }
+
+    #[test]
+    fn test_pipeline_matches_cached() {
+        let a = M31(1);
+        let b = M31(1);
+        let log_n = 6;
+
+        // Reference: cached proof
+        let cache = ProverCache::new(log_n);
+        let cached_proof = prove_cached(a, b, &cache);
+
+        // Pipeline proof
+        let pipeline = ProverPipeline::new(log_n);
+        let pipelined = pipeline.prove_batch(&[(a, b)]);
+        let pipe_proof = &pipelined[0];
+
+        assert_eq!(cached_proof.trace_commitment, pipe_proof.trace_commitment);
+        assert_eq!(cached_proof.quotient_commitment, pipe_proof.quotient_commitment);
+        assert_eq!(cached_proof.fri_commitments, pipe_proof.fri_commitments);
+        assert_eq!(cached_proof.fri_final, pipe_proof.fri_final);
+    }
+
+    #[test]
+    fn test_pipeline_batch() {
+        let pipeline = ProverPipeline::new(5);
+        let inputs = vec![(M31(1), M31(1)), (M31(2), M31(3)), (M31(5), M31(8))];
+        let proofs = pipeline.prove_batch(&inputs);
+
+        assert_eq!(proofs.len(), 3);
+        // Each proof should be different (different inputs)
+        assert_ne!(proofs[0].trace_commitment, proofs[1].trace_commitment);
+        assert_ne!(proofs[1].trace_commitment, proofs[2].trace_commitment);
     }
 }
