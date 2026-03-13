@@ -31,7 +31,7 @@ fn main() {
             .args([
                 "-c",
                 "-O3",
-                "--gpu-architecture=sm_100",
+                "--gpu-architecture=sm_120",
                 "--allow-unsupported-compiler",
                 "-Icuda/include",
                 "-o",
