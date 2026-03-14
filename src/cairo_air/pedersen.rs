@@ -143,22 +143,13 @@ impl PedersenBuiltin {
         Self { entries: Vec::new() }
     }
 
-    /// Invoke Pedersen hash. For now, returns a deterministic placeholder
-    /// (actual EC arithmetic over Stark252 is complex — will implement
-    /// using the windowed method).
+    /// Invoke Pedersen hash using real EC arithmetic on the STARK curve.
     pub fn invoke(&mut self, a: Stark252, b: Stark252) -> Stark252 {
-        // Placeholder: actual Pedersen requires full Stark252 EC arithmetic
-        // For the AIR integration test, we use a simple mixing function
-        let mut out = Stark252::ZERO;
-        for i in 0..N_LIMBS {
-            // Mix inputs deterministically (NOT cryptographically secure,
-            // but generates valid trace data for AIR testing)
-            let mixed = (a.limbs[i] as u64)
-                .wrapping_mul(0x9E3779B9) // golden ratio
-                .wrapping_add(b.limbs[i] as u64)
-                .wrapping_mul(0x517CC1B7);
-            out.limbs[i] = (mixed & 0x7FFF_FFFF) as u32;
-        }
+        use super::stark252_field::{Fp, pedersen_hash};
+        let fp_a = stark252_to_fp(&a);
+        let fp_b = stark252_to_fp(&b);
+        let fp_out = pedersen_hash(fp_a, fp_b);
+        let out = fp_to_stark252(&fp_out);
         self.entries.push((a, b, out));
         out
     }
@@ -201,6 +192,47 @@ impl PedersenBuiltin {
         }
         entries
     }
+}
+
+/// Convert Stark252 (9×31-bit limbs) to Fp (4×64-bit limbs).
+pub fn stark252_to_fp(s: &Stark252) -> super::stark252_field::Fp {
+    use super::stark252_field::Fp;
+    // Reassemble 252 bits from 31-bit limbs into 64-bit limbs
+    let mut bits = [0u8; 256];
+    for i in 0..N_LIMBS {
+        let val = s.limbs[i];
+        let n_bits = if i == N_LIMBS - 1 { 252 - 31 * (N_LIMBS - 1) } else { 31 };
+        for b in 0..n_bits {
+            bits[i * 31 + b] = ((val >> b) & 1) as u8;
+        }
+    }
+    let mut v = [0u64; 4];
+    for i in 0..252 {
+        if bits[i] == 1 {
+            v[i / 64] |= 1u64 << (i % 64);
+        }
+    }
+    Fp { v }
+}
+
+/// Convert Fp (4×64-bit limbs) to Stark252 (9×31-bit limbs).
+pub fn fp_to_stark252(fp: &super::stark252_field::Fp) -> Stark252 {
+    let mut bits = [0u8; 256];
+    for i in 0..252 {
+        if fp.v[i / 64] & (1u64 << (i % 64)) != 0 {
+            bits[i] = 1;
+        }
+    }
+    let mut limbs = [0u32; N_LIMBS];
+    for i in 0..N_LIMBS {
+        let n_bits = if i == N_LIMBS - 1 { 252 - 31 * (N_LIMBS - 1) } else { 31 };
+        for b in 0..n_bits {
+            if bits[i * 31 + b] == 1 {
+                limbs[i] |= 1 << b;
+            }
+        }
+    }
+    Stark252 { limbs }
 }
 
 pub const PEDERSEN_BUILTIN_BASE: u64 = 0x5000_0000;

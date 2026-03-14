@@ -460,10 +460,21 @@ impl Neg for Fp {
 }
 
 /// Point on the STARK elliptic curve: y² = x³ + x + β
+/// Affine representation for external interface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CurvePoint {
     Infinity,
     Affine(Fp, Fp), // (x, y)
+}
+
+/// Projective point: (X, Y, Z) where x = X/Z, y = Y/Z.
+/// No field inversions needed during point arithmetic — only one inversion
+/// at the end to convert back to affine.
+#[derive(Clone, Copy, Debug)]
+struct ProjectivePoint {
+    x: Fp,
+    y: Fp,
+    z: Fp,
 }
 
 /// Curve parameter β
@@ -471,58 +482,133 @@ pub fn curve_beta() -> Fp {
     Fp::from_hex("06f21413efbe40de150e596d72f7a8c5609ad26c15c915c1f4cdfcb99cee9e89")
 }
 
-impl CurvePoint {
-    /// Point addition on the STARK curve.
-    pub fn add(self, rhs: Self) -> Self {
-        match (self, rhs) {
-            (CurvePoint::Infinity, p) | (p, CurvePoint::Infinity) => p,
-            (CurvePoint::Affine(x1, y1), CurvePoint::Affine(x2, y2)) => {
-                if x1 == x2 {
-                    if y1 == y2 {
-                        // Point doubling
-                        if y1.is_zero() { return CurvePoint::Infinity; }
-                        // λ = (3x² + a) / (2y),  a = 1 for STARK curve
-                        let x1_sq = x1 * x1;
-                        let three_x1_sq = x1_sq + x1_sq + x1_sq;
-                        let num = three_x1_sq + Fp::ONE; // +a where a=1
-                        let denom = y1 + y1;
-                        let lambda = num * denom.inverse();
-                        let x3 = lambda * lambda - x1 - x2;
-                        let y3 = lambda * (x1 - x3) - y1;
-                        CurvePoint::Affine(x3, y3)
-                    } else {
-                        // x1 == x2, y1 != y2: point at infinity
-                        CurvePoint::Infinity
-                    }
-                } else {
-                    // Standard addition
-                    let lambda = (y2 - y1) * (x2 - x1).inverse();
-                    let x3 = lambda * lambda - x1 - x2;
-                    let y3 = lambda * (x1 - x3) - y1;
-                    CurvePoint::Affine(x3, y3)
-                }
-            }
+impl ProjectivePoint {
+    fn infinity() -> Self {
+        Self { x: Fp::ZERO, y: Fp::ONE, z: Fp::ZERO }
+    }
+
+    fn from_affine(x: Fp, y: Fp) -> Self {
+        Self { x, y, z: Fp::ONE }
+    }
+
+    fn is_infinity(&self) -> bool {
+        self.z.is_zero()
+    }
+
+    fn to_affine(self) -> CurvePoint {
+        if self.z.is_zero() {
+            CurvePoint::Infinity
+        } else {
+            let z_inv = self.z.inverse();
+            CurvePoint::Affine(self.x * z_inv, self.y * z_inv)
         }
     }
 
-    /// Scalar multiplication via double-and-add.
-    /// Scalar is a 252-bit value.
+    /// Point doubling in projective coordinates.
+    /// For y² = x³ + ax + b with a = 1:
+    /// Uses ~6M + ~4S (multiplications + squarings). No inversions.
+    fn double(self) -> Self {
+        if self.z.is_zero() { return self; }
+        let a = Fp::ONE; // STARK curve a = 1
+
+        let xx = self.x * self.x;
+        let yy = self.y * self.y;
+        let zz = self.z * self.z;
+        let xy2 = (self.x * self.y) + (self.x * self.y); // 2*x*y
+        let w = xx + xx + xx + a * zz * zz; // 3x² + a*z⁴... simplified for a=1
+        // Actually for short Weierstrass y²=x³+ax+b in Jacobian coords:
+        // Use simpler formulas. Let me use the standard Jacobian doubling:
+        // For y²=x³+ax+b, Jacobian: (X:Y:Z) represents (X/Z², Y/Z³)
+        // S = 4·X·Y²
+        // M = 3·X² + a·Z⁴
+        // X' = M² - 2·S
+        // Y' = M·(S - X') - 8·Y⁴
+        // Z' = 2·Y·Z
+
+        let s = (self.x * yy) + (self.x * yy) + (self.x * yy) + (self.x * yy); // 4·X·Y²
+        let zzzz = zz * zz;
+        let m = xx + xx + xx + a * zzzz; // 3X² + a·Z⁴
+
+        let x3 = m * m - s - s; // M² - 2S
+        let yyyy = yy * yy;
+        let eight_yyyy = yyyy + yyyy + yyyy + yyyy + yyyy + yyyy + yyyy + yyyy;
+        let y3 = m * (s - x3) - eight_yyyy; // M(S-X') - 8Y⁴
+        let z3 = (self.y + self.y) * self.z; // 2YZ
+
+        Self { x: x3, y: y3, z: z3 }
+    }
+
+    /// Point addition in projective (Jacobian) coordinates.
+    /// ~12M + ~4S. No inversions.
+    fn add(self, rhs: Self) -> Self {
+        if self.z.is_zero() { return rhs; }
+        if rhs.z.is_zero() { return self; }
+
+        let z1z1 = self.z * self.z;
+        let z2z2 = rhs.z * rhs.z;
+        let u1 = self.x * z2z2;
+        let u2 = rhs.x * z1z1;
+        let s1 = self.y * z2z2 * rhs.z;
+        let s2 = rhs.y * z1z1 * self.z;
+
+        let h = u2 - u1;
+        let r = s2 - s1;
+
+        if h.is_zero() {
+            if r.is_zero() {
+                return self.double();
+            }
+            return Self::infinity();
+        }
+
+        let hh = h * h;
+        let hhh = hh * h;
+        let x3 = r * r - hhh - u1 * hh - u1 * hh;
+        let y3 = r * (u1 * hh - x3) - s1 * hhh;
+        let z3 = self.z * rhs.z * h;
+
+        Self { x: x3, y: y3, z: z3 }
+    }
+}
+
+impl CurvePoint {
+    /// Point addition (delegates to projective, returns affine).
+    pub fn add(self, rhs: Self) -> Self {
+        let p1 = match self {
+            CurvePoint::Infinity => ProjectivePoint::infinity(),
+            CurvePoint::Affine(x, y) => ProjectivePoint::from_affine(x, y),
+        };
+        let p2 = match rhs {
+            CurvePoint::Infinity => ProjectivePoint::infinity(),
+            CurvePoint::Affine(x, y) => ProjectivePoint::from_affine(x, y),
+        };
+        p1.add(p2).to_affine()
+    }
+
+    /// Scalar multiplication via double-and-add in projective coordinates.
+    /// Only ONE field inversion at the end (to convert back to affine).
     pub fn scalar_mul(self, scalar: Fp) -> Self {
-        let mut result = CurvePoint::Infinity;
-        let mut base = self;
+        let base = match self {
+            CurvePoint::Infinity => return CurvePoint::Infinity,
+            CurvePoint::Affine(x, y) => ProjectivePoint::from_affine(x, y),
+        };
+
+        let mut result = ProjectivePoint::infinity();
+        let mut current = base;
 
         for limb_idx in 0..4 {
             let mut s = scalar.v[limb_idx];
-            let bits = if limb_idx == 3 { 60 } else { 64 }; // 252 bits total
+            let bits = if limb_idx == 3 { 60 } else { 64 };
             for _ in 0..bits {
                 if s & 1 == 1 {
-                    result = result.add(base);
+                    result = result.add(current);
                 }
-                base = base.add(base); // double
+                current = current.double();
                 s >>= 1;
             }
         }
-        result
+
+        result.to_affine() // single inversion here
     }
 }
 
