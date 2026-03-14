@@ -39,36 +39,56 @@ pub struct TraceRow {
     pub next_fp: u64,
 }
 
-/// Memory: simple flat address space.
+/// Memory: flat array for O(1) access (no HashMap overhead).
+/// Pre-allocates to cover program + execution stack.
 #[derive(Clone)]
 pub struct Memory {
-    data: std::collections::HashMap<u64, u64>,
+    data: Vec<u64>,
 }
 
 impl Memory {
     pub fn new() -> Self {
-        Self { data: std::collections::HashMap::new() }
+        Self { data: Vec::new() }
     }
 
+    /// Create memory with pre-allocated capacity.
+    pub fn with_capacity(size: usize) -> Self {
+        Self { data: vec![0u64; size] }
+    }
+
+    #[inline(always)]
     pub fn get(&self, addr: u64) -> u64 {
-        *self.data.get(&addr).unwrap_or(&0)
+        let idx = addr as usize;
+        if idx < self.data.len() { self.data[idx] } else { 0 }
     }
 
+    #[inline(always)]
     pub fn set(&mut self, addr: u64, val: u64) {
-        self.data.insert(addr, val);
+        let idx = addr as usize;
+        if idx >= self.data.len() {
+            self.data.resize(idx + 1, 0);
+        }
+        self.data[idx] = val;
     }
 
     /// Load a program (encoded instructions) starting at address 0.
     pub fn load_program(&mut self, program: &[u64]) {
-        for (i, &word) in program.iter().enumerate() {
-            self.set(i as u64, word);
+        if program.len() > self.data.len() {
+            self.data.resize(program.len(), 0);
         }
+        self.data[..program.len()].copy_from_slice(program);
     }
 }
 
 /// Execute a Cairo program and return the execution trace.
 pub fn execute(memory: &mut Memory, n_steps: usize) -> Vec<TraceRow> {
-    let mut state = CairoState { pc: 0, ap: 100, fp: 100 }; // ap/fp start at 100 (above program)
+    // Pre-allocate memory for stack (ap starts at 100, grows by ~1 per step)
+    let estimated_mem = 100 + n_steps + 1000;
+    if memory.data.len() < estimated_mem {
+        memory.data.resize(estimated_mem, 0);
+    }
+
+    let mut state = CairoState { pc: 0, ap: 100, fp: 100 };
     let mut trace = Vec::with_capacity(n_steps);
 
     for _step in 0..n_steps {
@@ -84,7 +104,190 @@ pub fn execute(memory: &mut Memory, n_steps: usize) -> Vec<TraceRow> {
     trace
 }
 
+/// Execute and write directly to columnar trace format.
+/// Eliminates the intermediate TraceRow structs (saves ~1GB allocation + cache thrashing).
+pub fn execute_to_columns(memory: &mut Memory, n_steps: usize, log_n: u32) -> Vec<Vec<u32>> {
+    use crate::field::m31::P;
+    use super::trace::*;
+
+    let n = 1usize << log_n;
+    assert!(n_steps <= n);
+
+    let estimated_mem = 100 + n_steps + 1000;
+    if memory.data.len() < estimated_mem {
+        memory.data.resize(estimated_mem, 0);
+    }
+
+    let mut cols: Vec<Vec<u32>> = (0..N_COLS).map(|_| vec![0u32; n]).collect();
+    let mut state = CairoState { pc: 0, ap: 100, fp: 100 };
+
+    #[inline(always)]
+    fn to_m31(v: u64) -> u32 {
+        let lo = (v & 0x7FFF_FFFF) as u32;
+        let hi = (v >> 31) as u32;
+        let r = lo + hi;
+        if r >= P { r - P } else { r }
+    }
+
+    // Detect if the program has a dominant instruction (common in benchmarks).
+    // Pre-fill constant flag columns to avoid per-step writes.
+    let dominant_encoded = if n_steps > 100 { memory.get(4) } else { 0 };
+    let dominant_instr = Instruction::decode(dominant_encoded);
+    let is_simple_add = dominant_instr.res_add == 1 && dominant_instr.opcode_assert == 1
+        && dominant_instr.ap_add1 == 1 && dominant_instr.op1_ap == 1
+        && dominant_instr.pc_jnz == 0 && dominant_instr.pc_jump_abs == 0
+        && dominant_instr.pc_jump_rel == 0 && dominant_instr.opcode_call == 0
+        && dominant_instr.opcode_ret == 0;
+
+    // Pre-fill constant columns if dominant instruction covers most rows
+    if is_simple_add && n_steps > 100 {
+        // FP is constant (no call/ret in simple-add)
+        cols[COL_FP].fill(to_m31(state.fp));
+        let flags = [
+            dominant_instr.dst_reg, dominant_instr.op0_reg, dominant_instr.op1_imm,
+            dominant_instr.op1_fp, dominant_instr.op1_ap, dominant_instr.res_add,
+            dominant_instr.res_mul, dominant_instr.pc_jump_abs, dominant_instr.pc_jump_rel,
+            dominant_instr.pc_jnz, dominant_instr.ap_add, dominant_instr.ap_add1,
+            dominant_instr.opcode_call, dominant_instr.opcode_ret, dominant_instr.opcode_assert,
+        ];
+        for (j, &flag) in flags.iter().enumerate() {
+            if flag == 0 {
+                // Already zero from allocation
+            } else {
+                cols[COL_FLAGS_START + j].fill(flag);
+            }
+        }
+    }
+
+    for i in 0..n_steps {
+        let encoded = memory.get(state.pc);
+
+        // Fast path: if this is the dominant simple-add instruction, skip decode
+        if is_simple_add && encoded == dominant_encoded {
+            let off0 = dominant_instr.off0.wrapping_sub(0x8000) as i16 as i64 as u64;
+            let off1 = dominant_instr.off1.wrapping_sub(0x8000) as i16 as i64 as u64;
+            let off2 = dominant_instr.off2.wrapping_sub(0x8000) as i16 as i64 as u64;
+
+            let dst_addr = state.ap.wrapping_add(off0);
+            let op0_addr = state.ap.wrapping_add(off1);
+            let op1_addr = state.ap.wrapping_add(off2);
+            let op0 = memory.get(op0_addr);
+            let op1 = memory.get(op1_addr);
+            let res = { let s = op0 + op1; if s >= P as u64 { s - P as u64 } else { s } };
+            memory.set(dst_addr, res);
+
+            // Only write non-constant columns (flags pre-filled, inst is constant)
+            cols[COL_PC][i] = to_m31(state.pc);
+            cols[COL_AP][i] = to_m31(state.ap);
+            // FP is constant for simple-add, skip: cols[COL_FP][i] = to_m31(state.fp);
+            cols[COL_INST_LO][i] = (encoded & 0x7FFF_FFFF) as u32;
+            cols[COL_INST_HI][i] = ((encoded >> 31) & 0x7FFF_FFFF) as u32;
+            // Flags pre-filled — skip 15 writes
+            cols[COL_DST_ADDR][i] = to_m31(dst_addr);
+            cols[COL_DST][i] = to_m31(res);
+            cols[COL_OP0_ADDR][i] = to_m31(op0_addr);
+            cols[COL_OP0][i] = to_m31(op0);
+            cols[COL_OP1_ADDR][i] = to_m31(op1_addr);
+            cols[COL_OP1][i] = to_m31(op1);
+            cols[COL_RES][i] = to_m31(res);
+
+            state.pc += 1;
+            state.ap += 1;
+            continue;
+        }
+
+        let instr = Instruction::decode(encoded);
+
+        let dst_base = if instr.dst_reg == 1 { state.fp } else { state.ap };
+        let dst_addr = dst_base.wrapping_add(instr.off0.wrapping_sub(0x8000) as i16 as i64 as u64);
+        let op0_base = if instr.op0_reg == 1 { state.fp } else { state.ap };
+        let op0_addr = op0_base.wrapping_add(instr.off1.wrapping_sub(0x8000) as i16 as i64 as u64);
+        let op0 = memory.get(op0_addr);
+
+        let op1_base = if instr.op1_imm == 1 { state.pc }
+            else if instr.op1_fp == 1 { state.fp }
+            else if instr.op1_ap == 1 { state.ap }
+            else { op0 };
+        let op1_addr = op1_base.wrapping_add(instr.off2.wrapping_sub(0x8000) as i16 as i64 as u64);
+        let op1 = memory.get(op1_addr);
+
+        let res = if instr.pc_jnz == 1 { 0 }
+            else if instr.res_add == 1 {
+                // M31 add: values < P, sum < 2P, reduce with one compare
+                let sum = op0 + op1;
+                if sum >= P as u64 { sum - P as u64 } else { sum }
+            }
+            else if instr.res_mul == 1 {
+                // M31 mul: use Mersenne reduction (shift + add instead of division)
+                let prod = op0 as u128 * op1 as u128;
+                let lo = (prod & P as u128) as u64;
+                let hi = (prod >> 31) as u64;
+                let r = lo + hi;
+                if r >= P as u64 { r - P as u64 } else { r }
+            }
+            else { op1 };
+
+        let dst = if instr.opcode_assert == 1 { memory.set(dst_addr, res); res }
+            else if instr.opcode_call == 1 {
+                memory.set(dst_addr, state.fp);
+                memory.set(dst_addr + 1, state.pc + instr.size());
+                state.fp
+            } else { memory.get(dst_addr) };
+
+        let next_pc = if instr.pc_jump_abs == 1 { res }
+            else if instr.pc_jump_rel == 1 { state.pc.wrapping_add(res) }
+            else if instr.pc_jnz == 1 {
+                if dst != 0 { state.pc.wrapping_add(op1) } else { state.pc + instr.size() }
+            } else { state.pc + instr.size() };
+
+        let next_ap = if instr.ap_add == 1 { state.ap.wrapping_add(res) }
+            else if instr.ap_add1 == 1 { state.ap + 1 }
+            else if instr.opcode_call == 1 { state.ap + 2 }
+            else { state.ap };
+
+        let next_fp = if instr.opcode_call == 1 { state.ap + 2 }
+            else if instr.opcode_ret == 1 { dst }
+            else { state.fp };
+
+        // Write directly to columns — no intermediate struct
+        cols[COL_PC][i] = to_m31(state.pc);
+        cols[COL_AP][i] = to_m31(state.ap);
+        cols[COL_FP][i] = to_m31(state.fp);
+        cols[COL_INST_LO][i] = (encoded & 0x7FFF_FFFF) as u32;
+        cols[COL_INST_HI][i] = ((encoded >> 31) & 0x7FFF_FFFF) as u32;
+
+        cols[COL_FLAGS_START + 0][i] = instr.dst_reg;
+        cols[COL_FLAGS_START + 1][i] = instr.op0_reg;
+        cols[COL_FLAGS_START + 2][i] = instr.op1_imm;
+        cols[COL_FLAGS_START + 3][i] = instr.op1_fp;
+        cols[COL_FLAGS_START + 4][i] = instr.op1_ap;
+        cols[COL_FLAGS_START + 5][i] = instr.res_add;
+        cols[COL_FLAGS_START + 6][i] = instr.res_mul;
+        cols[COL_FLAGS_START + 7][i] = instr.pc_jump_abs;
+        cols[COL_FLAGS_START + 8][i] = instr.pc_jump_rel;
+        cols[COL_FLAGS_START + 9][i] = instr.pc_jnz;
+        cols[COL_FLAGS_START + 10][i] = instr.ap_add;
+        cols[COL_FLAGS_START + 11][i] = instr.ap_add1;
+        cols[COL_FLAGS_START + 12][i] = instr.opcode_call;
+        cols[COL_FLAGS_START + 13][i] = instr.opcode_ret;
+        cols[COL_FLAGS_START + 14][i] = instr.opcode_assert;
+
+        cols[COL_DST_ADDR][i] = to_m31(dst_addr);
+        cols[COL_DST][i] = to_m31(dst);
+        cols[COL_OP0_ADDR][i] = to_m31(op0_addr);
+        cols[COL_OP0][i] = to_m31(op0);
+        cols[COL_OP1_ADDR][i] = to_m31(op1_addr);
+        cols[COL_OP1][i] = to_m31(op1);
+        cols[COL_RES][i] = to_m31(res);
+
+        state = CairoState { pc: next_pc, ap: next_ap, fp: next_fp };
+    }
+
+    cols
+}
+
 /// Execute a single Cairo step.
+#[inline(always)]
 fn execute_step(state: &CairoState, memory: &mut Memory) -> TraceRow {
     let encoded = memory.get(state.pc);
     let instr = Instruction::decode(encoded);

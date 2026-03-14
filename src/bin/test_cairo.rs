@@ -119,11 +119,14 @@ fn main() {
         // =============================================
         // Phase 1: Generate and commit execution trace
         // =============================================
+        let t_vm = Instant::now();
         let program = build_fib_program(n);
-        let mut mem = Memory::new();
+        let mut mem = Memory::with_capacity(n + 200);
         mem.load_program(&program);
-        let vm_trace = execute(&mut mem, n);
-        let columns = trace::trace_to_columns(&vm_trace, log_n);
+        // Fused execute + layout: writes directly to columns, no intermediate TraceRow structs
+        let columns = kraken_stark::cairo_air::vm::execute_to_columns(&mut mem, n, log_n);
+        let vm_ms = t_vm.elapsed().as_secs_f64() * 1000.0;
+        let layout_ms = 0.0; // fused into vm_ms
 
         let trace_domain = Coset::half_coset(log_n);
         let eval_domain = Coset::half_coset(log_eval_size);
@@ -298,9 +301,9 @@ fn main() {
         if all_zero {
             println!("SUSPICIOUS in {total_ms:.0}ms");
         } else {
-            let n_elements = n as u64 * (N_COLS as u64 + 4); // 27 trace + 4 interaction
-            println!("OK in {total_ms:.0}ms ({n_elements} elements, \
-                      phase1={phase1_ms:.0}ms phase2={phase2_ms:.0}ms phase3={phase3_ms:.0}ms)");
+            let n_elements = n as u64 * (N_COLS as u64 + 4);
+            println!("OK in {total_ms:.0}ms ({n_elements} elems, \
+                      vm={vm_ms:.0}ms layout={layout_ms:.0}ms gpu={phase2_ms:.0}+{phase3_ms:.0}ms)");
         }
     }
 }

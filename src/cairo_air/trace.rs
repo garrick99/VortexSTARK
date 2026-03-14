@@ -57,10 +57,19 @@ pub fn trace_to_columns(trace: &[TraceRow], log_n: u32) -> Vec<Vec<u32>> {
 
     let mut cols: Vec<Vec<u32>> = (0..N_COLS).map(|_| vec![0u32; n]).collect();
 
+    // Reduce u64 → M31: use bit trick instead of expensive % P division
+    #[inline(always)]
+    fn to_m31(v: u64) -> u32 {
+        let lo = (v & P as u64) as u32;
+        let hi = (v >> 31) as u32;
+        let r = lo + hi;
+        if r >= P { r - P } else { r }
+    }
+
     for (i, row) in trace.iter().enumerate() {
-        cols[COL_PC][i] = (row.pc % P as u64) as u32;
-        cols[COL_AP][i] = (row.ap % P as u64) as u32;
-        cols[COL_FP][i] = (row.fp % P as u64) as u32;
+        cols[COL_PC][i] = to_m31(row.pc);
+        cols[COL_AP][i] = to_m31(row.ap);
+        cols[COL_FP][i] = to_m31(row.fp);
 
         cols[COL_INST_LO][i] = (row.instruction & 0x7FFF_FFFF) as u32;
         cols[COL_INST_HI][i] = ((row.instruction >> 31) & 0x7FFF_FFFF) as u32;
@@ -69,13 +78,13 @@ pub fn trace_to_columns(trace: &[TraceRow], log_n: u32) -> Vec<Vec<u32>> {
             cols[COL_FLAGS_START + j][i] = flag;
         }
 
-        cols[COL_DST_ADDR][i] = (row.dst_addr % P as u64) as u32;
-        cols[COL_DST][i] = (row.dst % P as u64) as u32;
-        cols[COL_OP0_ADDR][i] = (row.op0_addr % P as u64) as u32;
-        cols[COL_OP0][i] = (row.op0 % P as u64) as u32;
-        cols[COL_OP1_ADDR][i] = (row.op1_addr % P as u64) as u32;
-        cols[COL_OP1][i] = (row.op1 % P as u64) as u32;
-        cols[COL_RES][i] = (row.res % P as u64) as u32;
+        cols[COL_DST_ADDR][i] = to_m31(row.dst_addr);
+        cols[COL_DST][i] = to_m31(row.dst);
+        cols[COL_OP0_ADDR][i] = to_m31(row.op0_addr);
+        cols[COL_OP0][i] = to_m31(row.op0);
+        cols[COL_OP1_ADDR][i] = to_m31(row.op1_addr);
+        cols[COL_OP1][i] = to_m31(row.op1);
+        cols[COL_RES][i] = to_m31(row.res);
     }
 
     cols
