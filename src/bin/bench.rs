@@ -339,5 +339,95 @@ fn main() {
         );
     }
 
+    // =============================================
+    // Scaling curve: push log_n until we hit limits
+    // =============================================
+    println!("\n=== Scaling Curve (cached) ===");
+    println!("  {:>8}  {:>10}  {:>14}  {:>14}  {:>14}  {:>14}",
+        "log_n", "n", "median (ms)", "proofs/sec", "M elem/s", "notes");
+    println!("  {:>8}  {:>10}  {:>14}  {:>14}  {:>14}  {:>14}",
+        "-----", "---", "-----------", "----------", "---------", "-----");
+
+    for log_n in 8..=28u32 {
+        let n: u64 = 1u64 << log_n;
+
+        // Estimate memory: ~60 bytes per element (trace + blowup + FRI SoA + merkle + twiddles)
+        let est_bytes = n * 60;
+        let est_gb = est_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        if est_gb > 28.0 {
+            println!("  {:>8}  {:>10}  {:>14}  {:>14}  {:>14}  skipped (~{:.1}GB > 28GB VRAM)",
+                log_n, format_n(n), "-", "-", "-", est_gb);
+            continue;
+        }
+
+        let a = M31(1);
+        let b = M31(1);
+
+        // Try to create cache; if it fails (OOM), stop gracefully
+        let cache = match std::panic::catch_unwind(|| {
+            kraken_stark::prover::ProverCache::new(log_n)
+        }) {
+            Ok(c) => c,
+            Err(_) => {
+                println!("  {:>8}  {:>10}  {:>14}  {:>14}  {:>14}  OOM at cache alloc",
+                    log_n, format_n(n), "-", "-", "-");
+                break;
+            }
+        };
+
+        // warmup — also catch OOM during prove
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = kraken_stark::prover::prove_cached(a, b, &cache);
+            let _ = kraken_stark::prover::prove_cached(a, b, &cache);
+        })).is_err() {
+            println!("  {:>8}  {:>10}  {:>14}  {:>14}  {:>14}  OOM during prove",
+                log_n, format_n(n), "-", "-", "-");
+            break;
+        }
+
+        let iters = if log_n >= 26 {
+            3
+        } else if log_n >= 24 {
+            5
+        } else if log_n >= 22 {
+            10
+        } else if log_n >= 20 {
+            20
+        } else if log_n >= 16 {
+            50
+        } else {
+            100
+        };
+
+        let mut times = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t0 = Instant::now();
+            let _proof = kraken_stark::prover::prove_cached(a, b, &cache);
+            times.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        let stats = compute_stats(&mut times);
+        let proofs_per_sec = 1000.0 / stats.median;
+        let m_elem_per_sec = (n as f64 / 1e6) / (stats.median / 1000.0);
+        let note = if est_gb > 1.0 {
+            format!("~{:.1}GB", est_gb)
+        } else {
+            String::new()
+        };
+        println!("  {:>8}  {:>10}  {:>14.3}  {:>14.1}  {:>14.1}  {}",
+            log_n, format_n(n), stats.median, proofs_per_sec, m_elem_per_sec, note);
+    }
+
     println!("\nDone.");
+}
+
+fn format_n(n: u64) -> String {
+    if n >= 1_000_000_000 {
+        format!("{:.1}B", n as f64 / 1e9)
+    } else if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1e6)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1e3)
+    } else {
+        format!("{}", n)
+    }
 }
