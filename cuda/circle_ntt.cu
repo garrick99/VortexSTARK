@@ -318,6 +318,23 @@ void cuda_circle_ntt_interpolate_batch(
     cudaDeviceSynchronize();
 }
 
+// Apply a single NTT butterfly layer (forward or inverse).
+// layer_idx: butterfly stride = 2^layer_idx. For circle layer use layer_idx=0.
+void cuda_circle_ntt_layer(
+    uint32_t* d_data,
+    const uint32_t* d_twiddles,
+    uint32_t layer_idx,
+    uint32_t n,
+    int forward
+) {
+    uint32_t half_n = n / 2;
+    uint32_t threads = 256;
+    uint32_t blocks = (half_n + threads - 1) / threads;
+    circle_ntt_layer_kernel<<<blocks, threads>>>(
+        d_data, d_twiddles, layer_idx, half_n, forward
+    );
+}
+
 void cuda_bit_reverse_m31(uint32_t* data, uint32_t log_n) {
     uint32_t n = 1u << log_n;
     uint32_t threads = 256;

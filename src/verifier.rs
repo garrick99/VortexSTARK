@@ -157,7 +157,13 @@ pub fn verify(proof: &StarkProof) -> Result<(), String> {
 
         // ---- Circle fold: quotient → FRI layer 0 ----
         {
-            let domain = Coset::half_coset(current_log);
+            // At log_eval_size=31 (log_n=30), the eval domain is the full circle group.
+            // half_coset(31) doesn't exist, so use subgroup(31) instead.
+            let domain = if current_log <= 30 {
+                Coset::half_coset(current_log)
+            } else {
+                Coset::subgroup(current_log)
+            };
             let folded_idx = current_idx / 2;
             let (f0, f1) = get_pair_from_decom_4(
                 &proof.quotient_decommitment.values[q],

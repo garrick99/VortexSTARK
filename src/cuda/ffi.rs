@@ -129,6 +129,14 @@ unsafe extern "C" {
         n_cols: u32,
     );
 
+    pub fn cuda_circle_ntt_layer(
+        d_data: *mut u32,
+        d_twiddles: *const u32,
+        layer_idx: u32,
+        n: u32,
+        forward: i32,
+    );
+
     pub fn cuda_bit_reverse_m31(data: *mut u32, log_n: u32);
 
     pub fn cuda_eval_at_point(
@@ -216,6 +224,54 @@ unsafe extern "C" {
         src_n: u32,
         dst_n: u32,
     );
+
+    pub fn cuda_fibonacci_quotient_chunk(
+        trace: *const u32,
+        out0: *mut u32, out1: *mut u32, out2: *mut u32, out3: *mut u32,
+        alpha: *const u32, // [4] on host
+        offset: u32,
+        chunk_n: u32,
+        global_n: u32,
+    );
+
+    pub fn cuda_fibonacci_quotient_chunk_stream(
+        trace: *const u32,
+        out0: *mut u32, out1: *mut u32, out2: *mut u32, out3: *mut u32,
+        alpha: *const u32,
+        offset: u32, chunk_n: u32, global_n: u32,
+        stream: *mut std::ffi::c_void,
+    );
+
+    pub fn cuda_poseidon_upload_round_consts(host_rc: *const u32);
+
+    pub fn cuda_poseidon_trace(
+        block_inputs: *const u32,
+        trace_cols: *const *mut u32,
+        n_blocks: u32,
+    );
+
+    pub fn cuda_poseidon_quotient(
+        trace_cols: *const *const u32,
+        out0: *mut u32, out1: *mut u32, out2: *mut u32, out3: *mut u32,
+        round_consts: *const u32,
+        alpha_coeffs: *const u32,
+        n: u32,
+    );
+
+    pub fn cuda_poseidon_quotient_chunk(
+        trace_cols: *const *const u32,
+        out0: *mut u32, out1: *mut u32, out2: *mut u32, out3: *mut u32,
+        round_consts: *const u32,
+        alpha_coeffs: *const u32,
+        offset: u32, chunk_n: u32, global_n: u32,
+    );
+
+    pub fn cuda_interleave_u32(
+        even: *const u32,
+        odd: *const u32,
+        output: *mut u32,
+        half_n: u32,
+    );
 }
 
 // Blake2s Merkle tree kernels
@@ -258,6 +314,14 @@ unsafe extern "C" {
         col2: *const u32, col3: *const u32,
         subtree_roots: *mut u32,
         n_leaves: u32,
+    );
+
+    pub fn cuda_merkle_tiled_soa4_stream(
+        col0: *const u32, col1: *const u32,
+        col2: *const u32, col3: *const u32,
+        subtree_roots: *mut u32,
+        n_leaves: u32,
+        stream: *mut std::ffi::c_void,
     );
 
     pub fn cuda_merkle_tiled_generic(

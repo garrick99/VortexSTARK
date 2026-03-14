@@ -588,6 +588,22 @@ void cuda_merkle_tiled_soa4(
     );
 }
 
+// Stream-aware tiled SoA4 variant
+void cuda_merkle_tiled_soa4_stream(
+    const uint32_t* col0, const uint32_t* col1,
+    const uint32_t* col2, const uint32_t* col3,
+    uint32_t* subtree_roots,
+    uint32_t n_leaves,
+    cudaStream_t stream
+) {
+    uint32_t n_blocks = n_leaves / MERKLE_TILE_SIZE;
+    uint32_t threads = MERKLE_TILE_SIZE / 2;
+    uint32_t smem_bytes = threads * 8 * sizeof(uint32_t);
+    merkle_tiled_soa4_kernel<<<n_blocks, threads, smem_bytes, stream>>>(
+        col0, col1, col2, col3, subtree_roots, n_leaves
+    );
+}
+
 // Tiled Merkle commit for N-column data (generic).
 // Produces n_leaves/TILE_SIZE subtree roots. Caller must reduce those to final root.
 void cuda_merkle_tiled_generic(

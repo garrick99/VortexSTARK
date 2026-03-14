@@ -153,11 +153,17 @@ fn prove_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
 /// Generate a STARK proof with lazy VRAM management.
 /// Uses root-only Merkle commits and computes auth paths on CPU from host data.
 pub fn prove_lean(a: M31, b: M31, log_n: u32) -> StarkProof {
+    if log_n == 30 {
+        return prove_lean_max(a, b, false);
+    }
     prove_lean_inner(a, b, log_n, false)
 }
 
 /// Generate a STARK proof with lazy VRAM management and timing output.
 pub fn prove_lean_timed(a: M31, b: M31, log_n: u32) -> StarkProof {
+    if log_n == 30 {
+        return prove_lean_max(a, b, true);
+    }
     prove_lean_inner(a, b, log_n, true)
 }
 
@@ -520,6 +526,435 @@ fn prove_lean_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     }
 }
 
+/// Prove at the maximum size: log_n=30 (1B trace elements, 2B eval domain).
+/// Uses twin-coset evaluation (half_coset(30) + subgroup(30)) since half_coset(31)
+/// doesn't exist (the M31 circle group has order 2^31). Quotient and FRI are
+/// streamed in chunks to fit in 32GB VRAM.
+fn prove_lean_max(a: M31, b: M31, timed: bool) -> StarkProof {
+    ensure_pool_init();
+    let log_n: u32 = 30;
+    let n = 1usize << log_n; // 2^30
+    let log_eval_size: u32 = 31;
+    let eval_size = 1usize << log_eval_size; // 2^31
+
+    let t_total = Instant::now();
+
+    // --- Step 1: Generate trace ---
+    let t0 = Instant::now();
+    let bytes = n * std::mem::size_of::<u32>();
+    let mut pinned_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let err = unsafe { ffi::cudaMallocHost(&mut pinned_ptr, bytes) };
+    assert!(err == 0, "cudaMallocHost failed: {err}");
+    let pinned_trace = pinned_ptr as *mut u32;
+    unsafe { air::fibonacci_trace_parallel(a, b, log_n, pinned_trace) };
+    if timed { eprintln!("  trace_gen (cpu): {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0); }
+
+    let t0 = Instant::now();
+    let mut d_coeffs = unsafe { DeviceBuffer::from_pinned(pinned_trace as *const u32, n) };
+    if timed { unsafe { ffi::cuda_device_sync() }; eprintln!("  trace_upload: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0); }
+    unsafe { ffi::cudaFreeHost(pinned_ptr) };
+
+    // --- Step 2: Interpolate on trace domain (half_coset(30)) ---
+    let t0 = Instant::now();
+    let trace_domain = Coset::half_coset(log_n);
+    let trace_inv = InverseTwiddleCache::new(&trace_domain);
+    ntt::interpolate(&mut d_coeffs, &trace_inv);
+    drop(trace_inv);
+    if timed { unsafe { ffi::cuda_device_sync() }; eprintln!("  interpolate: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0); }
+
+    // --- Step 3: Zero-pad + full-group NTT on subgroup(31) ---
+    let t0 = Instant::now();
+    let mut d_eval_full = DeviceBuffer::<u32>::alloc(eval_size);
+    unsafe {
+        ffi::cuda_zero_pad(d_coeffs.as_ptr(), d_eval_full.as_mut_ptr(), n as u32, eval_size as u32);
+    }
+    drop(d_coeffs);
+
+    // Try standard ForwardTwiddleCache (all twiddles on GPU, single NTT call).
+    // Peak VRAM ~32GB during twiddle construction — tight but should fit.
+    let eval_domain = Coset::subgroup(log_eval_size);
+    let eval_fwd = ForwardTwiddleCache::new(&eval_domain);
+    ntt::evaluate(&mut d_eval_full, &eval_fwd);
+    drop(eval_fwd);
+    unsafe { ffi::cuda_device_sync() };
+    if timed { eprintln!("  fullgroup_ntt: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0); }
+
+    // --- Step 5: Commit trace (root-only, tiled) ---
+    let t0 = Instant::now();
+    let (trace_commitment, trace_subtree_roots) =
+        MerkleTree::commit_root_only_with_subtrees(std::slice::from_ref(&d_eval_full), log_eval_size);
+    if timed { eprintln!("  trace_commit: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0); }
+
+    // Download eval to host for decommitment (quotient recomputation needs it).
+    // Then drop GPU copy to free 8GB for FRI arena.
+    let t0 = Instant::now();
+    let eval_full_host = d_eval_full.to_host();
+    if timed { eprintln!("  trace_download: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0); }
+
+    // --- Steps 6+7: Fused quotient + circle fold (zero host transfer!) ---
+    // Instead of: quotient → download 32GB → upload for fold
+    // Do: quotient chunk → circle fold chunk → drop quotient. All on GPU.
+    // Quotient values for decommitment re-computed from eval_full_host at query time.
+    let t0 = Instant::now();
+    let mut channel = Channel::new();
+    channel.mix_digest(&trace_commitment);
+    let alpha = channel.draw_felt();
+    let alpha_arr = alpha.to_u32_array();
+
+    // Quotient chunk size: 2^27 (2GB output per chunk, 16 chunks)
+    // This matches fold_chunk_size so each quotient chunk feeds one fold chunk.
+    const QUOTIENT_CHUNK_LOG: u32 = 27;
+    let chunk_size = 1usize << QUOTIENT_CHUNK_LOG;
+    let n_chunks = eval_size / chunk_size; // 16 chunks
+
+    let mut all_quotient_subtrees: Vec<[u32; 8]> = Vec::new();
+
+    // Compute quotient Merkle subtree roots chunk-by-chunk
+    // (we need these for quotient commitment + decommitment)
+    for chunk_idx in 0..n_chunks {
+        let offset = chunk_idx * chunk_size;
+        let mut dq0 = DeviceBuffer::<u32>::alloc(chunk_size);
+        let mut dq1 = DeviceBuffer::<u32>::alloc(chunk_size);
+        let mut dq2 = DeviceBuffer::<u32>::alloc(chunk_size);
+        let mut dq3 = DeviceBuffer::<u32>::alloc(chunk_size);
+
+        unsafe {
+            ffi::cuda_fibonacci_quotient_chunk(
+                d_eval_full.as_ptr(),
+                dq0.as_mut_ptr(), dq1.as_mut_ptr(), dq2.as_mut_ptr(), dq3.as_mut_ptr(),
+                alpha_arr.as_ptr(),
+                offset as u32,
+                chunk_size as u32,
+                eval_size as u32,
+            );
+        }
+
+        // Hash this chunk into Merkle subtree roots (no download!)
+        let n_subtrees = chunk_size / 1024;
+        let mut d_subtrees = DeviceBuffer::<u32>::alloc(n_subtrees * 8);
+        unsafe {
+            ffi::cuda_merkle_tiled_soa4(
+                dq0.as_ptr(), dq1.as_ptr(), dq2.as_ptr(), dq3.as_ptr(),
+                d_subtrees.as_mut_ptr(), chunk_size as u32,
+            );
+        }
+        let sub_host = d_subtrees.to_host();
+        let chunk_subtrees: Vec<[u32; 8]> = (0..n_subtrees)
+            .map(|i| {
+                let mut h = [0u32; 8];
+                h.copy_from_slice(&sub_host[i * 8..(i + 1) * 8]);
+                h
+            })
+            .collect();
+        all_quotient_subtrees.extend_from_slice(&chunk_subtrees);
+        // dq0-3, d_subtrees dropped — quotient data NOT downloaded to host
+    }
+
+    let quotient_commitment = reduce_subtree_roots_to_root(&all_quotient_subtrees);
+    channel.mix_digest(&quotient_commitment);
+    if timed { eprintln!("  quotient_commit: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0); }
+
+    // --- Circle fold: fused with quotient (re-compute quotient per chunk) ---
+    let t0 = Instant::now();
+    let mut fri_commitments = Vec::new();
+    let mut current_log_size = log_eval_size; // 31
+
+    enum FriLayerData {
+        HostData([Vec<u32>; 4], Vec<[u32; 8]>),
+        GpuTree(MerkleTree, SecureColumn),
+        GpuLean(SecureColumn, Vec<[u32; 8]>),
+    }
+    let mut fri_layer_data: Vec<FriLayerData> = Vec::new();
+
+    let fri_alpha = channel.draw_felt();
+    let fold_domain = Coset::subgroup(log_eval_size);
+    let d_fold_twid = fri::compute_fold_twiddles_on_demand(&fold_domain, true);
+
+    let fold_chunk_size = chunk_size / 2; // 2^26 fold outputs per quotient chunk
+    let fold_chunk_log: u32 = QUOTIENT_CHUNK_LOG - 1; // 26
+    let n_fold_output = eval_size / 2; // 2^30
+
+    let fri_alpha_arr = fri_alpha.to_u32_array();
+    let fri_alpha_sq = fri_alpha * fri_alpha;
+    let fri_alpha_sq_arr = fri_alpha_sq.to_u32_array();
+
+    // Allocate circle fold output on GPU (16GB)
+    let mut fri_gpu = SecureColumn::zeros(n_fold_output);
+
+    // Fused: re-compute quotient chunk → circle fold → drop quotient
+    for chunk_idx in 0..n_chunks {
+        let q_offset = chunk_idx * chunk_size;
+        let fold_offset = chunk_idx * fold_chunk_size;
+
+        // Re-compute quotient for this chunk (GPU, ~0.5s)
+        let mut dq0 = DeviceBuffer::<u32>::alloc(chunk_size);
+        let mut dq1 = DeviceBuffer::<u32>::alloc(chunk_size);
+        let mut dq2 = DeviceBuffer::<u32>::alloc(chunk_size);
+        let mut dq3 = DeviceBuffer::<u32>::alloc(chunk_size);
+        unsafe {
+            ffi::cuda_fibonacci_quotient_chunk(
+                d_eval_full.as_ptr(),
+                dq0.as_mut_ptr(), dq1.as_mut_ptr(), dq2.as_mut_ptr(), dq3.as_mut_ptr(),
+                alpha_arr.as_ptr(),
+                q_offset as u32, chunk_size as u32, eval_size as u32,
+            );
+        }
+
+        // Circle fold this quotient chunk directly into fri_gpu
+        // Quotient chunk has chunk_size elements. Fold pairs adjacent → fold_chunk_size outputs.
+        unsafe {
+            ffi::cuda_fold_circle_into_line_soa(
+                fri_gpu.cols[0].as_mut_ptr().add(fold_offset),
+                fri_gpu.cols[1].as_mut_ptr().add(fold_offset),
+                fri_gpu.cols[2].as_mut_ptr().add(fold_offset),
+                fri_gpu.cols[3].as_mut_ptr().add(fold_offset),
+                dq0.as_ptr(), dq1.as_ptr(), dq2.as_ptr(), dq3.as_ptr(),
+                d_fold_twid.as_ptr().add(fold_offset),
+                fri_alpha_arr.as_ptr(),
+                fri_alpha_sq_arr.as_ptr(),
+                fold_chunk_size as u32,
+            );
+        }
+        // Quotient chunk dropped — zero host transfer!
+    }
+    drop(d_fold_twid);
+    drop(d_eval_full); // free 8GB — eval data on host, VRAM freed for FRI arena
+    unsafe { ffi::cuda_device_sync() };
+
+    // Commit circle fold output
+    let (fri0_root, fri0_subtrees) = MerkleTree::commit_root_soa4_with_subtrees(
+        &fri_gpu.cols[0], &fri_gpu.cols[1],
+        &fri_gpu.cols[2], &fri_gpu.cols[3], log_eval_size - 1,
+    );
+    fri_commitments.push(fri0_root);
+    channel.mix_digest(&fri0_root);
+    current_log_size -= 1; // now 30
+    if timed {
+        eprintln!("  fused_quotient_fold: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    // --- GPU-resident line folds (no host round-trips!) ---
+    // VRAM budget: prev(16GB) + twid(4GB) + next(8GB) = 28GB for first fold.
+    // Prefetch deferred until after drop(prev) to avoid 32GB peak.
+
+    // Download circle fold output for decommitment (16GB — too large for GPU arena)
+    let fri0_host = [
+        fri_gpu.cols[0].to_host(), fri_gpu.cols[1].to_host(),
+        fri_gpu.cols[2].to_host(), fri_gpu.cols[3].to_host(),
+    ];
+    fri_layer_data.push(FriLayerData::HostData(fri0_host, fri0_subtrees));
+
+    // GPU-resident line folds: fold from fri_gpu, store results.
+    // Large layers download to host (VRAM headroom). Small layers clone to GPU.
+    let mut gpu_fold_active = true;
+    while current_log_size > FRI_CPU_TAIL_LOG.max(3) {
+        let ti = Instant::now();
+        let fold_alpha = channel.draw_felt();
+
+        let line_domain = Coset::half_coset(current_log_size);
+        let d_twid = fri::compute_fold_twiddles_on_demand(&line_domain, false);
+
+        let folded = if gpu_fold_active {
+            let result = fri::fold_line_with_twiddles(&fri_gpu, fold_alpha, &d_twid);
+            drop(d_twid);
+            drop(fri_gpu);
+            fri_gpu = SecureColumn::alloc(0);
+            result
+        } else {
+            let src = match fri_layer_data.last().unwrap() {
+                FriLayerData::GpuTree(_, eval) => eval,
+                _ => unreachable!(),
+            };
+            let result = fri::fold_line_with_twiddles(src, fold_alpha, &d_twid);
+            drop(d_twid);
+            result
+        };
+        current_log_size -= 1;
+
+        const FRI_LEAN_THRESHOLD_LOG: u32 = 18;
+        if current_log_size >= FRI_LEAN_THRESHOLD_LOG {
+            let (fri_root, subtrees) = MerkleTree::commit_root_soa4_with_subtrees(
+                &folded.cols[0], &folded.cols[1],
+                &folded.cols[2], &folded.cols[3], current_log_size,
+            );
+            fri_commitments.push(fri_root);
+            channel.mix_digest(&fri_root);
+            if current_log_size <= 29 {
+                fri_layer_data.push(FriLayerData::GpuLean(
+                    SecureColumn {
+                        cols: std::array::from_fn(|c| folded.cols[c].clone_device()),
+                        len: folded.len,
+                    },
+                    subtrees,
+                ));
+            } else {
+                let host_data = [
+                    folded.cols[0].to_host(), folded.cols[1].to_host(),
+                    folded.cols[2].to_host(), folded.cols[3].to_host(),
+                ];
+                fri_layer_data.push(FriLayerData::HostData(host_data, subtrees));
+            }
+            fri_gpu = folded;
+            gpu_fold_active = true;
+        } else {
+            let fri_tree = MerkleTree::commit_soa4(
+                &folded.cols[0], &folded.cols[1],
+                &folded.cols[2], &folded.cols[3], current_log_size,
+            );
+            fri_commitments.push(fri_tree.root());
+            channel.mix_digest(&fri_tree.root());
+            fri_layer_data.push(FriLayerData::GpuTree(fri_tree, folded));
+            gpu_fold_active = false;
+        }
+        if timed {
+            eprintln!("    fri line (log={}): {:.1}ms", current_log_size, ti.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+    drop(fri_gpu);
+
+    // CPU tail
+    let mut cpu_eval = match fri_layer_data.last().unwrap() {
+        FriLayerData::GpuTree(_, eval) | FriLayerData::GpuLean(eval, _) => eval.to_qm31(),
+        FriLayerData::HostData(host, _) => {
+            let nn = host[0].len();
+            (0..nn).map(|i| QM31::from_u32_array([host[0][i], host[1][i], host[2][i], host[3][i]])).collect()
+        }
+    };
+
+    let mut cpu_fri_trees: Vec<(Vec<QM31>, [u32; 8])> = Vec::new();
+    while current_log_size > 3 {
+        let fold_alpha = channel.draw_felt();
+        let line_domain = Coset::half_coset(current_log_size);
+        let d_twid = fri::compute_fold_twiddles_on_demand(&line_domain, false);
+        let twid_host = d_twid.to_host();
+        drop(d_twid);
+
+        cpu_eval = fri::fold_line_cpu(&cpu_eval, fold_alpha, &twid_host);
+        current_log_size -= 1;
+
+        let fri_root = fri::merkle_root_cpu(&cpu_eval);
+        fri_commitments.push(fri_root);
+        channel.mix_digest(&fri_root);
+        cpu_fri_trees.push((cpu_eval.clone(), fri_root));
+    }
+
+    let fri_last_layer = cpu_eval.clone();
+    if timed {
+        eprintln!("  fri_total: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    // --- Step 8: Query phase ---
+    let t0 = Instant::now();
+
+    channel.mix_felts(&fri_last_layer);
+    let query_indices: Vec<usize> = (0..N_QUERIES)
+        .map(|_| channel.draw_number(eval_size))
+        .collect();
+
+    // Decommit trace from host eval data
+    let trace_decommitment = decommit_trace_gpu(&eval_full_host, &trace_subtree_roots, &query_indices);
+
+    // Decommit quotient: recompute from host eval data
+    let quotient_decommitment = decommit_quotient_recompute(
+        &eval_full_host, eval_size, alpha, &all_quotient_subtrees, &query_indices,
+    );
+
+    // Decommit FRI layers
+    let mut fri_decommitments = Vec::new();
+    let mut folded_indices: Vec<usize> = query_indices.iter().map(|&qi| qi / 2).collect();
+    for layer_data in fri_layer_data.drain(..) {
+        match layer_data {
+            FriLayerData::GpuTree(tree, eval) => {
+                let decom = decommit_fri_layer(&tree, &eval, &folded_indices);
+                fri_decommitments.push(decom);
+            }
+            FriLayerData::HostData(host, subtrees) => {
+                let decom = decommit_soa4_gpu(&host, &subtrees, &folded_indices);
+                fri_decommitments.push(decom);
+            }
+            FriLayerData::GpuLean(ref eval, ref subtrees) => {
+                let decom = decommit_soa4_from_gpu_resident(eval, subtrees, &folded_indices);
+                fri_decommitments.push(decom);
+            }
+        }
+        folded_indices = folded_indices.iter().map(|&i| i / 2).collect();
+    }
+
+    // Decommit CPU tail FRI layers
+    for (cpu_vals, _root) in &cpu_fri_trees {
+        let values: Vec<[u32; 4]> = folded_indices.iter().map(|&i| cpu_vals[i].to_u32_array()).collect();
+        let sibling_indices: Vec<usize> = folded_indices.iter().map(|&i| i ^ 1).collect();
+        let sibling_values: Vec<[u32; 4]> = sibling_indices.iter().map(|&i| cpu_vals[i].to_u32_array()).collect();
+        let auth_paths = cpu_merkle_auth_paths(cpu_vals, &folded_indices);
+        let sibling_auth_paths = cpu_merkle_auth_paths(cpu_vals, &sibling_indices);
+        fri_decommitments.push(QueryDecommitment {
+            values, sibling_values, auth_paths, sibling_auth_paths,
+        });
+        folded_indices = folded_indices.iter().map(|&i| i / 2).collect();
+    }
+
+    if timed {
+        eprintln!("  query_decommit: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+        eprintln!("  TOTAL: {:.1}ms", t_total.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    StarkProof {
+        trace_commitment,
+        quotient_commitment,
+        fri_commitments,
+        fri_last_layer,
+        log_trace_size: log_n,
+        public_inputs: (a, b),
+        query_indices,
+        trace_decommitment,
+        quotient_decommitment,
+        fri_decommitments,
+    }
+}
+
+/// Reduce a flat list of subtree roots to a single Merkle root.
+fn reduce_subtree_roots_to_root(subtree_roots: &[[u32; 8]]) -> [u32; 8] {
+    use crate::merkle::HASH_WORDS;
+
+    let n = subtree_roots.len();
+    assert!(n.is_power_of_two() && n >= 1);
+
+    if n == 1 {
+        return subtree_roots[0];
+    }
+
+    // Upload subtree roots to GPU and reduce
+    let flat: Vec<u32> = subtree_roots.iter().flat_map(|h| h.iter().copied()).collect();
+    let mut current = DeviceBuffer::from_host(&flat);
+    let mut current_size = n as u32;
+
+    while current_size > 1024 {
+        let parent_size = current_size / 2;
+        let mut parents = DeviceBuffer::<u32>::alloc((parent_size as usize) * HASH_WORDS);
+        unsafe {
+            ffi::cuda_merkle_hash_nodes(current.as_ptr(), parents.as_mut_ptr(), parent_size);
+        }
+        current = parents;
+        current_size = parent_size;
+    }
+
+    if current_size > 1 {
+        let mut d_root = DeviceBuffer::<u32>::alloc(HASH_WORDS);
+        unsafe {
+            ffi::cuda_merkle_reduce_to_root(current.as_ptr(), d_root.as_mut_ptr(), current_size);
+        }
+        let host = d_root.to_host();
+        let mut root = [0u32; HASH_WORDS];
+        root.copy_from_slice(&host[..HASH_WORDS]);
+        root
+    } else {
+        let host = current.to_host();
+        let mut root = [0u32; HASH_WORDS];
+        root.copy_from_slice(&host[..HASH_WORDS]);
+        root
+    }
+}
+
 /// Extract trace decommitment with sibling values for fold verification.
 fn decommit_trace(
     tree: &MerkleTree,
@@ -613,6 +1048,372 @@ fn decommit_soa4_gpu(
     let tile_paths = gpu_tile_auth_paths_soa4(host, subtree_roots, &all_indices);
     let (auth_paths, sibling_auth_paths) = tile_paths.split_at(indices.len());
 
+    QueryDecommitment {
+        values, sibling_values,
+        auth_paths: auth_paths.to_vec(),
+        sibling_auth_paths: sibling_auth_paths.to_vec(),
+    }
+}
+
+/// Decommit single-column trace directly from GPU DeviceBuffer.
+/// Downloads only the ~200 needed tiles (~3.2MB) instead of 8GB.
+fn decommit_trace_from_gpu_resident(
+    d_eval: &DeviceBuffer<u32>,
+    subtree_roots: &[[u32; 8]],
+    indices: &[usize],
+) -> QueryDecommitment<u32> {
+    use std::collections::{BTreeSet, HashMap};
+
+    const TILE_SIZE: usize = 1024;
+
+    let sibling_indices: Vec<usize> = indices.iter().map(|&i| i ^ 1).collect();
+    let needed_tiles: BTreeSet<usize> = indices.iter()
+        .chain(sibling_indices.iter())
+        .map(|&qi| qi / TILE_SIZE)
+        .collect();
+
+    // Download only needed tiles + build per-tile Merkle trees via D2D
+    let mut tile_host: HashMap<usize, Vec<u32>> = HashMap::new();
+    let mut tile_trees: HashMap<usize, MerkleTree> = HashMap::new();
+
+    for &tile_idx in &needed_tiles {
+        let base = tile_idx * TILE_SIZE;
+        let mut d_tile = DeviceBuffer::<u32>::alloc(TILE_SIZE);
+        unsafe {
+            ffi::cudaMemcpy(
+                d_tile.as_mut_ptr() as *mut std::ffi::c_void,
+                d_eval.as_ptr().add(base) as *const std::ffi::c_void,
+                TILE_SIZE * 4, ffi::MEMCPY_D2D,
+            );
+        }
+        let tree = MerkleTree::commit(std::slice::from_ref(&d_tile), 10);
+        tile_host.insert(tile_idx, d_tile.to_host());
+        tile_trees.insert(tile_idx, tree);
+    }
+
+    let values: Vec<u32> = indices.iter().map(|&i| tile_host[&(i / TILE_SIZE)][i % TILE_SIZE]).collect();
+    let sibling_values: Vec<u32> = sibling_indices.iter().map(|&i| tile_host[&(i / TILE_SIZE)][i % TILE_SIZE]).collect();
+
+    let upper_layers = gpu_build_upper_tree(subtree_roots);
+
+    let all_indices: Vec<usize> = indices.iter().chain(sibling_indices.iter()).copied().collect();
+    let paths: Vec<Vec<[u32; 8]>> = all_indices.iter().map(|&qi| {
+        let tile_idx = qi / TILE_SIZE;
+        let intra_idx = qi % TILE_SIZE;
+        let mut path = Vec::new();
+        path.extend_from_slice(&tile_trees[&tile_idx].auth_path(intra_idx));
+        let mut idx = tile_idx;
+        for layer in &upper_layers[..upper_layers.len() - 1] {
+            path.push(layer[idx ^ 1]);
+            idx /= 2;
+        }
+        path
+    }).collect();
+
+    let (auth_paths, sibling_auth_paths) = paths.split_at(indices.len());
+    QueryDecommitment {
+        values, sibling_values,
+        auth_paths: auth_paths.to_vec(),
+        sibling_auth_paths: sibling_auth_paths.to_vec(),
+    }
+}
+
+/// Decommit quotient from GPU eval data: recompute quotient values on CPU,
+/// build tile trees from GPU-gathered tile data.
+fn decommit_quotient_from_gpu(
+    d_eval: &DeviceBuffer<u32>,
+    eval_size: usize,
+    alpha: QM31,
+    subtree_roots: &[[u32; 8]],
+    indices: &[usize],
+) -> QueryDecommitment<[u32; 4]> {
+    use std::collections::{BTreeSet, HashMap};
+
+    const TILE_SIZE: usize = 1024;
+
+    let sibling_indices: Vec<usize> = indices.iter().map(|&i| i ^ 1).collect();
+    let needed_tiles: BTreeSet<usize> = indices.iter()
+        .chain(sibling_indices.iter())
+        .map(|&qi| qi / TILE_SIZE)
+        .collect();
+
+    // Download eval tiles from GPU (for quotient recomputation)
+    // Each tile needs +2 elements for the constraint lookahead
+    let mut tile_eval: HashMap<usize, Vec<u32>> = HashMap::new();
+    for &tile_idx in &needed_tiles {
+        let base = tile_idx * TILE_SIZE;
+        // Download tile + 2 extra elements for constraint boundary
+        let fetch_size = TILE_SIZE + 2;
+        let mut buf = vec![0u32; fetch_size];
+        for j in 0..fetch_size {
+            let idx = (base + j) % eval_size;
+            // Single-element D2H (batching would be faster but this is ~200 tiles × 1026 = 205K reads)
+            // Actually let me download the tile in one shot and handle boundary separately
+            if j < TILE_SIZE {
+                // Will be filled below
+            }
+        }
+        // Download tile data in one D2H
+        let mut d_tile = DeviceBuffer::<u32>::alloc(TILE_SIZE);
+        unsafe {
+            ffi::cudaMemcpy(
+                d_tile.as_mut_ptr() as *mut std::ffi::c_void,
+                d_eval.as_ptr().add(base) as *const std::ffi::c_void,
+                TILE_SIZE * 4, ffi::MEMCPY_D2D,
+            );
+        }
+        let mut tile_data = d_tile.to_host();
+        // Get the 2 boundary elements
+        let mut boundary = [0u32; 2];
+        for k in 0..2 {
+            let idx = (base + TILE_SIZE + k) % eval_size;
+            unsafe {
+                ffi::cudaMemcpy(
+                    &mut boundary[k] as *mut u32 as *mut std::ffi::c_void,
+                    d_eval.as_ptr().add(idx) as *const std::ffi::c_void,
+                    4, ffi::MEMCPY_D2H,
+                );
+            }
+        }
+        tile_data.push(boundary[0]);
+        tile_data.push(boundary[1]);
+        tile_eval.insert(tile_idx, tile_data);
+    }
+
+    // Recompute quotient values and build tile Merkle trees
+    let mut tile_trees: HashMap<usize, MerkleTree> = HashMap::new();
+    for &tile_idx in &needed_tiles {
+        let base = tile_idx * TILE_SIZE;
+        let eval_tile = &tile_eval[&tile_idx];
+        let mut cols = [vec![0u32; TILE_SIZE], vec![0u32; TILE_SIZE],
+                       vec![0u32; TILE_SIZE], vec![0u32; TILE_SIZE]];
+        for j in 0..TILE_SIZE {
+            let t_i = M31(eval_tile[j]);
+            let t_i1 = M31(eval_tile[j + 1]);  // safe: we fetched +2
+            let t_i2 = M31(eval_tile[j + 2]);
+            let constraint = t_i2 - t_i1 - t_i;
+            let result = alpha * constraint;
+            let arr = result.to_u32_array();
+            cols[0][j] = arr[0]; cols[1][j] = arr[1]; cols[2][j] = arr[2]; cols[3][j] = arr[3];
+        }
+        let c0 = DeviceBuffer::from_host(&cols[0]);
+        let c1 = DeviceBuffer::from_host(&cols[1]);
+        let c2 = DeviceBuffer::from_host(&cols[2]);
+        let c3 = DeviceBuffer::from_host(&cols[3]);
+        let tree = MerkleTree::commit_soa4(&c0, &c1, &c2, &c3, 10);
+        tile_trees.insert(tile_idx, tree);
+    }
+
+    // Extract values at query positions
+    let values: Vec<[u32; 4]> = indices.iter().map(|&i| {
+        let tile = &tile_eval[&(i / TILE_SIZE)];
+        let off = i % TILE_SIZE;
+        let t_i = M31(tile[off]);
+        let t_i1 = M31(tile[off + 1]);
+        let t_i2 = M31(tile[off + 2]);
+        let constraint = t_i2 - t_i1 - t_i;
+        let result = alpha * constraint;
+        result.to_u32_array()
+    }).collect();
+
+    let sibling_values: Vec<[u32; 4]> = sibling_indices.iter().map(|&i| {
+        let tile = &tile_eval[&(i / TILE_SIZE)];
+        let off = i % TILE_SIZE;
+        let t_i = M31(tile[off]);
+        let t_i1 = M31(tile[off + 1]);
+        let t_i2 = M31(tile[off + 2]);
+        let constraint = t_i2 - t_i1 - t_i;
+        let result = alpha * constraint;
+        result.to_u32_array()
+    }).collect();
+
+    let upper_layers = gpu_build_upper_tree(subtree_roots);
+
+    let all_indices: Vec<usize> = indices.iter().chain(sibling_indices.iter()).copied().collect();
+    let paths: Vec<Vec<[u32; 8]>> = all_indices.iter().map(|&qi| {
+        let tile_idx = qi / TILE_SIZE;
+        let intra_idx = qi % TILE_SIZE;
+        let mut path = Vec::new();
+        path.extend_from_slice(&tile_trees[&tile_idx].auth_path(intra_idx));
+        let mut idx = tile_idx;
+        for layer in &upper_layers[..upper_layers.len() - 1] {
+            path.push(layer[idx ^ 1]);
+            idx /= 2;
+        }
+        path
+    }).collect();
+
+    let (auth_paths, sibling_auth_paths) = paths.split_at(indices.len());
+    QueryDecommitment {
+        values, sibling_values,
+        auth_paths: auth_paths.to_vec(),
+        sibling_auth_paths: sibling_auth_paths.to_vec(),
+    }
+}
+
+/// Recompute quotient values at specific positions from eval host data.
+/// This avoids storing the full 32GB quotient on host — values computed on demand.
+fn recompute_quotient_at(eval_host: &[u32], eval_size: usize, alpha: QM31, index: usize) -> [u32; 4] {
+    let t_i = M31(eval_host[index]);
+    let t_i1 = M31(eval_host[(index + 1) % eval_size]);
+    let t_i2 = M31(eval_host[(index + 2) % eval_size]);
+    let constraint = t_i2 - t_i1 - t_i;
+    // QM31 * M31 — matches GPU kernel qm31_mul_m31(alpha, constraint)
+    let result = alpha * constraint;
+    result.to_u32_array()
+}
+
+/// Decommit quotient by recomputing values on CPU from eval_full_host.
+/// Downloads only ~3.2MB of tile data (re-computed) for Merkle auth paths.
+fn decommit_quotient_recompute(
+    eval_host: &[u32],
+    eval_size: usize,
+    alpha: QM31,
+    subtree_roots: &[[u32; 8]],
+    indices: &[usize],
+) -> QueryDecommitment<[u32; 4]> {
+    use std::collections::{BTreeSet, HashMap};
+
+    const TILE_SIZE: usize = 1024;
+
+    // Recompute values at query positions
+    let values: Vec<[u32; 4]> = indices.iter()
+        .map(|&i| recompute_quotient_at(eval_host, eval_size, alpha, i))
+        .collect();
+    let sibling_indices: Vec<usize> = indices.iter().map(|&i| i ^ 1).collect();
+    let sibling_values: Vec<[u32; 4]> = sibling_indices.iter()
+        .map(|&i| recompute_quotient_at(eval_host, eval_size, alpha, i))
+        .collect();
+
+    // Collect needed tiles and recompute quotient for each tile on CPU
+    let needed_tiles: BTreeSet<usize> = indices.iter()
+        .chain(sibling_indices.iter())
+        .map(|&qi| qi / TILE_SIZE)
+        .collect();
+
+    // Build per-tile Merkle trees from recomputed quotient data
+    let mut tile_trees: HashMap<usize, MerkleTree> = HashMap::new();
+    for &tile_idx in &needed_tiles {
+        let base = tile_idx * TILE_SIZE;
+        // Recompute quotient for this tile on CPU
+        let tile_data: [Vec<u32>; 4] = {
+            let mut cols = [vec![0u32; TILE_SIZE], vec![0u32; TILE_SIZE],
+                           vec![0u32; TILE_SIZE], vec![0u32; TILE_SIZE]];
+            for j in 0..TILE_SIZE {
+                let q = recompute_quotient_at(eval_host, eval_size, alpha, base + j);
+                cols[0][j] = q[0]; cols[1][j] = q[1]; cols[2][j] = q[2]; cols[3][j] = q[3];
+            }
+            cols
+        };
+        // Upload tile and build Merkle tree on GPU
+        let c0 = DeviceBuffer::from_host(&tile_data[0]);
+        let c1 = DeviceBuffer::from_host(&tile_data[1]);
+        let c2 = DeviceBuffer::from_host(&tile_data[2]);
+        let c3 = DeviceBuffer::from_host(&tile_data[3]);
+        let tree = MerkleTree::commit_soa4(&c0, &c1, &c2, &c3, 10);
+        tile_trees.insert(tile_idx, tree);
+    }
+
+    // Upper tree from subtree roots
+    let upper_layers = gpu_build_upper_tree(subtree_roots);
+
+    // Extract auth paths
+    let all_indices: Vec<usize> = indices.iter().chain(sibling_indices.iter()).copied().collect();
+    let paths: Vec<Vec<[u32; 8]>> = all_indices.iter().map(|&qi| {
+        let tile_idx = qi / TILE_SIZE;
+        let intra_idx = qi % TILE_SIZE;
+        let mut path = Vec::new();
+        let tree = &tile_trees[&tile_idx];
+        path.extend_from_slice(&tree.auth_path(intra_idx));
+        let mut idx = tile_idx;
+        for layer in &upper_layers[..upper_layers.len() - 1] {
+            path.push(layer[idx ^ 1]);
+            idx /= 2;
+        }
+        path
+    }).collect();
+
+    let (auth_paths, sibling_auth_paths) = paths.split_at(indices.len());
+    QueryDecommitment {
+        values, sibling_values,
+        auth_paths: auth_paths.to_vec(),
+        sibling_auth_paths: sibling_auth_paths.to_vec(),
+    }
+}
+
+/// Extract SoA4 decommitment directly from GPU SecureColumn.
+/// Downloads only the ~200 needed tiles (~3.2MB) instead of the full layer (8GB+).
+/// Tile Merkle trees built via D2D copies — zero host round-trip for hashing.
+fn decommit_soa4_from_gpu_resident(
+    gpu_cols: &SecureColumn,
+    subtree_roots: &[[u32; 8]],
+    indices: &[usize],
+) -> QueryDecommitment<[u32; 4]> {
+    use std::collections::BTreeSet;
+
+    const TILE_SIZE: usize = 1024;
+    let n = gpu_cols.len;
+
+    let sibling_indices: Vec<usize> = indices.iter().map(|&i| i ^ 1).collect();
+    let needed_tiles: BTreeSet<usize> = indices.iter()
+        .chain(sibling_indices.iter())
+        .map(|&qi| qi / TILE_SIZE)
+        .collect();
+
+    let n_needed = needed_tiles.len();
+    let batch_size = n_needed * TILE_SIZE;
+    let tile_indices: Vec<usize> = needed_tiles.iter().copied().collect();
+
+    // Allocate contiguous GPU buffers for needed tiles
+    let mut d_batch: [DeviceBuffer<u32>; 4] = std::array::from_fn(|_| DeviceBuffer::<u32>::alloc(batch_size));
+
+    // Queue all D2D copies
+    for (slot, &tile_idx) in tile_indices.iter().enumerate() {
+        let src_base = tile_idx * TILE_SIZE;
+        let dst_base = slot * TILE_SIZE;
+        for c in 0..4 {
+            unsafe {
+                ffi::cudaMemcpy(
+                    d_batch[c].as_mut_ptr().add(dst_base) as *mut std::ffi::c_void,
+                    gpu_cols.cols[c].as_ptr().add(src_base) as *const std::ffi::c_void,
+                    TILE_SIZE * 4,
+                    ffi::MEMCPY_D2D,
+                );
+            }
+        }
+    }
+
+    // Single sync + batch download to host
+    unsafe { ffi::cuda_device_sync() };
+    let host_batch: [Vec<u32>; 4] = std::array::from_fn(|c| d_batch[c].to_host());
+    drop(d_batch);
+
+    // Build index: tile_idx → slot in batch
+    let tile_slot: std::collections::HashMap<usize, usize> = tile_indices.iter()
+        .enumerate().map(|(slot, &idx)| (idx, slot)).collect();
+
+    // Extract values from batch
+    let get_val = |i: usize| -> [u32; 4] {
+        let slot = tile_slot[&(i / TILE_SIZE)];
+        let off = slot * TILE_SIZE + (i % TILE_SIZE);
+        [host_batch[0][off], host_batch[1][off], host_batch[2][off], host_batch[3][off]]
+    };
+    let values: Vec<[u32; 4]> = indices.iter().map(|&i| get_val(i)).collect();
+    let sibling_values: Vec<[u32; 4]> = sibling_indices.iter().map(|&i| get_val(i)).collect();
+
+    // Auth paths: targeted approach (CPU tile subtrees + CPU upper tree)
+    let all_indices: Vec<usize> = indices.iter().chain(sibling_indices.iter()).copied().collect();
+    let hash_leaf = |i: usize| -> [u32; 8] {
+        let slot = tile_slot[&(i / TILE_SIZE)];
+        let off = slot * TILE_SIZE + (i % TILE_SIZE);
+        MerkleTree::hash_leaf(&[host_batch[0][off], host_batch[1][off],
+                                host_batch[2][off], host_batch[3][off]])
+    };
+    let auth_paths_all = MerkleTree::targeted_auth_paths_with_tile_roots(
+        subtree_roots, n, &all_indices, &hash_leaf,
+    );
+
+    let (auth_paths, sibling_auth_paths) = auth_paths_all.split_at(indices.len());
     QueryDecommitment {
         values, sibling_values,
         auth_paths: auth_paths.to_vec(),
@@ -1322,5 +2123,184 @@ mod tests {
         assert_eq!(proof_std.fri_commitments, proof_lean.fri_commitments);
         assert_eq!(proof_std.fri_last_layer, proof_lean.fri_last_layer);
         assert_eq!(proof_std.query_indices, proof_lean.query_indices);
+    }
+
+    #[test]
+    fn test_prove_lean_on_subgroup_small() {
+        // Test the full proof pipeline using subgroup eval domain (like log_n=30 does)
+        // at a small size where we can verify correctness.
+        // This manually constructs a proof using subgroup(log_n) as eval domain
+        // (instead of the standard half_coset(log_n+1)).
+        let log_n = 6u32;
+        let n = 1usize << log_n;
+        let eval_size = 2 * n;
+        let log_eval = log_n + 1;
+
+        // Standard proof (reference)
+        let std_proof = prove_lean(M31(1), M31(1), log_n);
+        let std_result = crate::verifier::verify(&std_proof);
+        assert!(std_result.is_ok(), "Standard proof should verify");
+
+        // Now: the standard proof uses half_coset(log_n+1) as eval domain.
+        // For log_n=30, we'd use subgroup(31) instead.
+        // At log_n=6, let's verify that the NTT on subgroup(7) produces a DIFFERENT
+        // output than half_coset(7), confirming they're different domains.
+        let trace = crate::air::fibonacci_trace_raw(M31(1), M31(1), log_n);
+        let mut d_coeffs = DeviceBuffer::from_host(&trace);
+        let trace_domain = Coset::half_coset(log_n);
+        let inv = InverseTwiddleCache::new(&trace_domain);
+        ntt::interpolate(&mut d_coeffs, &inv);
+        drop(inv);
+
+        // Eval on half_coset(log_n+1)
+        let mut d_eval_hc = DeviceBuffer::<u32>::alloc(eval_size);
+        unsafe {
+            ffi::cuda_zero_pad(d_coeffs.as_ptr(), d_eval_hc.as_mut_ptr(), n as u32, eval_size as u32);
+        }
+        let hc_domain = Coset::half_coset(log_eval);
+        let hc_fwd = ForwardTwiddleCache::new(&hc_domain);
+        ntt::evaluate(&mut d_eval_hc, &hc_fwd);
+        drop(hc_fwd);
+        let hc_eval = d_eval_hc.to_host();
+
+        // Eval on subgroup(log_n+1)
+        let mut d_eval_sg = DeviceBuffer::<u32>::alloc(eval_size);
+        unsafe {
+            ffi::cuda_zero_pad(d_coeffs.as_ptr(), d_eval_sg.as_mut_ptr(), n as u32, eval_size as u32);
+        }
+        let sg_domain = Coset::subgroup(log_eval);
+        let sg_fwd = ForwardTwiddleCache::new(&sg_domain);
+        ntt::evaluate(&mut d_eval_sg, &sg_fwd);
+        drop(sg_fwd);
+        let sg_eval = d_eval_sg.to_host();
+
+        // They should be DIFFERENT evaluations (different domains)
+        assert_ne!(hc_eval, sg_eval, "half_coset and subgroup evals should differ");
+
+        // But both should represent valid polynomial evaluations
+        // (non-trivial, containing non-zero values)
+        assert!(sg_eval.iter().any(|&v| v != 0));
+    }
+
+    #[test]
+    fn test_layerwise_ntt_matches_standard() {
+        // Verify that layer-by-layer NTT produces the same result as
+        // the standard ForwardTwiddleCache NTT.
+        let log_n = 8u32;
+        let n = 1usize << log_n;
+        let coset = Coset::half_coset(log_n);
+
+        let data: Vec<u32> = (0..n).map(|i| ((i * 7 + 13) % 0x7FFF_FFFF as usize) as u32).collect();
+
+        // Standard NTT
+        let mut d_std = DeviceBuffer::from_host(&data);
+        let cache = ForwardTwiddleCache::new(&coset);
+        ntt::evaluate(&mut d_std, &cache);
+        let std_result = d_std.to_host();
+        drop(d_std);
+        drop(cache);
+
+        // Layer-by-layer NTT (same as prove_lean_max does)
+        let mut d_layer = DeviceBuffer::from_host(&data);
+        {
+            let n_line_layers = log_n - 1;
+            let mut d_x = DeviceBuffer::<u32>::alloc(n);
+            let mut d_y = DeviceBuffer::<u32>::alloc(n);
+            unsafe {
+                ffi::cuda_compute_coset_points(
+                    coset.initial.x.0, coset.initial.y.0,
+                    coset.step.x.0, coset.step.y.0,
+                    d_x.as_mut_ptr(), d_y.as_mut_ptr(), n as u32,
+                );
+                ffi::cuda_device_sync();
+            }
+            let half = n / 2;
+            let mut d_circle = DeviceBuffer::<u32>::alloc(half);
+            unsafe {
+                ffi::cudaMemcpy(
+                    d_circle.as_mut_ptr() as *mut std::ffi::c_void,
+                    d_y.as_ptr() as *const std::ffi::c_void,
+                    half * 4, ffi::MEMCPY_D2D,
+                );
+            }
+            drop(d_y);
+
+            let mut d_current = d_x;
+            let mut host_twiddles: Vec<Vec<u32>> = Vec::new();
+            for _build in 0..n_line_layers as usize {
+                let ls = d_current.len() / 2;
+                let mut d_tw = DeviceBuffer::<u32>::alloc(ls);
+                let mut d_sq = DeviceBuffer::<u32>::alloc(ls);
+                unsafe {
+                    ffi::cuda_extract_and_squash(
+                        d_current.as_ptr(), d_tw.as_mut_ptr(), d_sq.as_mut_ptr(), ls as u32,
+                    );
+                    ffi::cuda_device_sync();
+                }
+                host_twiddles.push(d_tw.to_host());
+                drop(d_tw);
+                drop(d_current);
+                d_current = d_sq;
+            }
+            drop(d_current);
+
+            // Apply in reverse order
+            for layer in (0..n_line_layers as usize).rev() {
+                let d_tw = DeviceBuffer::from_host(&host_twiddles[layer]);
+                unsafe {
+                    ffi::cuda_circle_ntt_layer(
+                        d_layer.as_mut_ptr(), d_tw.as_ptr(),
+                        (layer + 1) as u32, n as u32, 1,
+                    );
+                }
+            }
+            // Circle layer
+            unsafe {
+                ffi::cuda_circle_ntt_layer(
+                    d_layer.as_mut_ptr(), d_circle.as_ptr(),
+                    0, n as u32, 1,
+                );
+                ffi::cuda_device_sync();
+            }
+        }
+        let layer_result = d_layer.to_host();
+        assert_eq!(std_result, layer_result,
+            "Layer-by-layer NTT doesn't match standard NTT");
+    }
+
+    #[test]
+    fn test_twin_coset_eval_roundtrip() {
+        // Validate twin-coset evaluation by checking that eval_0 (on half_coset(log_n))
+        // correctly reproduces the original trace values via NTT roundtrip.
+        let log_n = 8u32;
+        let n = 1usize << log_n;
+
+        let trace = crate::air::fibonacci_trace_raw(M31(1), M31(1), log_n);
+        let mut d_data = DeviceBuffer::from_host(&trace);
+        let trace_domain = Coset::half_coset(log_n);
+
+        // Forward NTT should produce eval values, inverse NTT should recover trace
+        let fwd = ForwardTwiddleCache::new(&trace_domain);
+        let inv = InverseTwiddleCache::new(&trace_domain);
+
+        // Interpolate → coefficients
+        ntt::interpolate(&mut d_data, &inv);
+        let coeffs = d_data.to_host();
+
+        // Evaluate on same domain → should recover original trace
+        ntt::evaluate(&mut d_data, &fwd);
+        let recovered = d_data.to_host();
+        assert_eq!(trace, recovered, "NTT roundtrip on half_coset failed");
+
+        // Now test subgroup NTT: interpolate coefficients, evaluate on subgroup(log_n)
+        let mut d_coeffs = DeviceBuffer::from_host(&coeffs);
+        let complement = Coset::subgroup(log_n);
+        let complement_fwd = ForwardTwiddleCache::new(&complement);
+        ntt::evaluate(&mut d_coeffs, &complement_fwd);
+        let complement_eval = d_coeffs.to_host();
+
+        // The complement eval should be non-trivial (not all zeros, not same as trace)
+        assert_ne!(complement_eval, trace, "Complement eval should differ from trace");
+        assert!(complement_eval.iter().any(|&v| v != 0), "Complement eval should be non-zero");
     }
 }

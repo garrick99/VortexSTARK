@@ -7,7 +7,7 @@ fn main() {
     println!("prove_lean VRAM scaling test");
     println!("============================\n");
 
-    for log_n in [20, 24, 26, 28, 29] {
+    for log_n in [20, 24, 26, 28, 29, 30] {
         let n: u64 = 1u64 << log_n;
         let est_gb = (n * 60) as f64 / (1024.0 * 1024.0 * 1024.0);
 
