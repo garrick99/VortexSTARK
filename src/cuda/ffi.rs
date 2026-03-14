@@ -207,4 +207,18 @@ unsafe extern "C" {
         parents: *mut u32,
         n_leaves: u32,
     );
+
+    pub fn cuda_merkle_tiled_soa4(
+        col0: *const u32, col1: *const u32,
+        col2: *const u32, col3: *const u32,
+        subtree_roots: *mut u32,
+        n_leaves: u32,
+    );
+
+    pub fn cuda_merkle_tiled_generic(
+        columns: *const *const u32,
+        subtree_roots: *mut u32,
+        n_cols: u32,
+        n_leaves: u32,
+    );
 }

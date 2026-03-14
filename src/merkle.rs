@@ -112,7 +112,7 @@ impl MerkleTree {
     }
 
     /// Build a Merkle tree and return only the root hash (no layer storage).
-    /// Skips storing intermediate layers, freeing memory sooner.
+    /// Uses tiled processing for large trees to avoid allocating a full leaf hash buffer.
     pub fn commit_root_only<C: AsRef<DeviceBuffer<u32>>>(columns: &[C], log_n_leaves: u32) -> [u32; HASH_WORDS] {
         let n_leaves = 1u32 << log_n_leaves;
         let n_cols = columns.len() as u32;
@@ -120,6 +120,60 @@ impl MerkleTree {
         let col_ptrs: Vec<*const u32> = columns.iter().map(|c| c.as_ref().as_ptr()).collect();
         let d_col_ptrs = DeviceBuffer::from_host(&col_ptrs);
 
+        // Tiled path: process 1024 leaves per block in shared memory,
+        // producing n_leaves/1024 subtree roots instead of n_leaves full hashes.
+        // Reduces peak allocation from O(n × 32B) to O(n/1024 × 32B).
+        const TILE_SIZE: u32 = 1024;
+        if n_leaves >= TILE_SIZE {
+            let n_subtrees = n_leaves / TILE_SIZE;
+            let mut current = DeviceBuffer::<u32>::alloc((n_subtrees as usize) * HASH_WORDS);
+            unsafe {
+                ffi::cuda_merkle_tiled_generic(
+                    d_col_ptrs.as_ptr() as *const *const u32,
+                    current.as_mut_ptr(),
+                    n_cols,
+                    n_leaves,
+                );
+            }
+            drop(d_col_ptrs);
+
+            let mut current_size = n_subtrees;
+            while current_size > 1024 {
+                let parent_size = current_size / 2;
+                let mut parents = DeviceBuffer::<u32>::alloc((parent_size as usize) * HASH_WORDS);
+                unsafe {
+                    ffi::cuda_merkle_hash_nodes(
+                        current.as_ptr(),
+                        parents.as_mut_ptr(),
+                        parent_size,
+                    );
+                }
+                current = parents;
+                current_size = parent_size;
+            }
+
+            if current_size > 1 {
+                let mut d_root = DeviceBuffer::<u32>::alloc(HASH_WORDS);
+                unsafe {
+                    ffi::cuda_merkle_reduce_to_root(
+                        current.as_ptr(),
+                        d_root.as_mut_ptr(),
+                        current_size,
+                    );
+                }
+                let host = d_root.to_host();
+                let mut root = [0u32; HASH_WORDS];
+                root.copy_from_slice(&host[..HASH_WORDS]);
+                return root;
+            } else {
+                let host = current.to_host();
+                let mut root = [0u32; HASH_WORDS];
+                root.copy_from_slice(&host[..HASH_WORDS]);
+                return root;
+            }
+        }
+
+        // Small tree fallback: full leaf hash buffer (< 1024 leaves = 32KB, negligible)
         let mut current = DeviceBuffer::<u32>::alloc((n_leaves as usize) * HASH_WORDS);
         unsafe {
             ffi::cuda_merkle_hash_leaves(
@@ -131,7 +185,7 @@ impl MerkleTree {
         }
 
         let mut current_size = n_leaves;
-        while current_size > 1024 {
+        while current_size > 1 {
             let parent_size = current_size / 2;
             let mut parents = DeviceBuffer::<u32>::alloc((parent_size as usize) * HASH_WORDS);
             unsafe {
@@ -144,26 +198,10 @@ impl MerkleTree {
             current = parents;
             current_size = parent_size;
         }
-
-        if current_size > 1 {
-            let mut d_root = DeviceBuffer::<u32>::alloc(HASH_WORDS);
-            unsafe {
-                ffi::cuda_merkle_reduce_to_root(
-                    current.as_ptr(),
-                    d_root.as_mut_ptr(),
-                    current_size,
-                );
-            }
-            let host = d_root.to_host();
-            let mut root = [0u32; HASH_WORDS];
-            root.copy_from_slice(&host[..HASH_WORDS]);
-            root
-        } else {
-            let host = current.to_host();
-            let mut root = [0u32; HASH_WORDS];
-            root.copy_from_slice(&host[..HASH_WORDS]);
-            root
-        }
+        let host = current.to_host();
+        let mut root = [0u32; HASH_WORDS];
+        root.copy_from_slice(&host[..HASH_WORDS]);
+        root
     }
 
     /// Build Merkle root from 4-column SoA data (SecureColumn / QM31).
@@ -195,12 +233,14 @@ impl MerkleTree {
             return root;
         }
 
-        // Large tree: fused leaf+merge kernel + multi-launch node hashing
-        // with shared-memory tail reduction for the last ≤ 1024 nodes
-        let mut current_size = n_leaves / 2;
-        let mut current = DeviceBuffer::<u32>::alloc((current_size as usize) * HASH_WORDS);
+        // Large tree: tiled kernel processes 1024 leaves/block in shared memory,
+        // producing n_leaves/1024 subtree roots. Then reduce those to final root.
+        // This replaces fused leaf+merge + ~9 hash_nodes launches with 1 tiled + 1-2 launches.
+        const TILE_SIZE: u32 = 1024;
+        let n_subtrees = n_leaves / TILE_SIZE;
+        let mut current = DeviceBuffer::<u32>::alloc((n_subtrees as usize) * HASH_WORDS);
         unsafe {
-            ffi::cuda_merkle_hash_leaves_merge_soa4(
+            ffi::cuda_merkle_tiled_soa4(
                 col0.as_ptr(), col1.as_ptr(),
                 col2.as_ptr(), col3.as_ptr(),
                 current.as_mut_ptr(),
@@ -208,7 +248,8 @@ impl MerkleTree {
             );
         }
 
-        // Hash node levels until small enough for single-kernel reduction
+        let mut current_size = n_subtrees;
+        // Hash remaining node levels until ≤ 1024 for tail reduction
         while current_size > 1024 {
             let parent_size = current_size / 2;
             let mut parents = DeviceBuffer::<u32>::alloc((parent_size as usize) * HASH_WORDS);
@@ -223,7 +264,6 @@ impl MerkleTree {
             current_size = parent_size;
         }
 
-        // Tail reduction: finish the tree in a single kernel launch
         if current_size > 1 {
             let mut d_root = DeviceBuffer::<u32>::alloc(HASH_WORDS);
             unsafe {
@@ -263,6 +303,187 @@ impl MerkleTree {
         }
 
         path
+    }
+
+    /// Generate authentication paths for multiple indices efficiently.
+    /// Downloads each layer once rather than once per query.
+    pub fn batch_auth_paths(&self, indices: &[usize]) -> Vec<Vec<[u32; HASH_WORDS]>> {
+        let depth = self.log_n_leaves as usize;
+        let mut paths: Vec<Vec<[u32; HASH_WORDS]>> = indices
+            .iter()
+            .map(|_| Vec::with_capacity(depth))
+            .collect();
+        let mut current_indices: Vec<usize> = indices.to_vec();
+
+        // Walk from leaves to root, downloading each layer once
+        for layer_idx in (1..=depth).rev() {
+            let layer_host = self.layers[layer_idx].to_host();
+            for (q, idx) in current_indices.iter_mut().enumerate() {
+                let sibling_idx = *idx ^ 1;
+                let mut hash = [0u32; HASH_WORDS];
+                let start = sibling_idx * HASH_WORDS;
+                hash.copy_from_slice(&layer_host[start..start + HASH_WORDS]);
+                paths[q].push(hash);
+                *idx /= 2;
+            }
+        }
+
+        paths
+    }
+
+    /// Download leaf values at given indices from the leaf layer.
+    /// Returns raw u32 words: HASH_WORDS per leaf (the Blake2s hash).
+    pub fn leaf_hashes_at(&self, indices: &[usize]) -> Vec<[u32; HASH_WORDS]> {
+        let leaf_layer = &self.layers[self.log_n_leaves as usize];
+        let host = leaf_layer.to_host();
+        indices
+            .iter()
+            .map(|&idx| {
+                let mut hash = [0u32; HASH_WORDS];
+                let start = idx * HASH_WORDS;
+                hash.copy_from_slice(&host[start..start + HASH_WORDS]);
+                hash
+            })
+            .collect()
+    }
+
+    /// Verify a Merkle auth path against a known root.
+    /// `leaf_hash` is the Blake2s hash of the leaf data (HASH_WORDS u32).
+    /// `index` is the leaf position in the tree.
+    /// `path` contains sibling hashes from leaf to root.
+    /// Returns true if the computed root matches `expected_root`.
+    pub fn verify_auth_path(
+        expected_root: &[u32; HASH_WORDS],
+        leaf_hash: &[u32; HASH_WORDS],
+        mut index: usize,
+        path: &[[u32; HASH_WORDS]],
+    ) -> bool {
+        use crate::channel::blake2s_hash;
+        let mut current = *leaf_hash;
+
+        for sibling in path {
+            // Determine order: if index is even, current is left child
+            let mut input = [0u8; 64];
+            if index % 2 == 0 {
+                for (i, &w) in current.iter().enumerate() {
+                    input[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+                }
+                for (i, &w) in sibling.iter().enumerate() {
+                    input[32 + i * 4..32 + i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+                }
+            } else {
+                for (i, &w) in sibling.iter().enumerate() {
+                    input[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+                }
+                for (i, &w) in current.iter().enumerate() {
+                    input[32 + i * 4..32 + i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+                }
+            }
+            let hash_bytes = blake2s_hash(&input);
+            for i in 0..HASH_WORDS {
+                current[i] = u32::from_le_bytes([
+                    hash_bytes[i * 4],
+                    hash_bytes[i * 4 + 1],
+                    hash_bytes[i * 4 + 2],
+                    hash_bytes[i * 4 + 3],
+                ]);
+            }
+            index /= 2;
+        }
+
+        current == *expected_root
+    }
+
+    /// Compute the Blake2s leaf hash for a single value with n_cols columns.
+    /// This matches the GPU leaf hashing in blake2s.cu.
+    pub fn hash_leaf(values: &[u32]) -> [u32; HASH_WORDS] {
+        use crate::channel::blake2s_hash;
+        let n_cols = values.len();
+        let mut input = [0u8; 64]; // max 16 columns × 4 bytes
+        for (i, &v) in values.iter().enumerate() {
+            input[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let hash_bytes = blake2s_hash(&input[..n_cols * 4]);
+        let mut out = [0u32; HASH_WORDS];
+        for i in 0..HASH_WORDS {
+            out[i] = u32::from_le_bytes([
+                hash_bytes[i * 4],
+                hash_bytes[i * 4 + 1],
+                hash_bytes[i * 4 + 2],
+                hash_bytes[i * 4 + 3],
+            ]);
+        }
+        out
+    }
+
+    /// Build a full Merkle tree from 4-column SoA data, storing all layers.
+    /// Uses the same hashing as commit_root_soa4 but retains the tree.
+    pub fn commit_soa4(
+        col0: &DeviceBuffer<u32>,
+        col1: &DeviceBuffer<u32>,
+        col2: &DeviceBuffer<u32>,
+        col3: &DeviceBuffer<u32>,
+        log_n_leaves: u32,
+    ) -> Self {
+        let n_leaves = 1u32 << log_n_leaves;
+
+        // Use fused leaf+merge to get n/2 parent hashes
+        let mut current_size = n_leaves / 2;
+        let mut current = DeviceBuffer::<u32>::alloc((current_size as usize) * HASH_WORDS);
+        unsafe {
+            ffi::cuda_merkle_hash_leaves_merge_soa4(
+                col0.as_ptr(), col1.as_ptr(),
+                col2.as_ptr(), col3.as_ptr(),
+                current.as_mut_ptr(),
+                n_leaves,
+            );
+        }
+
+        // Also compute full leaf hashes for the leaf layer (needed for auth paths)
+        // Build leaf hashes from the 4 SoA columns
+        let col_ptrs: Vec<*const u32> = vec![
+            col0.as_ptr(), col1.as_ptr(), col2.as_ptr(), col3.as_ptr(),
+        ];
+        let d_col_ptrs = DeviceBuffer::from_host(&col_ptrs);
+        let mut d_leaves = DeviceBuffer::<u32>::alloc((n_leaves as usize) * HASH_WORDS);
+        unsafe {
+            ffi::cuda_merkle_hash_leaves(
+                d_col_ptrs.as_ptr() as *const *const u32,
+                d_leaves.as_mut_ptr(),
+                4,
+                n_leaves,
+            );
+        }
+
+        // Build tree layers bottom-up, keeping all layers
+        let mut all_layers = vec![current]; // first entry = n/2 nodes
+        let mut sz = current_size;
+        while sz > 1 {
+            let parent_size = sz / 2;
+            let mut parents = DeviceBuffer::<u32>::alloc((parent_size as usize) * HASH_WORDS);
+            unsafe {
+                ffi::cuda_merkle_hash_nodes(
+                    all_layers.last().unwrap().as_ptr(),
+                    parents.as_mut_ptr(),
+                    parent_size,
+                );
+            }
+            all_layers.push(parents);
+            sz = parent_size;
+        }
+
+        // Arrange as [root, ..., n/2 nodes, leaves]
+        let root = all_layers.pop().unwrap();
+        let mut layers = vec![root];
+        for layer in all_layers.into_iter().rev() {
+            layers.push(layer);
+        }
+        layers.push(d_leaves); // leaf layer
+
+        Self {
+            layers,
+            log_n_leaves,
+        }
     }
 }
 
