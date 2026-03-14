@@ -4,7 +4,7 @@
 //! into the channel state, then draws random field elements as challenges.
 //! Lightweight — runs on CPU since it's just a few hashes.
 
-use crate::field::{M31, QM31};
+use crate::field::QM31;
 
 /// Simple Blake2s-based Fiat-Shamir channel.
 pub struct Channel {
@@ -54,7 +54,7 @@ impl Channel {
                 bytes[i * 4 + 1],
                 bytes[i * 4 + 2],
                 bytes[i * 4 + 3],
-            ]) % (M31::ONE.0 + 1) // reduce to M31 range
+            ]) % crate::field::m31::P // reduce to M31 range [0, P)
         });
         // Ensure values are in [0, P)
         QM31::from_u32_array(std::array::from_fn(|i| if v[i] == 0x7FFF_FFFF { 0 } else { v[i] }))
@@ -63,6 +63,13 @@ impl Channel {
     /// Draw multiple random QM31 elements.
     pub fn draw_felts(&mut self, n: usize) -> Vec<QM31> {
         (0..n).map(|_| self.draw_felt()).collect()
+    }
+
+    /// Draw a random number in [0, bound).
+    pub fn draw_number(&mut self, bound: usize) -> usize {
+        let bytes = self.squeeze();
+        let raw = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        (raw % bound as u64) as usize
     }
 
     fn squeeze(&mut self) -> [u8; 32] {
