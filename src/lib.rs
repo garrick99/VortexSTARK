@@ -8,5 +8,6 @@ pub mod fri;
 pub mod channel;
 pub mod air;
 pub mod poseidon;
+pub mod cairo_air;
 pub mod prover;
 pub mod verifier;
