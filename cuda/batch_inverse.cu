@@ -49,4 +49,11 @@ void cuda_batch_inverse_m31(const uint32_t* input, uint32_t* output, uint32_t n)
     batch_inverse_m31_kernel<<<blocks, threads>>>(input, output, n);
 }
 
+void cuda_batch_inverse_m31_stream(const uint32_t* input, uint32_t* output, uint32_t n, cudaStream_t stream) {
+    uint32_t n_chunks = (n + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    uint32_t threads = 256;
+    uint32_t blocks = (n_chunks + threads - 1) / threads;
+    batch_inverse_m31_kernel<<<blocks, threads, 0, stream>>>(input, output, n);
+}
+
 } // extern "C"

@@ -74,6 +74,39 @@ pub fn compute_fold_twiddles_on_demand(domain: &Coset, extract_y: bool) -> Devic
     compute_fold_twiddles_gpu(domain, extract_y)
 }
 
+/// Start computing fold twiddles asynchronously on a CUDA stream.
+/// Returns (sources_buf, result_buf) — caller must sync the stream before using result.
+pub fn compute_fold_twiddles_async(
+    domain: &Coset,
+    extract_y: bool,
+    stream: &ffi::CudaStream,
+) -> (DeviceBuffer<u32>, DeviceBuffer<u32>) {
+    let half_n = domain.size() / 2;
+    let n = domain.size();
+    let log_n = domain.log_size;
+
+    let mut d_sources = DeviceBuffer::<u32>::alloc(half_n);
+    unsafe {
+        ffi::cuda_compute_fold_twiddle_sources_stream(
+            domain.initial.x.0, domain.initial.y.0,
+            domain.step.x.0, domain.step.y.0,
+            d_sources.as_mut_ptr(),
+            n as u32, log_n,
+            if extract_y { 1 } else { 0 },
+            stream.ptr,
+        );
+    }
+
+    let mut d_result = DeviceBuffer::<u32>::alloc(half_n);
+    unsafe {
+        ffi::cuda_batch_inverse_m31_stream(
+            d_sources.as_ptr(), d_result.as_mut_ptr(), half_n as u32, stream.ptr,
+        );
+    }
+
+    (d_sources, d_result)
+}
+
 /// Compute fold twiddles on GPU: domain points → batch inverse, all on device.
 /// `extract_y`: false = x-coordinates (line fold), true = y-coordinates (circle fold).
 fn compute_fold_twiddles_gpu(domain: &Coset, extract_y: bool) -> DeviceBuffer<u32> {

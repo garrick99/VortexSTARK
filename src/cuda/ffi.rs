@@ -19,6 +19,40 @@ unsafe extern "C" {
     pub fn cudaMemPoolSetAttribute(pool: *mut c_void, attr: i32, value: *const c_void) -> i32;
 }
 
+// CUDA streams
+unsafe extern "C" {
+    pub fn cudaStreamCreate(stream: *mut *mut c_void) -> i32;
+    pub fn cudaStreamSynchronize(stream: *mut c_void) -> i32;
+    pub fn cudaStreamDestroy(stream: *mut c_void) -> i32;
+}
+
+/// RAII wrapper for a CUDA stream.
+pub struct CudaStream {
+    pub ptr: *mut c_void,
+}
+
+impl CudaStream {
+    pub fn new() -> Self {
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        let err = unsafe { cudaStreamCreate(&mut ptr) };
+        assert!(err == 0, "cudaStreamCreate failed: {err}");
+        Self { ptr }
+    }
+
+    pub fn sync(&self) {
+        let err = unsafe { cudaStreamSynchronize(self.ptr) };
+        assert!(err == 0, "cudaStreamSynchronize failed: {err}");
+    }
+}
+
+impl Drop for CudaStream {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { cudaStreamDestroy(self.ptr) };
+        }
+    }
+}
+
 // cudaMemcpyKind
 pub const MEMCPY_H2D: i32 = 1;
 pub const MEMCPY_D2H: i32 = 2;
@@ -138,6 +172,17 @@ unsafe extern "C" {
     );
 
     pub fn cuda_batch_inverse_m31(input: *const u32, output: *mut u32, n: u32);
+
+    pub fn cuda_compute_fold_twiddle_sources_stream(
+        initial_x: u32, initial_y: u32,
+        step_x: u32, step_y: u32,
+        output: *mut u32,
+        n: u32, log_n: u32,
+        extract_y: i32,
+        stream: *mut c_void,
+    );
+
+    pub fn cuda_batch_inverse_m31_stream(input: *const u32, output: *mut u32, n: u32, stream: *mut c_void);
 
     pub fn cuda_compute_coset_points(
         initial_x: u32, initial_y: u32,

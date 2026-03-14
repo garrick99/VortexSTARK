@@ -337,20 +337,39 @@ fn prove_lean_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     // For lean layers (host data), re-upload from host for the fold.
     // For GPU layers, fold directly from the stored SecureColumn.
 
-    // Line folds (GPU path for large sizes) — twiddles on demand
+    // Line folds with overlapped twiddle generation.
+    // While layer k folds+commits on default stream, layer k+1's twiddles
+    // compute on a separate stream (domain-only, no data dependency on fold result).
+    let twid_stream = ffi::CudaStream::new();
+    let mut prefetched_twid: Option<(DeviceBuffer<u32>, DeviceBuffer<u32>)> = None;
+
+    // Prefetch first line fold twiddle
+    if current_log_size > FRI_CPU_TAIL_LOG.max(3) {
+        let next_domain = Coset::half_coset(current_log_size);
+        prefetched_twid = Some(fri::compute_fold_twiddles_async(&next_domain, false, &twid_stream));
+    }
+
     while current_log_size > FRI_CPU_TAIL_LOG.max(3) {
         let ti = Instant::now();
         let fold_alpha = channel.draw_felt();
-        let line_domain = Coset::half_coset(current_log_size);
-        let d_twid = fri::compute_fold_twiddles_on_demand(&line_domain, false);
 
-        // Get the source evaluation for folding
+        // Wait for prefetched twiddle to finish
+        twid_stream.sync();
+        let (_sources, d_twid) = prefetched_twid.take().unwrap();
+
+        // Start prefetching NEXT layer's twiddle (overlaps with this fold+commit)
+        let next_log = current_log_size - 1;
+        if next_log > FRI_CPU_TAIL_LOG.max(3) {
+            let next_domain = Coset::half_coset(next_log);
+            prefetched_twid = Some(fri::compute_fold_twiddles_async(&next_domain, false, &twid_stream));
+        }
+
+        // Fold on default stream
         let folded = match fri_layer_data.last().unwrap() {
             FriLayerData::GpuTree(_, eval) => {
                 fri::fold_line_with_twiddles(eval, fold_alpha, &d_twid)
             }
             FriLayerData::HostData(host, _) => {
-                // Re-upload from host for folding (temporary, dropped after fold)
                 let src = SecureColumn {
                     cols: [
                         DeviceBuffer::from_host(&host[0]),
@@ -361,10 +380,11 @@ fn prove_lean_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
                     len: host[0].len(),
                 };
                 let result = fri::fold_line_with_twiddles(&src, fold_alpha, &d_twid);
-                drop(src); // free re-uploaded data immediately
+                drop(src);
                 result
             }
         };
+        drop(d_twid);
         current_log_size -= 1;
 
         if current_log_size >= FRI_LEAN_THRESHOLD_LOG {
@@ -392,6 +412,8 @@ fn prove_lean_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
             eprintln!("    fri gpu fold+commit (log={}): {:.3}ms", current_log_size, ti.elapsed().as_secs_f64() * 1000.0);
         }
     }
+    drop(prefetched_twid);
+    drop(twid_stream);
 
     // CPU tail
     let mut cpu_eval = match fri_layer_data.last().unwrap() {

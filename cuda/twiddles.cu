@@ -160,6 +160,25 @@ void cuda_compute_fold_twiddle_sources(
     );
 }
 
+// Stream-aware variant for overlapped execution
+void cuda_compute_fold_twiddle_sources_stream(
+    uint32_t initial_x, uint32_t initial_y,
+    uint32_t step_x, uint32_t step_y,
+    uint32_t* output,
+    uint32_t n,
+    uint32_t log_n,
+    int extract_y,
+    cudaStream_t stream
+) {
+    uint32_t half_n = n / 2;
+    uint32_t threads = 256;
+    uint32_t blocks = (half_n + threads - 1) / threads;
+    compute_fold_twiddle_sources_kernel<<<blocks, threads, 0, stream>>>(
+        initial_x, initial_y, step_x, step_y,
+        output, n, log_n, extract_y
+    );
+}
+
 void cuda_compute_coset_points(
     uint32_t initial_x, uint32_t initial_y,
     uint32_t step_x, uint32_t step_y,
