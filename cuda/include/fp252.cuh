@@ -61,12 +61,15 @@ __device__ __forceinline__ Fp252 fp_add(Fp252 a, Fp252 b) {
 
     Fp252 p = {{FP_P0, FP_P1, FP_P2, FP_P3}};
     if (c || fp_ge(r, p)) {
-        uint32_t borrow = 0;
-        uint64_t tmp;
-        tmp = r.v[0] - p.v[0]; borrow = (r.v[0] < p.v[0]) ? 1 : 0; r.v[0] = tmp;
-        tmp = r.v[1] - p.v[1] - borrow; borrow = (r.v[1] < p.v[1] + borrow) ? 1 : 0; r.v[1] = tmp;
-        tmp = r.v[2] - p.v[2] - borrow; borrow = (r.v[2] < p.v[2] + borrow) ? 1 : 0; r.v[2] = tmp;
-        r.v[3] = r.v[3] - p.v[3] - borrow;
+        // Subtract p with proper borrow chain
+        uint64_t borrow = 0;
+        for (int i = 0; i < 4; i++) {
+            uint64_t pi_plus_borrow = p.v[i] + borrow;
+            uint64_t overflow = (pi_plus_borrow < borrow) ? 1 : 0; // p.v[i] + borrow overflow
+            borrow = (r.v[i] < pi_plus_borrow) ? 1 : 0;
+            borrow += overflow;
+            r.v[i] -= pi_plus_borrow;
+        }
     }
     return r;
 }
@@ -76,28 +79,30 @@ __device__ __forceinline__ Fp252 fp_sub(Fp252 a, Fp252 b) {
         Fp252 r;
         uint64_t borrow = 0;
         for (int i = 0; i < 4; i++) {
-            uint64_t bi = b.v[i] + borrow;
-            borrow = (bi < borrow || a.v[i] < bi) ? 1 : 0;
-            r.v[i] = a.v[i] - bi;
+            uint64_t bi_plus_borrow = b.v[i] + borrow;
+            uint64_t overflow = (bi_plus_borrow < borrow) ? 1ULL : 0ULL;
+            borrow = (a.v[i] < bi_plus_borrow) ? 1ULL : 0ULL;
+            borrow += overflow;
+            r.v[i] = a.v[i] - bi_plus_borrow;
         }
         return r;
     } else {
-        Fp252 p = {{FP_P0, FP_P1, FP_P2, FP_P3}};
-        Fp252 pa = fp_add(p, a); // p + a (no reduce since we know p+a > b)
-        // But fp_add reduces... we need raw add. Use manual:
+        // a < b: compute p + a - b (raw add, no reduce)
         uint32_t c = 0;
         Fp252 raw;
-        raw.v[0] = adc64(p.v[0], a.v[0], 0, &c);
-        raw.v[1] = adc64(p.v[1], a.v[1], c, &c);
-        raw.v[2] = adc64(p.v[2], a.v[2], c, &c);
-        raw.v[3] = adc64(p.v[3], a.v[3], c, &c);
-        // Now subtract b
+        raw.v[0] = adc64(FP_P0, a.v[0], 0, &c);
+        raw.v[1] = adc64(FP_P1, a.v[1], c, &c);
+        raw.v[2] = adc64(FP_P2, a.v[2], c, &c);
+        raw.v[3] = adc64(FP_P3, a.v[3], c, &c);
+        // Subtract b
         Fp252 r;
         uint64_t borrow = 0;
         for (int i = 0; i < 4; i++) {
-            uint64_t bi = b.v[i] + borrow;
-            borrow = (bi < borrow || raw.v[i] < bi) ? 1 : 0;
-            r.v[i] = raw.v[i] - bi;
+            uint64_t bi_plus_borrow = b.v[i] + borrow;
+            uint64_t overflow = (bi_plus_borrow < borrow) ? 1ULL : 0ULL;
+            borrow = (raw.v[i] < bi_plus_borrow) ? 1ULL : 0ULL;
+            borrow += overflow;
+            r.v[i] = raw.v[i] - bi_plus_borrow;
         }
         return r;
     }
