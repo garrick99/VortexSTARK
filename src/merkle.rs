@@ -285,6 +285,145 @@ impl MerkleTree {
         }
     }
 
+    /// Build Merkle root from 4-column SoA data and also return the tile subtree roots.
+    /// The subtree roots can be used later for targeted auth path computation without
+    /// re-hashing all leaves.
+    pub fn commit_root_soa4_with_subtrees(
+        col0: &DeviceBuffer<u32>,
+        col1: &DeviceBuffer<u32>,
+        col2: &DeviceBuffer<u32>,
+        col3: &DeviceBuffer<u32>,
+        log_n_leaves: u32,
+    ) -> ([u32; HASH_WORDS], Vec<[u32; HASH_WORDS]>) {
+        let n_leaves = 1u32 << log_n_leaves;
+        const TILE_SIZE: u32 = 1024;
+
+        if n_leaves < TILE_SIZE {
+            let root = Self::commit_root_soa4(col0, col1, col2, col3, log_n_leaves);
+            return (root, vec![root]);
+        }
+
+        let n_subtrees = n_leaves / TILE_SIZE;
+        let mut d_subtrees = DeviceBuffer::<u32>::alloc((n_subtrees as usize) * HASH_WORDS);
+        unsafe {
+            ffi::cuda_merkle_tiled_soa4(
+                col0.as_ptr(), col1.as_ptr(),
+                col2.as_ptr(), col3.as_ptr(),
+                d_subtrees.as_mut_ptr(),
+                n_leaves,
+            );
+        }
+
+        // Download subtree roots to host BEFORE reducing to final root
+        let subtree_host = d_subtrees.to_host();
+        let subtree_roots: Vec<[u32; HASH_WORDS]> = (0..n_subtrees as usize)
+            .map(|i| {
+                let mut h = [0u32; HASH_WORDS];
+                h.copy_from_slice(&subtree_host[i * HASH_WORDS..(i + 1) * HASH_WORDS]);
+                h
+            })
+            .collect();
+
+        // Reduce to final root
+        let mut current = d_subtrees;
+        let mut current_size = n_subtrees;
+        while current_size > 1024 {
+            let parent_size = current_size / 2;
+            let mut parents = DeviceBuffer::<u32>::alloc((parent_size as usize) * HASH_WORDS);
+            unsafe {
+                ffi::cuda_merkle_hash_nodes(current.as_ptr(), parents.as_mut_ptr(), parent_size);
+            }
+            current = parents;
+            current_size = parent_size;
+        }
+
+        let root = if current_size > 1 {
+            let mut d_root = DeviceBuffer::<u32>::alloc(HASH_WORDS);
+            unsafe {
+                ffi::cuda_merkle_reduce_to_root(current.as_ptr(), d_root.as_mut_ptr(), current_size);
+            }
+            let host = d_root.to_host();
+            let mut r = [0u32; HASH_WORDS];
+            r.copy_from_slice(&host[..HASH_WORDS]);
+            r
+        } else {
+            let host = current.to_host();
+            let mut r = [0u32; HASH_WORDS];
+            r.copy_from_slice(&host[..HASH_WORDS]);
+            r
+        };
+
+        (root, subtree_roots)
+    }
+
+    /// Same as commit_root_only but also returns tile subtree roots for targeted auth paths.
+    pub fn commit_root_only_with_subtrees<C: AsRef<DeviceBuffer<u32>>>(
+        columns: &[C], log_n_leaves: u32,
+    ) -> ([u32; HASH_WORDS], Vec<[u32; HASH_WORDS]>) {
+        let n_leaves = 1u32 << log_n_leaves;
+        let n_cols = columns.len() as u32;
+        const TILE_SIZE: u32 = 1024;
+
+        if n_leaves < TILE_SIZE {
+            let root = Self::commit_root_only(columns, log_n_leaves);
+            return (root, vec![root]);
+        }
+
+        let col_ptrs: Vec<*const u32> = columns.iter().map(|c| c.as_ref().as_ptr()).collect();
+        let d_col_ptrs = DeviceBuffer::from_host(&col_ptrs);
+
+        let n_subtrees = n_leaves / TILE_SIZE;
+        let mut d_subtrees = DeviceBuffer::<u32>::alloc((n_subtrees as usize) * HASH_WORDS);
+        unsafe {
+            ffi::cuda_merkle_tiled_generic(
+                d_col_ptrs.as_ptr() as *const *const u32,
+                d_subtrees.as_mut_ptr(),
+                n_cols,
+                n_leaves,
+            );
+        }
+        drop(d_col_ptrs);
+
+        let subtree_host = d_subtrees.to_host();
+        let subtree_roots: Vec<[u32; HASH_WORDS]> = (0..n_subtrees as usize)
+            .map(|i| {
+                let mut h = [0u32; HASH_WORDS];
+                h.copy_from_slice(&subtree_host[i * HASH_WORDS..(i + 1) * HASH_WORDS]);
+                h
+            })
+            .collect();
+
+        let mut current = d_subtrees;
+        let mut current_size = n_subtrees;
+        while current_size > 1024 {
+            let parent_size = current_size / 2;
+            let mut parents = DeviceBuffer::<u32>::alloc((parent_size as usize) * HASH_WORDS);
+            unsafe {
+                ffi::cuda_merkle_hash_nodes(current.as_ptr(), parents.as_mut_ptr(), parent_size);
+            }
+            current = parents;
+            current_size = parent_size;
+        }
+
+        let root = if current_size > 1 {
+            let mut d_root = DeviceBuffer::<u32>::alloc(HASH_WORDS);
+            unsafe {
+                ffi::cuda_merkle_reduce_to_root(current.as_ptr(), d_root.as_mut_ptr(), current_size);
+            }
+            let host = d_root.to_host();
+            let mut r = [0u32; HASH_WORDS];
+            r.copy_from_slice(&host[..HASH_WORDS]);
+            r
+        } else {
+            let host = current.to_host();
+            let mut r = [0u32; HASH_WORDS];
+            r.copy_from_slice(&host[..HASH_WORDS]);
+            r
+        };
+
+        (root, subtree_roots)
+    }
+
     /// Generate a Merkle authentication path for leaf at `index`.
     /// Returns log_n sibling hashes (each HASH_WORDS u32).
     pub fn auth_path(&self, index: usize) -> Vec<[u32; HASH_WORDS]> {
@@ -423,66 +562,14 @@ impl MerkleTree {
         host_cols: &[Vec<u32>; 4],
         indices: &[usize],
     ) -> Vec<Vec<[u32; HASH_WORDS]>> {
-        use crate::channel::blake2s_hash;
-
         let n = host_cols[0].len();
         assert!(n.is_power_of_two() && n >= 1);
 
-        // Hash leaves: same as GPU kernel — 4 u32 → 16-byte message → Blake2s
-        let leaf_hashes: Vec<[u32; HASH_WORDS]> = (0..n)
-            .map(|i| {
-                let mut input = [0u8; 64];
-                for (c, col) in host_cols.iter().enumerate() {
-                    input[c * 4..c * 4 + 4].copy_from_slice(&col[i].to_le_bytes());
-                }
-                let h = blake2s_hash(&input[..16]);
-                let mut out = [0u32; HASH_WORDS];
-                for j in 0..HASH_WORDS {
-                    out[j] = u32::from_le_bytes([h[j*4], h[j*4+1], h[j*4+2], h[j*4+3]]);
-                }
-                out
-            })
-            .collect();
+        let hash_leaf = |i: usize| -> [u32; HASH_WORDS] {
+            Self::hash_leaf(&[host_cols[0][i], host_cols[1][i], host_cols[2][i], host_cols[3][i]])
+        };
 
-        // Build all layers bottom-up
-        let mut layers: Vec<Vec<[u32; HASH_WORDS]>> = vec![leaf_hashes];
-        while layers.last().unwrap().len() > 1 {
-            let prev = layers.last().unwrap();
-            let parent_count = prev.len() / 2;
-            let parents: Vec<[u32; HASH_WORDS]> = (0..parent_count)
-                .map(|i| {
-                    let mut input = [0u8; 64];
-                    for (j, &w) in prev[2 * i].iter().enumerate() {
-                        input[j * 4..j * 4 + 4].copy_from_slice(&w.to_le_bytes());
-                    }
-                    for (j, &w) in prev[2 * i + 1].iter().enumerate() {
-                        input[32 + j * 4..32 + j * 4 + 4].copy_from_slice(&w.to_le_bytes());
-                    }
-                    let h = blake2s_hash(&input);
-                    let mut out = [0u32; HASH_WORDS];
-                    for k in 0..HASH_WORDS {
-                        out[k] = u32::from_le_bytes([h[k*4], h[k*4+1], h[k*4+2], h[k*4+3]]);
-                    }
-                    out
-                })
-                .collect();
-            layers.push(parents);
-        }
-
-        // Extract auth paths: layers[0]=leaves, layers[last]=root
-        indices
-            .iter()
-            .map(|&qi| {
-                let mut path = Vec::new();
-                let mut idx = qi;
-                for layer in &layers[..layers.len() - 1] {
-                    let sibling = idx ^ 1;
-                    path.push(layer[sibling]);
-                    idx /= 2;
-                }
-                path
-            })
-            .collect()
+        Self::targeted_auth_paths(n, indices, &hash_leaf)
     }
 
     /// Build a CPU-side Merkle tree from single-column host data and extract auth paths.
@@ -491,58 +578,209 @@ impl MerkleTree {
         host_col: &[u32],
         indices: &[usize],
     ) -> Vec<Vec<[u32; HASH_WORDS]>> {
-        use crate::channel::blake2s_hash;
-
         let n = host_col.len();
         assert!(n.is_power_of_two() && n >= 1);
 
-        // Hash leaves: 1 u32 → 4-byte message → Blake2s
-        let leaf_hashes: Vec<[u32; HASH_WORDS]> = host_col
-            .iter()
-            .map(|&v| {
-                let mut input = [0u8; 64];
-                input[0..4].copy_from_slice(&v.to_le_bytes());
-                let h = blake2s_hash(&input[..4]);
-                let mut out = [0u32; HASH_WORDS];
-                for j in 0..HASH_WORDS {
-                    out[j] = u32::from_le_bytes([h[j*4], h[j*4+1], h[j*4+2], h[j*4+3]]);
-                }
-                out
-            })
-            .collect();
+        let hash_leaf = |i: usize| -> [u32; HASH_WORDS] {
+            Self::hash_leaf(&[host_col[i]])
+        };
 
-        let mut layers: Vec<Vec<[u32; HASH_WORDS]>> = vec![leaf_hashes];
+        Self::targeted_auth_paths(n, indices, &hash_leaf)
+    }
+
+    /// Compute auth paths by only building the subtrees that contain queried indices.
+    /// For 100 queries across 268M leaves, this touches ~200 tiles of 1024 instead of all 262K.
+    /// The upper tree (subtree roots → final root) is always built in full since it's small.
+    fn targeted_auth_paths(
+        n: usize,
+        indices: &[usize],
+        hash_leaf: &dyn Fn(usize) -> [u32; HASH_WORDS],
+    ) -> Vec<Vec<[u32; HASH_WORDS]>> {
+        use std::collections::HashMap;
+
+        const TILE_SIZE: usize = 1024;
+
+        // For small trees, just build the full tree directly (no tiling overhead)
+        if n <= TILE_SIZE * 4 {
+            let leaf_hashes: Vec<[u32; HASH_WORDS]> = (0..n).map(hash_leaf).collect();
+            let layers = Self::build_cpu_tree_layers(leaf_hashes);
+            return Self::extract_paths_from_layers(&layers, indices);
+        }
+
+        let n_tiles = n / TILE_SIZE;
+
+        // Collect which tiles we need (from query indices)
+        let mut needed_tiles: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        for &qi in indices {
+            needed_tiles.insert(qi / TILE_SIZE);
+        }
+
+        // Compute ALL tile roots (needed for upper tree correctness).
+        // Only build full subtrees for the ~200 tiles containing queries.
+        let mut tile_roots: Vec<[u32; HASH_WORDS]> = Vec::with_capacity(n_tiles);
+        let mut tile_subtrees: HashMap<usize, Vec<Vec<[u32; HASH_WORDS]>>> = HashMap::new();
+
+        for tile_idx in 0..n_tiles {
+            let base = tile_idx * TILE_SIZE;
+            let leaf_hashes: Vec<[u32; HASH_WORDS]> = (base..base + TILE_SIZE)
+                .map(hash_leaf)
+                .collect();
+
+            if needed_tiles.contains(&tile_idx) {
+                let layers = Self::build_cpu_tree_layers(leaf_hashes);
+                let root = layers.last().unwrap()[0];
+                tile_roots.push(root);
+                tile_subtrees.insert(tile_idx, layers);
+            } else {
+                let root = Self::reduce_to_root(leaf_hashes);
+                tile_roots.push(root);
+            }
+        }
+
+        // Build upper tree from tile roots
+        let upper_layers = Self::build_cpu_tree_layers(tile_roots);
+
+        // Extract auth paths: intra-tile path + upper tree path
+        indices
+            .iter()
+            .map(|&qi| {
+                let tile_idx = qi / TILE_SIZE;
+                let intra_idx = qi % TILE_SIZE;
+                let mut path = Vec::new();
+
+                // Intra-tile path
+                let subtree = &tile_subtrees[&tile_idx];
+                let mut idx = intra_idx;
+                for layer in &subtree[..subtree.len() - 1] {
+                    path.push(layer[idx ^ 1]);
+                    idx /= 2;
+                }
+
+                // Upper tree path
+                let mut idx = tile_idx;
+                for layer in &upper_layers[..upper_layers.len() - 1] {
+                    path.push(layer[idx ^ 1]);
+                    idx /= 2;
+                }
+
+                path
+            })
+            .collect()
+    }
+
+    /// Compute auth paths using pre-computed tile roots from the GPU tiled kernel.
+    /// Only builds the ~200 subtrees containing queried indices on CPU.
+    /// The upper tree is built from the pre-computed tile roots.
+    /// This is O(n_queries * 1024) instead of O(n).
+    pub fn targeted_auth_paths_with_tile_roots(
+        tile_roots: &[[u32; HASH_WORDS]],
+        n_leaves: usize,
+        indices: &[usize],
+        hash_leaf: &dyn Fn(usize) -> [u32; HASH_WORDS],
+    ) -> Vec<Vec<[u32; HASH_WORDS]>> {
+        use std::collections::HashMap;
+
+        const TILE_SIZE: usize = 1024;
+
+        // Collect which tiles we need
+        let mut needed_tiles: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        for &qi in indices {
+            needed_tiles.insert(qi / TILE_SIZE);
+        }
+
+        // Build only the needed subtrees on CPU
+        let mut tile_subtrees: HashMap<usize, Vec<Vec<[u32; HASH_WORDS]>>> = HashMap::new();
+        for &tile_idx in &needed_tiles {
+            let base = tile_idx * TILE_SIZE;
+            let leaf_hashes: Vec<[u32; HASH_WORDS]> = (base..base + TILE_SIZE)
+                .map(hash_leaf)
+                .collect();
+            tile_subtrees.insert(tile_idx, Self::build_cpu_tree_layers(leaf_hashes));
+        }
+
+        // Build upper tree from ALL tile roots (already computed by GPU)
+        let upper_layers = Self::build_cpu_tree_layers(tile_roots.to_vec());
+
+        // Extract auth paths: intra-tile path + upper tree path
+        indices
+            .iter()
+            .map(|&qi| {
+                let tile_idx = qi / TILE_SIZE;
+                let intra_idx = qi % TILE_SIZE;
+                let mut path = Vec::new();
+
+                let subtree = &tile_subtrees[&tile_idx];
+                let mut idx = intra_idx;
+                for layer in &subtree[..subtree.len() - 1] {
+                    path.push(layer[idx ^ 1]);
+                    idx /= 2;
+                }
+
+                let mut idx = tile_idx;
+                for layer in &upper_layers[..upper_layers.len() - 1] {
+                    path.push(layer[idx ^ 1]);
+                    idx /= 2;
+                }
+
+                path
+            })
+            .collect()
+    }
+
+    /// Build CPU Merkle tree layers from leaf hashes. Returns [leaves, parents, ..., root].
+    fn build_cpu_tree_layers(leaf_hashes: Vec<[u32; HASH_WORDS]>) -> Vec<Vec<[u32; HASH_WORDS]>> {
+        use crate::channel::blake2s_hash;
+        let mut layers = vec![leaf_hashes];
         while layers.last().unwrap().len() > 1 {
             let prev = layers.last().unwrap();
-            let parent_count = prev.len() / 2;
-            let parents: Vec<[u32; HASH_WORDS]> = (0..parent_count)
-                .map(|i| {
-                    let mut input = [0u8; 64];
-                    for (j, &w) in prev[2 * i].iter().enumerate() {
-                        input[j * 4..j * 4 + 4].copy_from_slice(&w.to_le_bytes());
-                    }
-                    for (j, &w) in prev[2 * i + 1].iter().enumerate() {
-                        input[32 + j * 4..32 + j * 4 + 4].copy_from_slice(&w.to_le_bytes());
-                    }
-                    let h = blake2s_hash(&input);
-                    let mut out = [0u32; HASH_WORDS];
-                    for k in 0..HASH_WORDS {
-                        out[k] = u32::from_le_bytes([h[k*4], h[k*4+1], h[k*4+2], h[k*4+3]]);
-                    }
-                    out
-                })
+            let parents: Vec<[u32; HASH_WORDS]> = (0..prev.len() / 2)
+                .map(|i| Self::hash_pair(&prev[2 * i], &prev[2 * i + 1]))
                 .collect();
             layers.push(parents);
         }
+        layers
+    }
 
+    /// Reduce leaf hashes to a single root without storing intermediate layers.
+    fn reduce_to_root(mut hashes: Vec<[u32; HASH_WORDS]>) -> [u32; HASH_WORDS] {
+        while hashes.len() > 1 {
+            hashes = (0..hashes.len() / 2)
+                .map(|i| Self::hash_pair(&hashes[2 * i], &hashes[2 * i + 1]))
+                .collect();
+        }
+        hashes[0]
+    }
+
+    /// Hash two sibling nodes into a parent.
+    fn hash_pair(left: &[u32; HASH_WORDS], right: &[u32; HASH_WORDS]) -> [u32; HASH_WORDS] {
+        use crate::channel::blake2s_hash;
+        let mut input = [0u8; 64];
+        for (j, &w) in left.iter().enumerate() {
+            input[j * 4..j * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        for (j, &w) in right.iter().enumerate() {
+            input[32 + j * 4..32 + j * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        let h = blake2s_hash(&input);
+        let mut out = [0u32; HASH_WORDS];
+        for k in 0..HASH_WORDS {
+            out[k] = u32::from_le_bytes([h[k * 4], h[k * 4 + 1], h[k * 4 + 2], h[k * 4 + 3]]);
+        }
+        out
+    }
+
+    /// Extract auth paths from pre-built tree layers.
+    fn extract_paths_from_layers(
+        layers: &[Vec<[u32; HASH_WORDS]>],
+        indices: &[usize],
+    ) -> Vec<Vec<[u32; HASH_WORDS]>> {
         indices
             .iter()
             .map(|&qi| {
                 let mut path = Vec::new();
                 let mut idx = qi;
                 for layer in &layers[..layers.len() - 1] {
-                    let sibling = idx ^ 1;
-                    path.push(layer[sibling]);
+                    path.push(layer[idx ^ 1]);
                     idx /= 2;
                 }
                 path

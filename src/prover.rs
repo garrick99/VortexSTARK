@@ -217,9 +217,10 @@ fn prove_lean_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
         eprintln!("  blowup_eval: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
     }
 
-    // --- Step 4: Commit trace (root-only, tiled) ---
+    // --- Step 4: Commit trace (root-only, tiled) — save subtree roots for fast decommit ---
     let t0 = Instant::now();
-    let trace_commitment = MerkleTree::commit_root_only(std::slice::from_ref(&d_eval), log_eval_size);
+    let (trace_commitment, trace_subtree_roots) =
+        MerkleTree::commit_root_only_with_subtrees(std::slice::from_ref(&d_eval), log_eval_size);
     if timed { eprintln!("  trace_commit: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0); }
 
     // Download trace eval to host for later decommitment
@@ -255,9 +256,9 @@ fn prove_lean_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
         eprintln!("  quotient_gpu: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
     }
 
-    // --- Step 6: Commit quotient (root-only, tiled) ---
+    // --- Step 6: Commit quotient (root-only, tiled) — save subtree roots for fast decommit ---
     let t0 = Instant::now();
-    let quotient_commitment = MerkleTree::commit_root_soa4(
+    let (quotient_commitment, quotient_subtree_roots) = MerkleTree::commit_root_soa4_with_subtrees(
         &quotient_col.cols[0], &quotient_col.cols[1],
         &quotient_col.cols[2], &quotient_col.cols[3],
         log_eval_size,
@@ -298,16 +299,16 @@ fn prove_lean_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     drop(current_eval);
     current_log_size -= 1;
 
-    // Track FRI data: either a full GPU tree or host data for CPU decommitment
+    // Track FRI data: either a full GPU tree or host data + subtree roots
     enum FriLayerData {
         GpuTree(MerkleTree, SecureColumn),
-        HostData([Vec<u32>; 4]),
+        HostData([Vec<u32>; 4], Vec<[u32; 8]>), // host cols + subtree roots
     }
     let mut fri_layer_data: Vec<FriLayerData> = Vec::new();
 
     // Commit first FRI layer
     if current_log_size >= FRI_LEAN_THRESHOLD_LOG {
-        let fri_root = MerkleTree::commit_root_soa4(
+        let (fri_root, subtrees) = MerkleTree::commit_root_soa4_with_subtrees(
             &line_eval.cols[0], &line_eval.cols[1],
             &line_eval.cols[2], &line_eval.cols[3], current_log_size,
         );
@@ -317,7 +318,7 @@ fn prove_lean_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
             line_eval.cols[0].to_host(), line_eval.cols[1].to_host(),
             line_eval.cols[2].to_host(), line_eval.cols[3].to_host(),
         ];
-        fri_layer_data.push(FriLayerData::HostData(host_data));
+        fri_layer_data.push(FriLayerData::HostData(host_data, subtrees));
     } else {
         let fri_tree = MerkleTree::commit_soa4(
             &line_eval.cols[0], &line_eval.cols[1],
@@ -348,7 +349,7 @@ fn prove_lean_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
             FriLayerData::GpuTree(_, eval) => {
                 fri::fold_line_with_twiddles(eval, fold_alpha, &d_twid)
             }
-            FriLayerData::HostData(host) => {
+            FriLayerData::HostData(host, _) => {
                 // Re-upload from host for folding (temporary, dropped after fold)
                 let src = SecureColumn {
                     cols: [
@@ -367,7 +368,7 @@ fn prove_lean_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
         current_log_size -= 1;
 
         if current_log_size >= FRI_LEAN_THRESHOLD_LOG {
-            let fri_root = MerkleTree::commit_root_soa4(
+            let (fri_root, subtrees) = MerkleTree::commit_root_soa4_with_subtrees(
                 &folded.cols[0], &folded.cols[1],
                 &folded.cols[2], &folded.cols[3], current_log_size,
             );
@@ -377,7 +378,7 @@ fn prove_lean_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
                 folded.cols[0].to_host(), folded.cols[1].to_host(),
                 folded.cols[2].to_host(), folded.cols[3].to_host(),
             ];
-            fri_layer_data.push(FriLayerData::HostData(host_data));
+            fri_layer_data.push(FriLayerData::HostData(host_data, subtrees));
         } else {
             let fri_tree = MerkleTree::commit_soa4(
                 &folded.cols[0], &folded.cols[1],
@@ -395,7 +396,7 @@ fn prove_lean_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     // CPU tail
     let mut cpu_eval = match fri_layer_data.last().unwrap() {
         FriLayerData::GpuTree(_, eval) => eval.to_qm31(),
-        FriLayerData::HostData(host) => {
+        FriLayerData::HostData(host, _) => {
             let n = host[0].len();
             (0..n).map(|i| QM31::from_u32_array([host[0][i], host[1][i], host[2][i], host[3][i]])).collect()
         }
@@ -435,11 +436,11 @@ fn prove_lean_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
         .map(|_| channel.draw_number(eval_size))
         .collect();
 
-    // Decommit trace — CPU auth paths from host data
-    let trace_decommitment = decommit_trace_cpu(&eval_host, &trace_commitment, &query_indices, log_eval_size);
+    // Decommit trace — targeted CPU auth paths using GPU subtree roots
+    let trace_decommitment = decommit_trace_cpu(&eval_host, &trace_subtree_roots, &query_indices);
 
-    // Decommit quotient — CPU auth paths from host data
-    let quotient_decommitment = decommit_soa4_cpu(&quotient_host, &quotient_commitment, &query_indices, log_eval_size);
+    // Decommit quotient — targeted CPU auth paths using GPU subtree roots
+    let quotient_decommitment = decommit_soa4_cpu(&quotient_host, &quotient_subtree_roots, &query_indices);
 
     // Decommit FRI layers
     let mut fri_decommitments = Vec::new();
@@ -450,8 +451,8 @@ fn prove_lean_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
                 let decom = decommit_fri_layer(tree, eval, &folded_indices);
                 fri_decommitments.push(decom);
             }
-            FriLayerData::HostData(host) => {
-                let decom = decommit_soa4_cpu(host, &[0u32; 8], &folded_indices, 0);
+            FriLayerData::HostData(host, subtrees) => {
+                let decom = decommit_soa4_cpu(host, subtrees, &folded_indices);
                 fri_decommitments.push(decom);
             }
         }
@@ -512,18 +513,31 @@ fn decommit_trace(
     QueryDecommitment { values, sibling_values, auth_paths, sibling_auth_paths }
 }
 
-/// Extract trace decommitment from host data with CPU-computed auth paths.
+/// Extract trace decommitment from host data with targeted CPU auth paths.
+/// Uses pre-computed subtree roots from the GPU tiled commit for large trees,
+/// falls back to full CPU tree for small ones.
 fn decommit_trace_cpu(
     eval_host: &[u32],
-    _commitment: &[u32; 8],
+    subtree_roots: &[[u32; 8]],
     indices: &[usize],
-    _log_eval_size: u32,
 ) -> QueryDecommitment<u32> {
     let values: Vec<u32> = indices.iter().map(|&i| eval_host[i]).collect();
     let sibling_indices: Vec<usize> = indices.iter().map(|&i| i ^ 1).collect();
     let sibling_values: Vec<u32> = sibling_indices.iter().map(|&i| eval_host[i]).collect();
-    let auth_paths = MerkleTree::cpu_merkle_auth_paths_single(eval_host, indices);
-    let sibling_auth_paths = MerkleTree::cpu_merkle_auth_paths_single(eval_host, &sibling_indices);
+
+    let hash_leaf = |i: usize| -> [u32; 8] { MerkleTree::hash_leaf(&[eval_host[i]]) };
+    let n = eval_host.len();
+    let (auth_paths, sibling_auth_paths) = if n >= 4096 {
+        (
+            MerkleTree::targeted_auth_paths_with_tile_roots(subtree_roots, n, indices, &hash_leaf),
+            MerkleTree::targeted_auth_paths_with_tile_roots(subtree_roots, n, &sibling_indices, &hash_leaf),
+        )
+    } else {
+        (
+            MerkleTree::cpu_merkle_auth_paths_single(eval_host, indices),
+            MerkleTree::cpu_merkle_auth_paths_single(eval_host, &sibling_indices),
+        )
+    };
     QueryDecommitment { values, sibling_values, auth_paths, sibling_auth_paths }
 }
 
@@ -547,12 +561,11 @@ fn decommit_soa4_from_host(
     QueryDecommitment { values, sibling_values, auth_paths, sibling_auth_paths }
 }
 
-/// Extract SoA4 decommitment with CPU-computed auth paths (no GPU tree needed).
+/// Extract SoA4 decommitment with targeted CPU auth paths using pre-computed subtree roots.
 fn decommit_soa4_cpu(
     host: &[Vec<u32>; 4],
-    _commitment: &[u32; 8],
+    subtree_roots: &[[u32; 8]],
     indices: &[usize],
-    _log_eval_size: u32,
 ) -> QueryDecommitment<[u32; 4]> {
     let values: Vec<[u32; 4]> = indices
         .iter()
@@ -563,8 +576,21 @@ fn decommit_soa4_cpu(
         .iter()
         .map(|&i| [host[0][i], host[1][i], host[2][i], host[3][i]])
         .collect();
-    let auth_paths = MerkleTree::cpu_merkle_auth_paths_soa4(host, indices);
-    let sibling_auth_paths = MerkleTree::cpu_merkle_auth_paths_soa4(host, &sibling_indices);
+    let n = host[0].len();
+    let hash_leaf = |i: usize| -> [u32; 8] {
+        MerkleTree::hash_leaf(&[host[0][i], host[1][i], host[2][i], host[3][i]])
+    };
+    let (auth_paths, sibling_auth_paths) = if n >= 4096 {
+        (
+            MerkleTree::targeted_auth_paths_with_tile_roots(subtree_roots, n, indices, &hash_leaf),
+            MerkleTree::targeted_auth_paths_with_tile_roots(subtree_roots, n, &sibling_indices, &hash_leaf),
+        )
+    } else {
+        (
+            MerkleTree::cpu_merkle_auth_paths_soa4(host, indices),
+            MerkleTree::cpu_merkle_auth_paths_soa4(host, &sibling_indices),
+        )
+    };
     QueryDecommitment { values, sibling_values, auth_paths, sibling_auth_paths }
 }
 
