@@ -7,5 +7,6 @@ pub mod merkle;
 pub mod fri;
 pub mod channel;
 pub mod air;
+pub mod poseidon;
 pub mod prover;
 pub mod verifier;
