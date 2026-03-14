@@ -127,12 +127,19 @@ impl Fp {
             }
             Self { v: r }
         } else {
-            // self < rhs: compute p + self - rhs
-            let p_plus_self = PRIME.add(self);
+            // self < rhs: compute p + self - rhs (using raw addition, no reduce)
+            let mut p_plus_self = [0u64; 4];
+            let mut carry = 0u128;
+            for i in 0..4 {
+                carry += PRIME.v[i] as u128 + self.v[i] as u128;
+                p_plus_self[i] = carry as u64;
+                carry >>= 64;
+            }
+            // Now subtract rhs
             let mut r = [0u64; 4];
             let mut borrow: u64 = 0;
             for i in 0..4 {
-                let (r1, b1) = p_plus_self.v[i].overflowing_sub(rhs.v[i]);
+                let (r1, b1) = p_plus_self[i].overflowing_sub(rhs.v[i]);
                 let (r2, b2) = r1.overflowing_sub(borrow);
                 r[i] = r2;
                 borrow = (b1 as u64) + (b2 as u64);
@@ -231,59 +238,214 @@ impl Fp {
     }
 }
 
-/// Reduce a 512-bit value mod p using signed i128 limbs for safe borrow propagation.
+/// Reduce a 512-bit product mod p.
+/// Uses: 2^256 ≡ -(544·2^192 + 32) mod p (since p = 2^251 + 17·2^192 + 1).
+/// Iteratively folds high limbs down until the value fits in 4 limbs.
 fn reduce_512(full: &[u64; 8]) -> Fp {
-    // Use signed arithmetic to handle borrows cleanly
-    let mut w = [0i128; 9];
+    // Strategy: repeatedly fold bits >= 256 using 2^256 ≡ -(544·2^192 + 32) mod p.
+    // Work in i128 limbs to handle signed intermediates safely.
+    // After each fold, normalize limbs to [0, 2^64) and check convergence.
+    let mut w = [0i128; 8]; // extra headroom
     for i in 0..8 { w[i] = full[i] as i128; }
 
-    // Reduce high limbs by subtracting q * p shifted
-    let p3 = PRIME.v[3] as i128;
-    for top in (4..8).rev() {
-        while w[top] > 0 {
-            let q = w[top] / p3; // quotient estimate
-            let q = if q == 0 { 1 } else { q }; // at least 1 to make progress
-            let shift = (top - 3) as usize;
-            // Subtract q * p shifted
-            for i in 0..4 {
-                let idx = i + shift;
-                if idx < 9 {
-                    w[idx] -= q * PRIME.v[i] as i128;
-                }
+    // Iterative fold: for each limb k >= 4, fold w[k] * 2^(64k) down.
+    // w[k] * 2^(64k) = w[k] * 2^(64*(k-4)) * 2^256
+    //                 ≡ -w[k] * 2^(64*(k-4)) * (544*2^192 + 32) mod p
+    // = subtract w[k]*32 from position (k-4) and w[k]*544 from position (k-4+3)=(k-1)
+    // This folds limb k down to limbs k-4 and k-1.
+
+    // Two passes should suffice (512 bits → ~266 bits → ~256 bits).
+    for _pass in 0..3 {
+        // Normalize first: propagate carries so each limb is in [0, 2^64)
+        for i in 0..7 {
+            if w[i] >= (1i128 << 64) {
+                w[i + 1] += w[i] >> 64;
+                w[i] &= (1i128 << 64) - 1;
+            } else if w[i] < 0 {
+                let borrow = ((-w[i] - 1) >> 64) + 1; // ceil(-w[i] / 2^64)
+                w[i] += borrow << 64;
+                w[i + 1] -= borrow;
             }
-            // Propagate borrows
-            for i in 0..8 {
-                if w[i] < 0 {
-                    let borrow = ((-w[i]) + ((1i128 << 64) - 1)) >> 64;
-                    w[i] += borrow << 64;
-                    w[i + 1] -= borrow;
-                }
-                if w[i] >= (1i128 << 64) {
-                    let carry = w[i] >> 64;
-                    w[i] -= carry << 64;
-                    w[i + 1] += carry;
-                }
-            }
+        }
+
+        // Fold limbs 4+ down
+        let mut any_high = false;
+        for k in (4..8).rev() {
+            if w[k] == 0 { continue; }
+            any_high = true;
+            let val = w[k];
+            w[k] = 0;
+            let base = k - 4;
+            w[base] -= val * 32;         // -(val * 32) at position base
+            w[base + 3] -= val * 544;    // -(val * 544) at position base+3
+        }
+        if !any_high { break; }
+    }
+
+    // Final normalize
+    for i in 0..7 {
+        if w[i] >= (1i128 << 64) {
+            w[i + 1] += w[i] >> 64;
+            w[i] &= (1i128 << 64) - 1;
+        } else if w[i] < 0 {
+            let borrow = ((-w[i] - 1) >> 64) + 1;
+            w[i] += borrow << 64;
+            w[i + 1] -= borrow;
         }
     }
 
-    // Add p until non-negative
-    while w[3] < 0 || w[4] != 0 {
-        if w[3] < 0 || w[4] < 0 {
-            for i in 0..4 { w[i] += PRIME.v[i] as i128; }
-            for i in 0..4 {
-                if w[i] >= (1i128 << 64) {
-                    let carry = w[i] >> 64;
-                    w[i] -= carry << 64;
-                    w[i + 1] += carry;
-                }
+    // If negative (w[3] < 0 or w[4] != 0), add p repeatedly
+    for _ in 0..10 {
+        if w[4] <= 0 && w[3] >= 0 { break; }
+        w[0] += PRIME.v[0] as i128;
+        w[3] += PRIME.v[3] as i128;
+        for i in 0..4 {
+            if w[i] >= (1i128 << 64) {
+                w[i + 1] += w[i] >> 64;
+                w[i] &= (1i128 << 64) - 1;
             }
-        } else {
-            break;
         }
     }
 
     let mut result = Fp { v: [w[0] as u64, w[1] as u64, w[2] as u64, w[3] as u64] };
+    result.reduce();
+    result
+}
+
+#[allow(dead_code)]
+fn reduce_512_old(full: &[u64; 8]) -> Fp {
+    // Signed i128 limbs with headroom for negative intermediates.
+    // We work with 5 limbs to handle the fold overflow.
+    let mut lo = [full[0] as i128, full[1] as i128, full[2] as i128, full[3] as i128, 0i128];
+    let hi = [full[4] as i128, full[5] as i128, full[6] as i128, full[7] as i128];
+
+    // Fold: lo -= hi * (544·2^192 + 32)
+    // 544·2^192 = 544 in "limb 3" position (bits 192-255)
+    // 32 in "limb 0" position (bits 0-63)
+    // hi[k] * 2^(64*k) * (544·2^192 + 32)
+    //   = hi[k] * 544 * 2^(192 + 64*k) + hi[k] * 32 * 2^(64*k)
+    // In limb terms:
+    //   -= hi[k] * 32 into lo[k]
+    //   -= hi[k] * 544 into lo[k+3]
+    for k in 0..4 {
+        lo[k] -= hi[k] * 32;
+        if k + 3 < 5 {
+            lo[k + 3] -= hi[k] * 544;
+        }
+        // hi[3] * 544 would go to lo[6] — out of range. Handle separately.
+    }
+    // hi[3] * 544 * 2^(192+192) = hi[3] * 544 * 2^384
+    // 2^384 = 2^256 * 2^128. Need another fold for this term.
+    // hi[3] * 544 goes into a "super-high" term at limb position 6 (bits 384-447).
+    // Fold again: this_term * 2^384 ≡ -this_term * (544·2^192+32) * 2^128 mod p
+    // which is complex. For products of 252-bit values, hi[3] ≈ 2^59, so
+    // hi[3] * 544 ≈ 2^69 — this goes into lo[4] (overflow limb).
+    // Actually hi[3]*544 is at bit position 3+3=6 in our 5-limb layout.
+    // Since we only have 5 limbs (indices 0-4), this overflows.
+    // Handle by putting it in lo[4] and doing a second fold.
+    // hi[k=1]*544 goes to lo[4]: ✓ (1+3=4)
+    // hi[k=2]*544 goes to lo[5]: overflow! But k+3<5 catches k≤1 only.
+    // Fix: handle k=2 and k=3 overflow terms separately.
+
+    // hi[2]*544 goes to position 5 — we need a second fold.
+    // hi[3]*544 goes to position 6 — also needs folding.
+    let overflow2 = hi[2] * 544; // goes to 2^(64*5) = 2^320
+    let overflow3 = hi[3] * 544; // goes to 2^(64*6) = 2^384
+
+    // 2^320 = 2^256 * 2^64 ≡ -(544·2^192+32) * 2^64 mod p
+    //   = -(544·2^256 + 32·2^64) ≡ -(-544*(544·2^192+32) + 32·2^64) ... getting recursive.
+    // Simpler: just fold overflow into lo[0..4] using the same identity.
+    // 2^320 = 2^64 * 2^256 ≡ -2^64 * (544*2^192 + 32) = -(544*2^256 + 32*2^64)
+    //   ≡ -(-(544)*(544*2^192+32) + 32*2^64) — no, this recurses.
+    //
+    // Clean approach: treat overflow as a 2-limb "hi2" and fold again.
+    // overflow2 * 2^320 + overflow3 * 2^384
+    //   = 2^256 * (overflow2 * 2^64 + overflow3 * 2^128)
+    //   ≡ -(overflow2 * 2^64 + overflow3 * 2^128) * (544*2^192 + 32)  [mod p]
+    //
+    // Even simpler: since overflow2 and overflow3 are small (~2^69),
+    // just do: lo[4] holds the combined overflow, fold lo[4] back into lo[0..3].
+
+    // Re-do the fold properly: handle all k, let overflow go to lo[4]
+    // Reset and redo
+    lo = [full[0] as i128, full[1] as i128, full[2] as i128, full[3] as i128, 0i128];
+
+    for k in 0..4 {
+        lo[k] -= hi[k] * 32;
+        let dst = k + 3;
+        if dst < 5 {
+            lo[dst] -= hi[k] * 544;
+        } else {
+            // dst = 5 (k=2) or 6 (k=3): fold again
+            // These contribute to an even higher overflow.
+            // For k=2: hi[2]*544 * 2^(5*64) = hi[2]*544 * 2^320
+            // For k=3: hi[3]*544 * 2^(6*64) = hi[3]*544 * 2^384
+            // 2^320 mod p: fold 2^256 first. 2^320 = 2^64 * 2^256 ≡ -2^64*(544*2^192+32) mod p
+            //   = -(544*2^256 + 32*2^64) ≡ 544*(544*2^192+32) - 32*2^64 [double negation]
+            // No, 2^320 ≡ -2^64*(544*2^192+32) = -(544*2^(192+64) + 32*2^64) = -(544*2^256 + 32*2^64)
+            //   ≡ -(-(544*2^192+32)*544 + 32*2^64)... this recurses.
+
+            // PRAGMATIC: since these overflow terms are small (< 2^80),
+            // compute them as Fp values and add to result at the end.
+            // For now, approximate: add to lo[4] and fold lo[4] separately.
+            lo[4] -= hi[k] * 544; // approximate, will fold lo[4] below
+        }
+    }
+
+    // Normalize: propagate borrows/carries through lo[0..4]
+    for i in 0..4 {
+        if lo[i] < 0 {
+            let borrow = ((-lo[i]) + ((1 << 64) - 1)) >> 64; // ceil division
+            lo[i] += borrow << 64;
+            lo[i + 1] -= borrow;
+        }
+        if lo[i] >= (1 << 64) {
+            let carry = lo[i] >> 64;
+            lo[i] &= (1i128 << 64) - 1;
+            lo[i + 1] += carry;
+        }
+    }
+
+    // Fold lo[4] (overflow from the first fold) back into lo[0..3]
+    // lo[4] * 2^256 ≡ -lo[4] * (544*2^192 + 32) mod p
+    if lo[4] != 0 {
+        let h = lo[4];
+        lo[0] -= h * 32;
+        lo[3] -= h * 544;
+        lo[4] = 0;
+
+        // Normalize again
+        for i in 0..4 {
+            if lo[i] < 0 {
+                let borrow = ((-lo[i]) + ((1 << 64) - 1)) >> 64;
+                lo[i] += borrow << 64;
+                lo[i + 1] -= borrow;
+            }
+            if lo[i] >= (1 << 64) {
+                let carry = lo[i] >> 64;
+                lo[i] &= (1i128 << 64) - 1;
+                lo[i + 1] += carry;
+            }
+        }
+    }
+
+    // If still negative, add multiples of p
+    while lo[4] < 0 || lo[3] < 0 {
+        lo[0] += PRIME.v[0] as i128;
+        lo[3] += PRIME.v[3] as i128;
+        for i in 0..4 {
+            if lo[i] >= (1i128 << 64) {
+                let carry = lo[i] >> 64;
+                lo[i] &= (1i128 << 64) - 1;
+                lo[i + 1] += carry;
+            }
+        }
+    }
+
+    // lo[4] should now be 0 after folding
+    debug_assert!(lo[4] == 0, "reduce_512: lo[4] = {} after fold", lo[4]);
+
+    let mut result = Fp { v: [lo[0] as u64, lo[1] as u64, lo[2] as u64, lo[3] as u64] };
     result.reduce();
     result
 }
@@ -554,6 +716,103 @@ mod tests {
         let pm1 = Fp { v: [0, 0, 0, 0x0800000000000011] };
         let result = pm1 * pm1;
         assert_eq!(result, Fp::ONE, "(p-1)^2 should be 1");
+    }
+
+    #[test]
+    fn test_fp_mul_two_large() {
+        // (p-1) * (p-2) mod p = (-1)*(-2) = 2
+        let pm1 = Fp { v: [0, 0, 0, 0x0800000000000011] };
+        let pm2 = Fp { v: [0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0x0800000000000010] };
+        let result = pm1 * pm2;
+        assert_eq!(result, Fp::from_u64(2), "(p-1)*(p-2) should be 2");
+    }
+
+    #[test]
+    fn test_fp_pow_64() {
+        let two = Fp::from_u64(2);
+        let exp = Fp::from_u64(64);
+        let result = two.pow_fp(exp);
+        // 2^64 < p, so result should be exactly 2^64
+        assert_eq!(result, Fp { v: [0, 1, 0, 0] }, "2^64 should be 2^64");
+    }
+
+    #[test]
+    fn test_fp_pow_128() {
+        let two = Fp::from_u64(2);
+        let exp = Fp::from_u64(128);
+        let result = two.pow_fp(exp);
+        assert_eq!(result, Fp { v: [0, 0, 1, 0] }, "2^128 should be 2^128");
+    }
+
+    #[test]
+    fn test_fp_pow_192() {
+        let two = Fp::from_u64(2);
+        let exp = Fp::from_u64(192);
+        let result = two.pow_fp(exp);
+        assert_eq!(result, Fp { v: [0, 0, 0, 1] }, "2^192 should be 2^192");
+    }
+
+    #[test]
+    fn test_fp_pow_large_exp() {
+        // 2^256 mod p. Since p ≈ 2^251, this should be a small-ish number.
+        // 2^256 = 32*p - 544*2^192 - 32
+        // So 2^256 mod p = -(544*2^192 + 32) mod p = p - 544*2^192 - 32
+        let two = Fp::from_u64(2);
+        let exp = Fp { v: [0, 0, 0, 0x0000000000000001] }; // 2^192
+        let r = two.pow_fp(exp);
+        // 2^(2^192) — this is a huge number. Just check it's non-zero and deterministic.
+        let r2 = two.pow_fp(exp);
+        assert_eq!(r, r2, "pow should be deterministic");
+        assert!(!r.is_zero(), "2^(2^192) should be non-zero");
+    }
+
+    #[test]
+    fn test_fp_pow_2_to_59() {
+        // 2^(2^59): exponent has only bit 59 set
+        let two = Fp::from_u64(2);
+        let exp = Fp { v: [0, 0, 0, 0x0800000000000000] }; // bit 251 = bit 59 of limb 3
+        let r = two.pow_fp(exp);
+        // Just check deterministic
+        let r2 = two.pow_fp(exp);
+        assert_eq!(r, r2);
+        assert!(!r.is_zero());
+    }
+
+    #[test]
+    fn test_fp_pow_bit_192() {
+        // 2^(2^192): exponent = [0, 0, 0, 1]
+        let two = Fp::from_u64(2);
+        let exp = Fp { v: [0, 0, 0, 1] }; // 2^192
+        let r = two.pow_fp(exp);
+        // Compute expected: 2^(2^192) mod p
+        // Since this is huge, just verify via squaring: r*r should be 2^(2^193)
+        let r2 = two.pow_fp(Fp { v: [0, 0, 0, 2] }); // 2^(2*2^192) = 2^(2^193)
+        assert_eq!(r * r, r2, "2^(2^192) squared should be 2^(2^193)");
+    }
+
+    #[test]
+    fn test_fp_pow_combined_bits() {
+        // Exponent with bits 192 and 251: 2^(2^192 + 2^251)
+        let two = Fp::from_u64(2);
+        let exp_a = Fp { v: [0, 0, 0, 1] }; // 2^192
+        let exp_b = Fp { v: [0, 0, 0, 0x0800000000000000] }; // 2^251
+        let exp_combined = Fp { v: [0, 0, 0, 0x0800000000000001] }; // 2^192 + 2^251
+
+        let r_a = two.pow_fp(exp_a);
+        let r_b = two.pow_fp(exp_b);
+        let r_combined = two.pow_fp(exp_combined);
+
+        // 2^(a+b) = 2^a * 2^b
+        assert_eq!(r_combined, r_a * r_b, "2^(a+b) should equal 2^a * 2^b");
+    }
+
+    #[test]
+    fn test_fermat_little_3() {
+        // 3^(p-1) ≡ 1 mod p
+        let three = Fp::from_u64(3);
+        let pm1 = Fp { v: [0, 0, 0, 0x0800000000000011] };
+        let result = three.pow_fp(pm1);
+        assert_eq!(result, Fp::ONE, "3^(p-1) should be 1 mod p");
     }
 
     #[test]
