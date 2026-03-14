@@ -19,7 +19,7 @@ fn main() {
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  FIBONACCI STARK (1 column, degree-1 constraint)");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    for log_n in [20, 24, 28] {
+    for log_n in [20, 24, 28, 29, 30] {
         let n: u64 = 1 << log_n;
         let t = Instant::now();
         let proof = kraken_stark::prover::prove_lean(M31(1), M31(1), log_n);
