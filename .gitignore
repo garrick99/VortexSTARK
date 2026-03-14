@@ -3,3 +3,5 @@
 *.lib
 *.pdb
 *.exp
+gpu_log_*.csv
+gpu_monitor_output.txt
