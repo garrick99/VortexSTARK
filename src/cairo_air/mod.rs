@@ -16,3 +16,5 @@ pub mod trace;
 pub mod logup;
 pub mod range_check;
 pub mod builtins;
+pub mod pedersen;
+pub mod bitwise;
