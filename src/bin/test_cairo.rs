@@ -107,7 +107,7 @@ fn main() {
 
     ffi::init_memory_pool();
 
-    for log_n in [12, 16, 20, 24] {
+    for log_n in [20, 24, 26, 27] {
         let n: usize = 1 << log_n;
         let eval_size = 2 * n;
         let log_eval_size = log_n + 1;
