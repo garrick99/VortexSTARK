@@ -239,77 +239,66 @@ impl Fp {
 }
 
 /// Reduce a 512-bit product mod p.
-/// Uses: 2^256 ≡ -(544·2^192 + 32) mod p (since p = 2^251 + 17·2^192 + 1).
-/// Iteratively folds high limbs down until the value fits in 4 limbs.
+/// Uses: 2^256 ≡ -(544·2^192 + 32) mod p.
+/// Folds one high limb at a time with full normalization between folds.
 fn reduce_512(full: &[u64; 8]) -> Fp {
-    // Strategy: repeatedly fold bits >= 256 using 2^256 ≡ -(544·2^192 + 32) mod p.
-    // Work in i128 limbs to handle signed intermediates safely.
-    // After each fold, normalize limbs to [0, 2^64) and check convergence.
-    let mut w = [0i128; 8]; // extra headroom
-    for i in 0..8 { w[i] = full[i] as i128; }
+    // Work entirely in unsigned u128 arithmetic.
+    // Step 1: Convert 8×u64 product to 5×u128 by folding limbs 4-7 using
+    //         the unsigned version: val * 2^(64*k) ≡ val * R^(k-4) mod p
+    //         where R = 2^256 mod p.
+    //
+    // Since signed arithmetic is fragile, use a different strategy:
+    // Compute the full 512-bit value as a pair of 256-bit numbers,
+    // then use Fp::mul to multiply the high part by R = 2^256 mod p,
+    // and add to the low part.
+    //
+    // R = 2^256 mod p: since p = 2^251 + 17*2^192 + 1 and 2^256 = 32*p - (544*2^192 + 32),
+    // R = 2^256 - 32*p = -(544*2^192 + 32) mod p = p - 544*2^192 - 32.
+    // p - 544*2^192 - 32:
+    //   limb[0] = 1 - 32 → need to borrow. 1 + 2^64 - 32 = 2^64 - 31, borrow to limb[1]
+    //   limb[1] = 0 - 1 (borrow) → 2^64 - 1, borrow to limb[2]
+    //   limb[2] = 0 - 1 (borrow) → 2^64 - 1, borrow to limb[3]
+    //   limb[3] = 0x0800000000000011 - 544 - 1 (borrow) = 0x0800000000000011 - 0x221 = 0x07FFFFFFFFFFFDF0
+    // Wait: 544 = 0x220, +1 borrow = 0x221. 0x0800000000000011 - 0x221 = 0x07FFFFFFFFFFFFDF0.
+    // Let me compute: 0x0800000000000011 - 0x0000000000000221 = 0x07FFFFFFFFFFFFFF0? No.
+    // 0x11 - 0x21 borrows: 0x11 + 0x100 - 0x21 = 0xF0 with borrow from higher. Hmm, 0x11 = 17, 0x221 = 545.
+    // 0x0800000000000011 - 0x0000000000000221 = 0x07FFFFFFFFFFFDF0.
+    // 0x0800000000000011 = 576460752303423505
+    // 576460752303423505 - 545 = 576460752303422960 = 0x07FFFFFFFFFFFDF0. ✓
 
-    // Iterative fold: for each limb k >= 4, fold w[k] * 2^(64k) down.
-    // w[k] * 2^(64k) = w[k] * 2^(64*(k-4)) * 2^256
-    //                 ≡ -w[k] * 2^(64*(k-4)) * (544*2^192 + 32) mod p
-    // = subtract w[k]*32 from position (k-4) and w[k]*544 from position (k-4+3)=(k-1)
-    // This folds limb k down to limbs k-4 and k-1.
+    let r_mod_p = Fp { v: [
+        0xFFFF_FFFF_FFFF_FFE1u64, // 2^64 - 31
+        0xFFFF_FFFF_FFFF_FFFFu64, // 2^64 - 1
+        0xFFFF_FFFF_FFFF_FFFFu64, // 2^64 - 1
+        0x07FF_FFFF_FFFF_FDF0u64, // see calculation above
+    ]};
 
-    // Two passes should suffice (512 bits → ~266 bits → ~256 bits).
-    for _pass in 0..3 {
-        // Normalize first: propagate carries so each limb is in [0, 2^64)
-        for i in 0..7 {
-            if w[i] >= (1i128 << 64) {
-                w[i + 1] += w[i] >> 64;
-                w[i] &= (1i128 << 64) - 1;
-            } else if w[i] < 0 {
-                let borrow = ((-w[i] - 1) >> 64) + 1; // ceil(-w[i] / 2^64)
-                w[i] += borrow << 64;
-                w[i + 1] -= borrow;
-            }
-        }
+    let lo = Fp { v: [full[0], full[1], full[2], full[3]] };
+    let hi = Fp { v: [full[4], full[5], full[6], full[7]] };
 
-        // Fold limbs 4+ down
-        let mut any_high = false;
-        for k in (4..8).rev() {
-            if w[k] == 0 { continue; }
-            any_high = true;
-            let val = w[k];
-            w[k] = 0;
-            let base = k - 4;
-            w[base] -= val * 32;         // -(val * 32) at position base
-            w[base + 3] -= val * 544;    // -(val * 544) at position base+3
-        }
-        if !any_high { break; }
+    // result = lo + hi * R mod p
+    // But hi might be >= p, so reduce first
+    let mut hi_reduced = hi;
+    hi_reduced.reduce();
+    let mut lo_reduced = lo;
+    lo_reduced.reduce();
+
+    // hi * R: both < p, so product < p^2 < 2^504
+    // This calls reduce_512 recursively! But hi*R has hi part < 2^252,
+    // so the recursive call handles a smaller value.
+    // To avoid infinite recursion, limit: if hi is zero, just return lo.
+    if hi_reduced.is_zero() {
+        let mut result = lo_reduced;
+        result.reduce();
+        return result;
     }
 
-    // Final normalize
-    for i in 0..7 {
-        if w[i] >= (1i128 << 64) {
-            w[i + 1] += w[i] >> 64;
-            w[i] &= (1i128 << 64) - 1;
-        } else if w[i] < 0 {
-            let borrow = ((-w[i] - 1) >> 64) + 1;
-            w[i] += borrow << 64;
-            w[i + 1] -= borrow;
-        }
-    }
-
-    // If negative (w[3] < 0 or w[4] != 0), add p repeatedly
-    for _ in 0..10 {
-        if w[4] <= 0 && w[3] >= 0 { break; }
-        w[0] += PRIME.v[0] as i128;
-        w[3] += PRIME.v[3] as i128;
-        for i in 0..4 {
-            if w[i] >= (1i128 << 64) {
-                w[i + 1] += w[i] >> 64;
-                w[i] &= (1i128 << 64) - 1;
-            }
-        }
-    }
-
-    let mut result = Fp { v: [w[0] as u64, w[1] as u64, w[2] as u64, w[3] as u64] };
-    result.reduce();
-    result
+    // Use the schoolbook mul which calls reduce_512. Since hi < p < 2^252
+    // and R < p < 2^252, the product is < 2^504, and the recursive reduce_512
+    // will have hi part < 2^252 (since 2^504 / 2^256 < 2^248).
+    // Each recursion reduces the size by ~4 bits (252+252-256=248), converging quickly.
+    let hi_times_r = hi_reduced.mul(r_mod_p);
+    lo_reduced.add(hi_times_r)
 }
 
 #[allow(dead_code)]
@@ -702,12 +691,13 @@ mod tests {
 
     #[test]
     fn test_fp_p_minus_2() {
-        // Verify p - 2 is correct
-        let pm2 = PRIME.sub(Fp::from_u64(2));
+        // (p-2) + 2 should reduce to 0 (since p ≡ 0 mod p)
+        let pm2 = Fp { v: [
+            0xFFFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFF,
+            0xFFFF_FFFF_FFFF_FFFF, 0x0800_0000_0000_0010,
+        ]};
         let check = pm2.add(Fp::from_u64(2));
-        assert_eq!(check, PRIME, "p - 2 + 2 should equal p (which reduces to 0)");
-        // p - 2 + 2 reduces to 0 since p ≡ 0 mod p
-        assert_eq!(check, Fp::ZERO, "p should equal 0 in Fp");
+        assert_eq!(check, Fp::ZERO, "(p-2) + 2 should be 0 mod p");
     }
 
     #[test]
