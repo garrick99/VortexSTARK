@@ -312,6 +312,99 @@ pub fn compute_both_twiddles_gpu(
     (d_line_twiddles, d_circle_twids, d_iline_twiddles, d_icircle_twids, layer_offsets, layer_sizes)
 }
 
+/// Compute forward twiddles only, returning DeviceBuffers.
+pub fn compute_forward_twiddles_gpu(
+    coset: &Coset,
+) -> (DeviceBuffer<u32>, DeviceBuffer<u32>, Vec<u32>, Vec<u32>) {
+    let log_n = coset.log_size;
+    let n = coset.size();
+    let n_line_layers = if log_n > 0 { log_n - 1 } else { 0 };
+
+    let mut d_x = DeviceBuffer::<u32>::alloc(n);
+    let mut d_y = DeviceBuffer::<u32>::alloc(n);
+    unsafe {
+        ffi::cuda_compute_coset_points(
+            coset.initial.x.0, coset.initial.y.0,
+            coset.step.x.0, coset.step.y.0,
+            d_x.as_mut_ptr(), d_y.as_mut_ptr(),
+            n as u32,
+        );
+        ffi::cuda_device_sync();
+    }
+
+    let half_n = n / 2;
+    let mut d_circle_twids = DeviceBuffer::<u32>::alloc(half_n);
+    unsafe {
+        ffi::cudaMemcpy(
+            d_circle_twids.as_mut_ptr() as *mut std::ffi::c_void,
+            d_y.as_ptr() as *const std::ffi::c_void,
+            half_n * std::mem::size_of::<u32>(),
+            ffi::MEMCPY_D2D,
+        );
+    }
+    drop(d_y);
+
+    let total_twiddles = n - 1;
+    let mut d_line_twiddles = DeviceBuffer::<u32>::alloc(total_twiddles);
+    let mut layer_offsets = Vec::new();
+    let mut layer_sizes = Vec::new();
+    let mut d_current = d_x;
+    let mut current_n = n;
+    let mut write_offset = 0usize;
+
+    for _layer in 0..n_line_layers as usize {
+        let layer_size = current_n / 2;
+        layer_offsets.push(write_offset as u32);
+        layer_sizes.push(layer_size as u32);
+
+        let mut d_squashed = DeviceBuffer::<u32>::alloc(layer_size);
+        unsafe {
+            ffi::cuda_extract_and_squash(
+                d_current.as_ptr(),
+                d_line_twiddles.as_mut_ptr().add(write_offset),
+                d_squashed.as_mut_ptr(),
+                layer_size as u32,
+            );
+        }
+
+        write_offset += layer_size;
+        d_current = d_squashed;
+        current_n = layer_size;
+    }
+    unsafe { ffi::cuda_device_sync(); }
+
+    (d_line_twiddles, d_circle_twids, layer_offsets, layer_sizes)
+}
+
+/// Compute inverse twiddles only, returning DeviceBuffers.
+/// Internally creates forward twiddles, inverts, and drops the forward ones.
+pub fn compute_inverse_twiddles_gpu(
+    coset: &Coset,
+) -> (DeviceBuffer<u32>, DeviceBuffer<u32>, Vec<u32>, Vec<u32>) {
+    let (d_fwd_line, d_fwd_circle, offsets, sizes) = compute_forward_twiddles_gpu(coset);
+
+    let n = coset.size();
+    let half_n = n / 2;
+    let total_twiddles = n - 1;
+
+    let mut d_iline = DeviceBuffer::<u32>::alloc(total_twiddles);
+    let mut d_icircle = DeviceBuffer::<u32>::alloc(half_n);
+    unsafe {
+        ffi::cuda_batch_inverse_m31(
+            d_fwd_line.as_ptr(), d_iline.as_mut_ptr(), total_twiddles as u32,
+        );
+        ffi::cuda_batch_inverse_m31(
+            d_fwd_circle.as_ptr(), d_icircle.as_mut_ptr(), half_n as u32,
+        );
+        ffi::cuda_device_sync();
+    }
+    // Forward twiddles dropped here
+    drop(d_fwd_line);
+    drop(d_fwd_circle);
+
+    (d_iline, d_icircle, offsets, sizes)
+}
+
 /// Compute both forward and inverse twiddles in one pass (avoids double coset computation).
 pub fn compute_both_twiddles(
     coset: &Coset,

@@ -68,6 +68,12 @@ impl SecureColumn {
     }
 }
 
+/// Compute fold twiddles on GPU on demand (public API for lazy twiddle lifetime).
+/// Returns a DeviceBuffer that the caller can drop after use.
+pub fn compute_fold_twiddles_on_demand(domain: &Coset, extract_y: bool) -> DeviceBuffer<u32> {
+    compute_fold_twiddles_gpu(domain, extract_y)
+}
+
 /// Compute fold twiddles on GPU: domain points → batch inverse, all on device.
 /// `extract_y`: false = x-coordinates (line fold), true = y-coordinates (circle fold).
 fn compute_fold_twiddles_gpu(domain: &Coset, extract_y: bool) -> DeviceBuffer<u32> {

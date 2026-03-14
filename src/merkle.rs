@@ -416,6 +416,140 @@ impl MerkleTree {
         out
     }
 
+    /// Build a CPU-side Merkle tree from 4-column SoA host data and extract auth paths.
+    /// Produces the same hashes as the GPU Merkle tree (commit_soa4).
+    /// This avoids storing the full tree on GPU.
+    pub fn cpu_merkle_auth_paths_soa4(
+        host_cols: &[Vec<u32>; 4],
+        indices: &[usize],
+    ) -> Vec<Vec<[u32; HASH_WORDS]>> {
+        use crate::channel::blake2s_hash;
+
+        let n = host_cols[0].len();
+        assert!(n.is_power_of_two() && n >= 1);
+
+        // Hash leaves: same as GPU kernel — 4 u32 → 16-byte message → Blake2s
+        let leaf_hashes: Vec<[u32; HASH_WORDS]> = (0..n)
+            .map(|i| {
+                let mut input = [0u8; 64];
+                for (c, col) in host_cols.iter().enumerate() {
+                    input[c * 4..c * 4 + 4].copy_from_slice(&col[i].to_le_bytes());
+                }
+                let h = blake2s_hash(&input[..16]);
+                let mut out = [0u32; HASH_WORDS];
+                for j in 0..HASH_WORDS {
+                    out[j] = u32::from_le_bytes([h[j*4], h[j*4+1], h[j*4+2], h[j*4+3]]);
+                }
+                out
+            })
+            .collect();
+
+        // Build all layers bottom-up
+        let mut layers: Vec<Vec<[u32; HASH_WORDS]>> = vec![leaf_hashes];
+        while layers.last().unwrap().len() > 1 {
+            let prev = layers.last().unwrap();
+            let parent_count = prev.len() / 2;
+            let parents: Vec<[u32; HASH_WORDS]> = (0..parent_count)
+                .map(|i| {
+                    let mut input = [0u8; 64];
+                    for (j, &w) in prev[2 * i].iter().enumerate() {
+                        input[j * 4..j * 4 + 4].copy_from_slice(&w.to_le_bytes());
+                    }
+                    for (j, &w) in prev[2 * i + 1].iter().enumerate() {
+                        input[32 + j * 4..32 + j * 4 + 4].copy_from_slice(&w.to_le_bytes());
+                    }
+                    let h = blake2s_hash(&input);
+                    let mut out = [0u32; HASH_WORDS];
+                    for k in 0..HASH_WORDS {
+                        out[k] = u32::from_le_bytes([h[k*4], h[k*4+1], h[k*4+2], h[k*4+3]]);
+                    }
+                    out
+                })
+                .collect();
+            layers.push(parents);
+        }
+
+        // Extract auth paths: layers[0]=leaves, layers[last]=root
+        indices
+            .iter()
+            .map(|&qi| {
+                let mut path = Vec::new();
+                let mut idx = qi;
+                for layer in &layers[..layers.len() - 1] {
+                    let sibling = idx ^ 1;
+                    path.push(layer[sibling]);
+                    idx /= 2;
+                }
+                path
+            })
+            .collect()
+    }
+
+    /// Build a CPU-side Merkle tree from single-column host data and extract auth paths.
+    /// Produces the same hashes as the GPU Merkle tree (commit with 1 column).
+    pub fn cpu_merkle_auth_paths_single(
+        host_col: &[u32],
+        indices: &[usize],
+    ) -> Vec<Vec<[u32; HASH_WORDS]>> {
+        use crate::channel::blake2s_hash;
+
+        let n = host_col.len();
+        assert!(n.is_power_of_two() && n >= 1);
+
+        // Hash leaves: 1 u32 → 4-byte message → Blake2s
+        let leaf_hashes: Vec<[u32; HASH_WORDS]> = host_col
+            .iter()
+            .map(|&v| {
+                let mut input = [0u8; 64];
+                input[0..4].copy_from_slice(&v.to_le_bytes());
+                let h = blake2s_hash(&input[..4]);
+                let mut out = [0u32; HASH_WORDS];
+                for j in 0..HASH_WORDS {
+                    out[j] = u32::from_le_bytes([h[j*4], h[j*4+1], h[j*4+2], h[j*4+3]]);
+                }
+                out
+            })
+            .collect();
+
+        let mut layers: Vec<Vec<[u32; HASH_WORDS]>> = vec![leaf_hashes];
+        while layers.last().unwrap().len() > 1 {
+            let prev = layers.last().unwrap();
+            let parent_count = prev.len() / 2;
+            let parents: Vec<[u32; HASH_WORDS]> = (0..parent_count)
+                .map(|i| {
+                    let mut input = [0u8; 64];
+                    for (j, &w) in prev[2 * i].iter().enumerate() {
+                        input[j * 4..j * 4 + 4].copy_from_slice(&w.to_le_bytes());
+                    }
+                    for (j, &w) in prev[2 * i + 1].iter().enumerate() {
+                        input[32 + j * 4..32 + j * 4 + 4].copy_from_slice(&w.to_le_bytes());
+                    }
+                    let h = blake2s_hash(&input);
+                    let mut out = [0u32; HASH_WORDS];
+                    for k in 0..HASH_WORDS {
+                        out[k] = u32::from_le_bytes([h[k*4], h[k*4+1], h[k*4+2], h[k*4+3]]);
+                    }
+                    out
+                })
+                .collect();
+            layers.push(parents);
+        }
+
+        indices
+            .iter()
+            .map(|&qi| {
+                let mut path = Vec::new();
+                let mut idx = qi;
+                for layer in &layers[..layers.len() - 1] {
+                    let sibling = idx ^ 1;
+                    path.push(layer[sibling]);
+                    idx /= 2;
+                }
+                path
+            })
+            .collect()
+    }
+
     /// Build a full Merkle tree from 4-column SoA data, storing all layers.
     /// Uses the same hashing as commit_root_soa4 but retains the tree.
     pub fn commit_soa4(

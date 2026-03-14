@@ -18,7 +18,7 @@ use crate::device::DeviceBuffer;
 use crate::field::{M31, QM31};
 use crate::fri::{self, SecureColumn};
 use crate::merkle::MerkleTree;
-use crate::ntt::{self, TwiddleCache};
+use crate::ntt::{self, TwiddleCache, ForwardTwiddleCache, InverseTwiddleCache};
 use std::sync::Once;
 use std::time::Instant;
 
@@ -150,6 +150,291 @@ fn prove_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     prove_with_cache(a, b, &cache, timed)
 }
 
+/// Generate a STARK proof with lazy VRAM management.
+/// Uses root-only Merkle commits and computes auth paths on CPU from host data.
+pub fn prove_lean(a: M31, b: M31, log_n: u32) -> StarkProof {
+    prove_lean_inner(a, b, log_n, false)
+}
+
+/// Generate a STARK proof with lazy VRAM management and timing output.
+pub fn prove_lean_timed(a: M31, b: M31, log_n: u32) -> StarkProof {
+    prove_lean_inner(a, b, log_n, true)
+}
+
+fn prove_lean_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
+    ensure_pool_init();
+    assert!(log_n >= 4, "trace too small");
+    let n = 1usize << log_n;
+    let log_eval_size = log_n + BLOWUP_BITS;
+    let eval_size = 1usize << log_eval_size;
+
+    let t_total = Instant::now();
+
+    // Pinned host memory for trace
+    let bytes = n * std::mem::size_of::<u32>();
+    let mut pinned_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let err = unsafe { ffi::cudaMallocHost(&mut pinned_ptr, bytes) };
+    assert!(err == 0, "cudaMallocHost failed: {err}");
+    let pinned_trace = pinned_ptr as *mut u32;
+
+    // --- Step 1: Generate trace ---
+    let t0 = Instant::now();
+    unsafe { air::fibonacci_trace_parallel(a, b, log_n, pinned_trace) };
+    if timed { eprintln!("  trace_gen (cpu): {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0); }
+
+    let t0b = Instant::now();
+    let mut d_trace = unsafe { DeviceBuffer::from_pinned(pinned_trace as *const u32, n) };
+    if timed {
+        unsafe { ffi::cuda_device_sync() };
+        eprintln!("  trace_upload: {:.1}ms", t0b.elapsed().as_secs_f64() * 1000.0);
+    }
+    unsafe { ffi::cudaFreeHost(pinned_ptr) };
+
+    // --- Step 2: Interpolate (needs inverse twiddles only for trace domain) ---
+    let t0 = Instant::now();
+    let trace_domain = Coset::half_coset(log_n);
+    let trace_inv = InverseTwiddleCache::new(&trace_domain);
+    ntt::interpolate(&mut d_trace, &trace_inv);
+    drop(trace_inv); // Free inverse twiddles immediately
+    if timed {
+        unsafe { ffi::cuda_device_sync() };
+        eprintln!("  interpolate: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    // --- Step 3: Zero-pad + evaluate on blowup domain (needs forward twiddles for eval domain) ---
+    let t0 = Instant::now();
+    let mut d_eval = DeviceBuffer::<u32>::alloc(eval_size);
+    unsafe {
+        ffi::cuda_zero_pad(d_trace.as_ptr(), d_eval.as_mut_ptr(), n as u32, eval_size as u32);
+    }
+    drop(d_trace);
+    let eval_domain = Coset::half_coset(log_eval_size);
+    let eval_fwd = ForwardTwiddleCache::new(&eval_domain);
+    ntt::evaluate(&mut d_eval, &eval_fwd);
+    drop(eval_fwd); // Free forward twiddles immediately
+    if timed {
+        unsafe { ffi::cuda_device_sync() };
+        eprintln!("  blowup_eval: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    // --- Step 4: Commit trace (root-only, tiled) ---
+    let t0 = Instant::now();
+    let trace_commitment = MerkleTree::commit_root_only(std::slice::from_ref(&d_eval), log_eval_size);
+    if timed { eprintln!("  trace_commit: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0); }
+
+    // Download trace eval to host for later decommitment
+    let eval_host = d_eval.to_host();
+
+    // --- Step 5: Quotient ---
+    let t0 = Instant::now();
+    let mut channel = Channel::new();
+    channel.mix_digest(&trace_commitment);
+    let alpha = channel.draw_felt();
+    let alpha_arr = alpha.to_u32_array();
+
+    let mut q0 = DeviceBuffer::<u32>::alloc(eval_size);
+    let mut q1 = DeviceBuffer::<u32>::alloc(eval_size);
+    let mut q2 = DeviceBuffer::<u32>::alloc(eval_size);
+    let mut q3 = DeviceBuffer::<u32>::alloc(eval_size);
+    unsafe {
+        ffi::cuda_fibonacci_quotient(
+            d_eval.as_ptr(),
+            q0.as_mut_ptr(), q1.as_mut_ptr(), q2.as_mut_ptr(), q3.as_mut_ptr(),
+            alpha_arr.as_ptr(),
+            eval_size as u32,
+        );
+    }
+    drop(d_eval); // Free eval GPU buffer — we have host copy
+
+    let quotient_col = SecureColumn {
+        cols: [q0, q1, q2, q3],
+        len: eval_size,
+    };
+    if timed {
+        unsafe { ffi::cuda_device_sync() };
+        eprintln!("  quotient_gpu: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    // --- Step 6: Commit quotient (root-only, tiled) ---
+    let t0 = Instant::now();
+    let quotient_commitment = MerkleTree::commit_root_soa4(
+        &quotient_col.cols[0], &quotient_col.cols[1],
+        &quotient_col.cols[2], &quotient_col.cols[3],
+        log_eval_size,
+    );
+    channel.mix_digest(&quotient_commitment);
+    if timed { eprintln!("  quotient_commit: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0); }
+
+    // Download quotient to host for later decommitment
+    let quotient_host: [Vec<u32>; 4] = [
+        quotient_col.cols[0].to_host(),
+        quotient_col.cols[1].to_host(),
+        quotient_col.cols[2].to_host(),
+        quotient_col.cols[3].to_host(),
+    ];
+
+    // --- Step 7: FRI ---
+    let t0 = Instant::now();
+    let mut fri_commitments = Vec::new();
+    let mut fri_trees: Vec<MerkleTree> = Vec::new();
+    let mut fri_evals: Vec<SecureColumn> = Vec::new();
+    let mut current_eval = quotient_col;
+    let mut current_log_size = log_eval_size;
+
+    // Circle fold — compute twiddle on demand
+    let fri_alpha = channel.draw_felt();
+    let mut line_eval = SecureColumn::zeros(current_eval.len / 2);
+    {
+        let circle_domain = Coset::half_coset(current_log_size);
+        let d_twid = fri::compute_fold_twiddles_on_demand(&circle_domain, true);
+        fri::fold_circle_into_line_with_twiddles(
+            &mut line_eval, &current_eval, fri_alpha, &d_twid,
+        );
+        // d_twid dropped here
+    }
+    drop(current_eval);
+    current_log_size -= 1;
+
+    let fri_tree = MerkleTree::commit_soa4(
+        &line_eval.cols[0], &line_eval.cols[1],
+        &line_eval.cols[2], &line_eval.cols[3],
+        current_log_size,
+    );
+    let fri_root = fri_tree.root();
+    fri_commitments.push(fri_root);
+    channel.mix_digest(&fri_root);
+    fri_trees.push(fri_tree);
+    fri_evals.push(line_eval);
+    if timed {
+        unsafe { ffi::cuda_device_sync() };
+        eprintln!("    fri[0] circle fold+commit (log={}): {:.3}ms", current_log_size, t0.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    // Line folds (GPU path for large sizes) — twiddles on demand
+    while current_log_size > FRI_CPU_TAIL_LOG.max(3) {
+        let ti = Instant::now();
+        let fold_alpha = channel.draw_felt();
+        let line_domain = Coset::half_coset(current_log_size);
+        let d_twid = fri::compute_fold_twiddles_on_demand(&line_domain, false);
+        let folded = fri::fold_line_with_twiddles(
+            fri_evals.last().unwrap(), fold_alpha, &d_twid,
+        );
+        // d_twid dropped here
+        current_log_size -= 1;
+
+        let fri_tree = MerkleTree::commit_soa4(
+            &folded.cols[0], &folded.cols[1],
+            &folded.cols[2], &folded.cols[3],
+            current_log_size,
+        );
+        let fri_root = fri_tree.root();
+        fri_commitments.push(fri_root);
+        channel.mix_digest(&fri_root);
+        fri_trees.push(fri_tree);
+        fri_evals.push(folded);
+        if timed {
+            eprintln!("    fri gpu fold+commit (log={}): {:.3}ms", current_log_size, ti.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+
+    // CPU tail
+    let mut cpu_eval = {
+        let last = fri_evals.last().unwrap();
+        last.to_qm31()
+    };
+
+    let mut cpu_fri_trees: Vec<(Vec<QM31>, [u32; 8])> = Vec::new();
+    while current_log_size > 3 {
+        let ti = Instant::now();
+        let fold_alpha = channel.draw_felt();
+        // Compute twiddle on demand, download to host, drop GPU buffer
+        let line_domain = Coset::half_coset(current_log_size);
+        let d_twid = fri::compute_fold_twiddles_on_demand(&line_domain, false);
+        let twid_host = d_twid.to_host();
+        drop(d_twid);
+
+        cpu_eval = fri::fold_line_cpu(
+            &cpu_eval, fold_alpha, &twid_host,
+        );
+        current_log_size -= 1;
+
+        let fri_root = fri::merkle_root_cpu(&cpu_eval);
+        fri_commitments.push(fri_root);
+        channel.mix_digest(&fri_root);
+        cpu_fri_trees.push((cpu_eval.clone(), fri_root));
+        if timed {
+            eprintln!("    fri cpu fold+commit (log={}): {:.3}ms", current_log_size, ti.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+
+    let fri_last_layer = cpu_eval.clone();
+    if timed {
+        eprintln!("  fri_fold+commit: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    // --- Step 8: Query phase ---
+    let t0 = Instant::now();
+
+    channel.mix_felts(&fri_last_layer);
+    let query_indices: Vec<usize> = (0..N_QUERIES)
+        .map(|_| channel.draw_number(eval_size))
+        .collect();
+
+    // Decommit trace — CPU auth paths from host data
+    let trace_decommitment = decommit_trace_cpu(&eval_host, &trace_commitment, &query_indices, log_eval_size);
+
+    // Decommit quotient — CPU auth paths from host data
+    let quotient_decommitment = decommit_soa4_cpu(&quotient_host, &quotient_commitment, &query_indices, log_eval_size);
+
+    // Decommit FRI layers (GPU layers — these still have full trees)
+    let mut fri_decommitments = Vec::new();
+    let mut folded_indices: Vec<usize> = query_indices.iter().map(|&qi| qi / 2).collect();
+    for (tree, eval) in fri_trees.iter().zip(fri_evals.iter()) {
+        let decom = decommit_fri_layer(tree, eval, &folded_indices);
+        fri_decommitments.push(decom);
+        folded_indices = folded_indices.iter().map(|&i| i / 2).collect();
+    }
+    drop(fri_trees);
+    drop(fri_evals);
+
+    // Decommit CPU tail FRI layers
+    for (cpu_vals, _root) in &cpu_fri_trees {
+        let values: Vec<[u32; 4]> = folded_indices
+            .iter()
+            .map(|&i| cpu_vals[i].to_u32_array())
+            .collect();
+        let sibling_indices: Vec<usize> = folded_indices.iter().map(|&i| i ^ 1).collect();
+        let sibling_values: Vec<[u32; 4]> = sibling_indices
+            .iter()
+            .map(|&i| cpu_vals[i].to_u32_array())
+            .collect();
+        let auth_paths = cpu_merkle_auth_paths(cpu_vals, &folded_indices);
+        let sibling_auth_paths = cpu_merkle_auth_paths(cpu_vals, &sibling_indices);
+        fri_decommitments.push(QueryDecommitment {
+            values, sibling_values, auth_paths, sibling_auth_paths,
+        });
+        folded_indices = folded_indices.iter().map(|&i| i / 2).collect();
+    }
+
+    if timed {
+        eprintln!("  query_decommit: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+        eprintln!("  TOTAL: {:.1}ms", t_total.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    StarkProof {
+        trace_commitment,
+        quotient_commitment,
+        fri_commitments,
+        fri_last_layer,
+        log_trace_size: log_n,
+        public_inputs: (a, b),
+        query_indices,
+        trace_decommitment,
+        quotient_decommitment,
+        fri_decommitments,
+    }
+}
+
 /// Extract trace decommitment with sibling values for fold verification.
 fn decommit_trace(
     tree: &MerkleTree,
@@ -162,6 +447,21 @@ fn decommit_trace(
     let sibling_values: Vec<u32> = sibling_indices.iter().map(|&i| eval_host[i]).collect();
     let auth_paths = tree.batch_auth_paths(indices);
     let sibling_auth_paths = tree.batch_auth_paths(&sibling_indices);
+    QueryDecommitment { values, sibling_values, auth_paths, sibling_auth_paths }
+}
+
+/// Extract trace decommitment from host data with CPU-computed auth paths.
+fn decommit_trace_cpu(
+    eval_host: &[u32],
+    _commitment: &[u32; 8],
+    indices: &[usize],
+    _log_eval_size: u32,
+) -> QueryDecommitment<u32> {
+    let values: Vec<u32> = indices.iter().map(|&i| eval_host[i]).collect();
+    let sibling_indices: Vec<usize> = indices.iter().map(|&i| i ^ 1).collect();
+    let sibling_values: Vec<u32> = sibling_indices.iter().map(|&i| eval_host[i]).collect();
+    let auth_paths = MerkleTree::cpu_merkle_auth_paths_single(eval_host, indices);
+    let sibling_auth_paths = MerkleTree::cpu_merkle_auth_paths_single(eval_host, &sibling_indices);
     QueryDecommitment { values, sibling_values, auth_paths, sibling_auth_paths }
 }
 
@@ -182,6 +482,27 @@ fn decommit_soa4_from_host(
         .collect();
     let auth_paths = tree.batch_auth_paths(indices);
     let sibling_auth_paths = tree.batch_auth_paths(&sibling_indices);
+    QueryDecommitment { values, sibling_values, auth_paths, sibling_auth_paths }
+}
+
+/// Extract SoA4 decommitment with CPU-computed auth paths (no GPU tree needed).
+fn decommit_soa4_cpu(
+    host: &[Vec<u32>; 4],
+    _commitment: &[u32; 8],
+    indices: &[usize],
+    _log_eval_size: u32,
+) -> QueryDecommitment<[u32; 4]> {
+    let values: Vec<[u32; 4]> = indices
+        .iter()
+        .map(|&i| [host[0][i], host[1][i], host[2][i], host[3][i]])
+        .collect();
+    let sibling_indices: Vec<usize> = indices.iter().map(|&i| i ^ 1).collect();
+    let sibling_values: Vec<[u32; 4]> = sibling_indices
+        .iter()
+        .map(|&i| [host[0][i], host[1][i], host[2][i], host[3][i]])
+        .collect();
+    let auth_paths = MerkleTree::cpu_merkle_auth_paths_soa4(host, indices);
+    let sibling_auth_paths = MerkleTree::cpu_merkle_auth_paths_soa4(host, &sibling_indices);
     QueryDecommitment { values, sibling_values, auth_paths, sibling_auth_paths }
 }
 
@@ -705,5 +1026,33 @@ mod tests {
         // Each proof should be different (different inputs)
         assert_ne!(proofs[0].trace_commitment, proofs[1].trace_commitment);
         assert_ne!(proofs[1].trace_commitment, proofs[2].trace_commitment);
+    }
+
+    #[test]
+    fn test_prove_lean_runs() {
+        let a = M31(1);
+        let b = M31(1);
+        let proof = prove_lean(a, b, 6);
+
+        assert_ne!(proof.trace_commitment, [0; 8]);
+        assert_ne!(proof.quotient_commitment, [0; 8]);
+        assert!(!proof.fri_commitments.is_empty());
+        assert_eq!(proof.log_trace_size, 6);
+    }
+
+    #[test]
+    fn test_prove_lean_matches_prove() {
+        // prove_lean should produce the same commitments as prove
+        // (same Fiat-Shamir transcript, same math, just different VRAM strategy)
+        let a = M31(1);
+        let b = M31(1);
+        let proof_std = prove(a, b, 6);
+        let proof_lean = prove_lean(a, b, 6);
+
+        assert_eq!(proof_std.trace_commitment, proof_lean.trace_commitment);
+        assert_eq!(proof_std.quotient_commitment, proof_lean.quotient_commitment);
+        assert_eq!(proof_std.fri_commitments, proof_lean.fri_commitments);
+        assert_eq!(proof_std.fri_last_layer, proof_lean.fri_last_layer);
+        assert_eq!(proof_std.query_indices, proof_lean.query_indices);
     }
 }

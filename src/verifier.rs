@@ -374,4 +374,30 @@ mod tests {
             assert!(result.is_ok(), "Failed for a={a}, b={b}: {:?}", result);
         }
     }
+
+    #[test]
+    fn test_verify_lean_proof() {
+        // prove_lean uses root-only commits + CPU auth paths — must pass verifier
+        let proof = prover::prove_lean(M31(1), M31(1), 6);
+        let result = verify(&proof);
+        assert!(result.is_ok(), "Lean proof should verify: {:?}", result);
+    }
+
+    #[test]
+    fn test_verify_lean_multiple_sizes() {
+        for log_n in [4, 5, 6, 8] {
+            let proof = prover::prove_lean(M31(1), M31(1), log_n);
+            let result = verify(&proof);
+            assert!(result.is_ok(), "Lean proof failed at log_n={log_n}: {:?}", result);
+        }
+    }
+
+    #[test]
+    fn test_verify_lean_different_inputs() {
+        for (a, b) in [(1, 1), (2, 3), (42, 99), (1000, 2000)] {
+            let proof = prover::prove_lean(M31(a), M31(b), 6);
+            let result = verify(&proof);
+            assert!(result.is_ok(), "Lean proof failed for a={a}, b={b}: {:?}", result);
+        }
+    }
 }
