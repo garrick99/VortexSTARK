@@ -110,7 +110,7 @@ __device__ __forceinline__ Fp252 fp_neg(Fp252 a) {
 }
 
 // Helper: schoolbook 4x4 multiply into an 8-limb accumulator
-__device__ void schoolbook_4x4(const Fp252& a, const Fp252& b, uint64_t out[8]) {
+__device__ static void schoolbook_4x4(const Fp252& a, const Fp252& b, uint64_t out[8]) {
     for (int i = 0; i < 8; i++) out[i] = 0;
     for (int i = 0; i < 4; i++) {
         uint64_t carry = 0;
@@ -141,7 +141,7 @@ __device__ void schoolbook_4x4(const Fp252& a, const Fp252& b, uint64_t out[8]) 
 
 // Schoolbook 4x4 multiply with 64-bit limbs → 8-limb product.
 // Then reduce via recursive lo + hi * R mod p.
-__device__ Fp252 fp_mul(Fp252 a, Fp252 b) {
+__device__ static Fp252 fp_mul(Fp252 a, Fp252 b) {
     uint64_t full[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 
     // Schoolbook 4x4 multiply. Accumulate products into 8 u64 limbs.
@@ -173,55 +173,44 @@ __device__ Fp252 fp_mul(Fp252 a, Fp252 b) {
     Fp252 R = {{0xFFFFFFFFFFFFFFE1ULL, 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL, 0x07FFFFFFFFFFFDF0ULL}};
     Fp252 p = {{FP_P0, FP_P1, FP_P2, FP_P3}};
 
-    // Iteration 1: fold full[4..7] using R
-    Fp252 lo = {{full[0], full[1], full[2], full[3]}};
-    Fp252 hi = {{full[4], full[5], full[6], full[7]}};
+    // Iterative fold: keep folding hi*R + lo until hi is zero.
+    // Each fold reduces bit-width by ~4 bits. 512 bits → 252 in ~65 iterations max,
+    // but in practice converges in 3-4 iterations.
+    uint64_t f[8] = {full[0], full[1], full[2], full[3], full[4], full[5], full[6], full[7]};
 
-    if (fp_is_zero(hi)) {
-        while (fp_ge(lo, p)) lo = fp_sub(lo, p);
-        return lo;
+    // Just 3 iterations needed with the recursive multiply approach,
+    // but we use iterative to avoid CUDA stack overflow.
+    // Each iteration reduces by ~4 bits. For 252-bit inputs, product < 504 bits,
+    // hi < 248 bits. After fold: hi*R product high < 244 bits. Need ~62 iterations worst case.
+    for (int iter = 0; iter < 70; iter++) {
+        Fp252 lo_i = {{f[0], f[1], f[2], f[3]}};
+        Fp252 hi_i = {{f[4], f[5], f[6], f[7]}};
+
+        if (fp_is_zero(hi_i)) {
+            while (fp_ge(lo_i, p)) lo_i = fp_sub(lo_i, p);
+            return lo_i;
+        }
+
+        // f = lo + hi * R
+        uint64_t hr[8];
+        schoolbook_4x4(hi_i, R, hr);
+
+        // Add lo to hr
+        uint32_t cc = 0;
+        hr[0] = adc64(hr[0], lo_i.v[0], 0, &cc);
+        hr[1] = adc64(hr[1], lo_i.v[1], cc, &cc);
+        hr[2] = adc64(hr[2], lo_i.v[2], cc, &cc);
+        hr[3] = adc64(hr[3], lo_i.v[3], cc, &cc);
+        if (cc) {
+            hr[4] += 1;
+            if (hr[4] == 0) { hr[5] += 1; if (hr[5] == 0) hr[6] += 1; }
+        }
+
+        for (int i = 0; i < 8; i++) f[i] = hr[i];
     }
 
-    // Compute hi * R
-    uint64_t f2[8];
-    schoolbook_4x4(hi, R, f2);
-
-    // Add lo to f2[0..3] with full carry propagation
-    uint32_t cc = 0;
-    f2[0] = adc64(f2[0], lo.v[0], 0, &cc);
-    f2[1] = adc64(f2[1], lo.v[1], cc, &cc);
-    f2[2] = adc64(f2[2], lo.v[2], cc, &cc);
-    f2[3] = adc64(f2[3], lo.v[3], cc, &cc);
-    if (cc) {
-        f2[4] += 1;
-        if (f2[4] == 0) f2[5] += 1; // propagate overflow
-    }
-
-    // Iteration 2: fold f2 again (hi2 is much smaller now, < 2^248)
-    Fp252 lo2 = {{f2[0], f2[1], f2[2], f2[3]}};
-    Fp252 hi2 = {{f2[4], f2[5], f2[6], f2[7]}};
-
-    if (fp_is_zero(hi2)) {
-        while (fp_ge(lo2, p)) lo2 = fp_sub(lo2, p);
-        return lo2;
-    }
-
-    // One more fold
-    uint64_t f3[8];
-    schoolbook_4x4(hi2, R, f3);
-
-    cc = 0;
-    f3[0] = adc64(f3[0], lo2.v[0], 0, &cc);
-    f3[1] = adc64(f3[1], lo2.v[1], cc, &cc);
-    f3[2] = adc64(f3[2], lo2.v[2], cc, &cc);
-    f3[3] = adc64(f3[3], lo2.v[3], cc, &cc);
-    if (cc) {
-        f3[4] += 1;
-        if (f3[4] == 0) f3[5] += 1;
-    }
-
-    // After 3 folds, the high part should be zero
-    Fp252 result = {{f3[0], f3[1], f3[2], f3[3]}};
+    // Should have converged
+    Fp252 result = {{f[0], f[1], f[2], f[3]}};
     while (fp_ge(result, p)) result = fp_sub(result, p);
     return result;
 }
@@ -244,7 +233,7 @@ __device__ __forceinline__ ProjPoint proj_from_affine(Fp252 x, Fp252 y) {
 }
 
 // Jacobian point doubling: ~6M + 4S
-__device__ ProjPoint proj_double(ProjPoint p) {
+__device__ static ProjPoint proj_double(ProjPoint p) {
     if (fp_is_zero(p.z)) return p;
 
     Fp252 xx = fp_mul(p.x, p.x);
@@ -277,7 +266,7 @@ __device__ ProjPoint proj_double(ProjPoint p) {
 }
 
 // Jacobian point addition: ~12M + 4S
-__device__ ProjPoint proj_add(ProjPoint p1, ProjPoint p2) {
+__device__ static ProjPoint proj_add(ProjPoint p1, ProjPoint p2) {
     if (fp_is_zero(p1.z)) return p2;
     if (fp_is_zero(p2.z)) return p1;
 
@@ -310,7 +299,7 @@ __device__ ProjPoint proj_add(ProjPoint p1, ProjPoint p2) {
 }
 
 // Scalar multiplication: double-and-add in projective, single inversion at end
-__device__ ProjPoint proj_scalar_mul(ProjPoint base, Fp252 scalar) {
+__device__ static ProjPoint proj_scalar_mul(ProjPoint base, Fp252 scalar) {
     ProjPoint result = proj_infinity();
     ProjPoint current = base;
 
@@ -329,7 +318,7 @@ __device__ ProjPoint proj_scalar_mul(ProjPoint base, Fp252 scalar) {
 }
 
 // Convert projective to affine x-coordinate (requires one fp_inverse)
-__device__ Fp252 proj_to_affine_x(ProjPoint p) {
+__device__ static Fp252 proj_to_affine_x(ProjPoint p) {
     if (fp_is_zero(p.z)) return fp_zero();
     // For Jacobian: x = X/Z²
     Fp252 zz = fp_mul(p.z, p.z);

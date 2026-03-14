@@ -4,9 +4,9 @@
 
 #include "include/fp252.cuh"
 
-// The 5 Pedersen constant points (P₀..P₄) in __constant__ memory
-__constant__ Fp252 PEDERSEN_PX[5]; // x-coordinates
-__constant__ Fp252 PEDERSEN_PY[5]; // y-coordinates
+// The 5 Pedersen constant points — defined here, extern'd by test
+__constant__ Fp252 PEDERSEN_PX[5];
+__constant__ Fp252 PEDERSEN_PY[5];
 
 // Mask lowest n_bits of a field element
 __device__ Fp252 fp_mask(Fp252 val, int n_bits) {
@@ -39,8 +39,9 @@ __device__ Fp252 fp_shr(Fp252 val, int n_bits) {
     return r;
 }
 
-// Compute Pedersen hash: H(a,b) = [P₀ + a_low·P₁ + a_high·P₂ + b_low·P₃ + b_high·P₄]_x
-__device__ Fp252 pedersen_hash_device(Fp252 a, Fp252 b) {
+// Compute Pedersen hash in projective coordinates.
+// Returns the projective point (X, Y, Z) — caller converts to affine.
+__device__ ProjPoint pedersen_hash_proj(Fp252 a, Fp252 b) {
     // Decompose inputs
     Fp252 a_low  = fp_mask(a, 248);
     Fp252 a_high = fp_shr(a, 248);
@@ -66,15 +67,16 @@ __device__ Fp252 pedersen_hash_device(Fp252 a, Fp252 b) {
     ProjPoint p4 = proj_from_affine(PEDERSEN_PX[4], PEDERSEN_PY[4]);
     result = proj_add(result, proj_scalar_mul(p4, b_high));
 
-    // Convert to affine x-coordinate
-    return proj_to_affine_x(result);
+    return result;
 }
 
-// Each thread computes one Pedersen hash
+// Each thread computes one Pedersen hash in projective coordinates.
+// Outputs X and Z²; caller computes x = X * inv(Z²) on CPU via batch inverse.
 __global__ void pedersen_batch_kernel(
-    const uint64_t* __restrict__ inputs_a,  // [n * 4] — n Fp252 values for 'a'
-    const uint64_t* __restrict__ inputs_b,  // [n * 4] — n Fp252 values for 'b'
-    uint64_t* __restrict__ outputs,         // [n * 4] — n Fp252 hash results
+    const uint64_t* __restrict__ inputs_a,
+    const uint64_t* __restrict__ inputs_b,
+    uint64_t* __restrict__ out_x,   // [n * 4] — projective X
+    uint64_t* __restrict__ out_zz,  // [n * 4] — Z² for batch inverse
     uint32_t n
 ) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -86,10 +88,14 @@ __global__ void pedersen_batch_kernel(
     b.v[0] = inputs_b[i*4+0]; b.v[1] = inputs_b[i*4+1];
     b.v[2] = inputs_b[i*4+2]; b.v[3] = inputs_b[i*4+3];
 
-    Fp252 hash = pedersen_hash_device(a, b);
+    ProjPoint result = pedersen_hash_proj(a, b);
 
-    outputs[i*4+0] = hash.v[0]; outputs[i*4+1] = hash.v[1];
-    outputs[i*4+2] = hash.v[2]; outputs[i*4+3] = hash.v[3];
+    // Output X and Z²
+    Fp252 zz = fp_mul(result.z, result.z);
+    out_x[i*4+0] = result.x.v[0]; out_x[i*4+1] = result.x.v[1];
+    out_x[i*4+2] = result.x.v[2]; out_x[i*4+3] = result.x.v[3];
+    out_zz[i*4+0] = zz.v[0]; out_zz[i*4+1] = zz.v[1];
+    out_zz[i*4+2] = zz.v[2]; out_zz[i*4+3] = zz.v[3];
 }
 
 extern "C" {
@@ -102,17 +108,18 @@ void cuda_pedersen_upload_points(const uint64_t* px, const uint64_t* py) {
     cudaMemcpyToSymbol(PEDERSEN_PY, py, 5 * 4 * sizeof(uint64_t));
 }
 
-// Batch Pedersen hash on GPU
+// Batch Pedersen hash on GPU — outputs projective (X, Z²) for CPU batch inverse
 void cuda_pedersen_hash_batch(
     const uint64_t* inputs_a,
     const uint64_t* inputs_b,
-    uint64_t* outputs,
+    uint64_t* out_x,
+    uint64_t* out_zz,
     uint32_t n
 ) {
-    // Use fewer threads per block — each thread does heavy EC work
+    cudaDeviceSetLimit(cudaLimitStackSize, 65536);
     uint32_t threads = 64;
     uint32_t blocks = (n + threads - 1) / threads;
-    pedersen_batch_kernel<<<blocks, threads>>>(inputs_a, inputs_b, outputs, n);
+    pedersen_batch_kernel<<<blocks, threads>>>(inputs_a, inputs_b, out_x, out_zz, n);
 }
 
 } // extern "C"

@@ -257,35 +257,75 @@ pub fn gpu_init() {
 }
 
 /// Batch Pedersen hash on GPU. Returns output Fp values.
+/// GPU computes in projective coordinates; CPU does batch inverse to get affine x.
 pub fn gpu_hash_batch(
     inputs_a: &[super::stark252_field::Fp],
     inputs_b: &[super::stark252_field::Fp],
 ) -> Vec<super::stark252_field::Fp> {
     use crate::cuda::ffi;
     use crate::device::DeviceBuffer;
+    use super::stark252_field::Fp;
 
     let n = inputs_a.len();
     assert_eq!(n, inputs_b.len());
 
-    // Flatten Fp values to u64 arrays
     let flat_a: Vec<u64> = inputs_a.iter().flat_map(|fp| fp.v.iter().copied()).collect();
     let flat_b: Vec<u64> = inputs_b.iter().flat_map(|fp| fp.v.iter().copied()).collect();
 
     let d_a = DeviceBuffer::from_host(&flat_a);
     let d_b = DeviceBuffer::from_host(&flat_b);
-    let mut d_out = DeviceBuffer::<u64>::alloc(n * 4);
+    let mut d_out_x = DeviceBuffer::<u64>::alloc(n * 4);
+    let mut d_out_zz = DeviceBuffer::<u64>::alloc(n * 4);
 
     unsafe {
         ffi::cuda_pedersen_hash_batch(
-            d_a.as_ptr(), d_b.as_ptr(), d_out.as_mut_ptr(), n as u32,
+            d_a.as_ptr(), d_b.as_ptr(),
+            d_out_x.as_mut_ptr(), d_out_zz.as_mut_ptr(),
+            n as u32,
         );
         ffi::cuda_device_sync();
     }
 
-    let flat_out = d_out.to_host();
-    (0..n).map(|i| super::stark252_field::Fp {
-        v: [flat_out[i*4], flat_out[i*4+1], flat_out[i*4+2], flat_out[i*4+3]]
-    }).collect()
+    let flat_x = d_out_x.to_host();
+    let flat_zz = d_out_zz.to_host();
+
+    // CPU batch inverse: compute inv(Z²) for all hashes, then x = X * inv(Z²)
+    let proj_x: Vec<Fp> = (0..n).map(|i| Fp { v: [flat_x[i*4], flat_x[i*4+1], flat_x[i*4+2], flat_x[i*4+3]] }).collect();
+    let zz: Vec<Fp> = (0..n).map(|i| Fp { v: [flat_zz[i*4], flat_zz[i*4+1], flat_zz[i*4+2], flat_zz[i*4+3]] }).collect();
+
+    // Montgomery batch inverse: O(n) muls + 1 inverse
+    let zz_inv = batch_inverse_fp(&zz);
+
+    // affine_x[i] = proj_x[i] * zz_inv[i]
+    (0..n).map(|i| proj_x[i] * zz_inv[i]).collect()
+}
+
+/// Batch inverse for Fp values using Montgomery's trick.
+fn batch_inverse_fp(values: &[super::stark252_field::Fp]) -> Vec<super::stark252_field::Fp> {
+    use super::stark252_field::Fp;
+
+    let n = values.len();
+    if n == 0 { return vec![]; }
+
+    // Prefix products
+    let mut prefix = Vec::with_capacity(n);
+    prefix.push(values[0]);
+    for i in 1..n {
+        prefix.push(prefix[i-1] * values[i]);
+    }
+
+    // Invert the total product
+    let mut inv = prefix[n-1].inverse();
+
+    // Unwind
+    let mut result = vec![Fp::ZERO; n];
+    for i in (1..n).rev() {
+        result[i] = inv * prefix[i-1]; // inv(values[i]) = inv * prefix[i-1]
+        inv = inv * values[i];         // update inv for next
+    }
+    result[0] = inv;
+
+    result
 }
 
 pub const PEDERSEN_BUILTIN_BASE: u64 = 0x5000_0000;
