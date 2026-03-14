@@ -436,11 +436,11 @@ fn prove_lean_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
         .map(|_| channel.draw_number(eval_size))
         .collect();
 
-    // Decommit trace — targeted CPU auth paths using GPU subtree roots
-    let trace_decommitment = decommit_trace_cpu(&eval_host, &trace_subtree_roots, &query_indices);
+    // Decommit trace — GPU per-tile Merkle trees + CPU upper tree
+    let trace_decommitment = decommit_trace_gpu(&eval_host, &trace_subtree_roots, &query_indices);
 
-    // Decommit quotient — targeted CPU auth paths using GPU subtree roots
-    let quotient_decommitment = decommit_soa4_cpu(&quotient_host, &quotient_subtree_roots, &query_indices);
+    // Decommit quotient — GPU per-tile Merkle trees + CPU upper tree
+    let quotient_decommitment = decommit_soa4_gpu(&quotient_host, &quotient_subtree_roots, &query_indices);
 
     // Decommit FRI layers
     let mut fri_decommitments = Vec::new();
@@ -452,7 +452,7 @@ fn prove_lean_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
                 fri_decommitments.push(decom);
             }
             FriLayerData::HostData(host, subtrees) => {
-                let decom = decommit_soa4_cpu(host, subtrees, &folded_indices);
+                let decom = decommit_soa4_gpu(host, subtrees, &folded_indices);
                 fri_decommitments.push(decom);
             }
         }
@@ -513,10 +513,10 @@ fn decommit_trace(
     QueryDecommitment { values, sibling_values, auth_paths, sibling_auth_paths }
 }
 
-/// Extract trace decommitment from host data with targeted CPU auth paths.
-/// Uses pre-computed subtree roots from the GPU tiled commit for large trees,
-/// falls back to full CPU tree for small ones.
-fn decommit_trace_cpu(
+/// Extract trace decommitment using GPU-accelerated per-tile Merkle trees.
+/// Uploads only the ~200 queried tiles to GPU, hashes on GPU, downloads auth paths.
+/// Zero CPU blake2s for large trees.
+fn decommit_trace_gpu(
     eval_host: &[u32],
     subtree_roots: &[[u32; 8]],
     indices: &[usize],
@@ -525,20 +525,23 @@ fn decommit_trace_cpu(
     let sibling_indices: Vec<usize> = indices.iter().map(|&i| i ^ 1).collect();
     let sibling_values: Vec<u32> = sibling_indices.iter().map(|&i| eval_host[i]).collect();
 
-    let hash_leaf = |i: usize| -> [u32; 8] { MerkleTree::hash_leaf(&[eval_host[i]]) };
     let n = eval_host.len();
-    let (auth_paths, sibling_auth_paths) = if n >= 4096 {
-        (
-            MerkleTree::targeted_auth_paths_with_tile_roots(subtree_roots, n, indices, &hash_leaf),
-            MerkleTree::targeted_auth_paths_with_tile_roots(subtree_roots, n, &sibling_indices, &hash_leaf),
-        )
-    } else {
-        (
-            MerkleTree::cpu_merkle_auth_paths_single(eval_host, indices),
-            MerkleTree::cpu_merkle_auth_paths_single(eval_host, &sibling_indices),
-        )
-    };
-    QueryDecommitment { values, sibling_values, auth_paths, sibling_auth_paths }
+    if n < 4096 {
+        let auth_paths = MerkleTree::cpu_merkle_auth_paths_single(eval_host, indices);
+        let sibling_auth_paths = MerkleTree::cpu_merkle_auth_paths_single(eval_host, &sibling_indices);
+        return QueryDecommitment { values, sibling_values, auth_paths, sibling_auth_paths };
+    }
+
+    // GPU path: upload only queried tiles, hash on GPU
+    let all_indices: Vec<usize> = indices.iter().chain(sibling_indices.iter()).copied().collect();
+    let tile_paths = gpu_tile_auth_paths_single(eval_host, subtree_roots, &all_indices);
+    let (auth_paths, sibling_auth_paths) = tile_paths.split_at(indices.len());
+
+    QueryDecommitment {
+        values, sibling_values,
+        auth_paths: auth_paths.to_vec(),
+        sibling_auth_paths: sibling_auth_paths.to_vec(),
+    }
 }
 
 /// Extract SoA4 decommitment with siblings from host-side column data.
@@ -561,8 +564,8 @@ fn decommit_soa4_from_host(
     QueryDecommitment { values, sibling_values, auth_paths, sibling_auth_paths }
 }
 
-/// Extract SoA4 decommitment with targeted CPU auth paths using pre-computed subtree roots.
-fn decommit_soa4_cpu(
+/// Extract SoA4 decommitment using GPU-accelerated per-tile Merkle trees.
+fn decommit_soa4_gpu(
     host: &[Vec<u32>; 4],
     subtree_roots: &[[u32; 8]],
     indices: &[usize],
@@ -576,22 +579,23 @@ fn decommit_soa4_cpu(
         .iter()
         .map(|&i| [host[0][i], host[1][i], host[2][i], host[3][i]])
         .collect();
+
     let n = host[0].len();
-    let hash_leaf = |i: usize| -> [u32; 8] {
-        MerkleTree::hash_leaf(&[host[0][i], host[1][i], host[2][i], host[3][i]])
-    };
-    let (auth_paths, sibling_auth_paths) = if n >= 4096 {
-        (
-            MerkleTree::targeted_auth_paths_with_tile_roots(subtree_roots, n, indices, &hash_leaf),
-            MerkleTree::targeted_auth_paths_with_tile_roots(subtree_roots, n, &sibling_indices, &hash_leaf),
-        )
-    } else {
-        (
-            MerkleTree::cpu_merkle_auth_paths_soa4(host, indices),
-            MerkleTree::cpu_merkle_auth_paths_soa4(host, &sibling_indices),
-        )
-    };
-    QueryDecommitment { values, sibling_values, auth_paths, sibling_auth_paths }
+    if n < 4096 {
+        let auth_paths = MerkleTree::cpu_merkle_auth_paths_soa4(host, indices);
+        let sibling_auth_paths = MerkleTree::cpu_merkle_auth_paths_soa4(host, &sibling_indices);
+        return QueryDecommitment { values, sibling_values, auth_paths, sibling_auth_paths };
+    }
+
+    let all_indices: Vec<usize> = indices.iter().chain(sibling_indices.iter()).copied().collect();
+    let tile_paths = gpu_tile_auth_paths_soa4(host, subtree_roots, &all_indices);
+    let (auth_paths, sibling_auth_paths) = tile_paths.split_at(indices.len());
+
+    QueryDecommitment {
+        values, sibling_values,
+        auth_paths: auth_paths.to_vec(),
+        sibling_auth_paths: sibling_auth_paths.to_vec(),
+    }
 }
 
 /// Extract FRI layer decommitment with siblings.
@@ -865,6 +869,115 @@ fn prove_with_cache(a: M31, b: M31, cache: &ProverCache, timed: bool) -> StarkPr
         quotient_decommitment,
         fri_decommitments,
     }
+}
+
+/// GPU-accelerated auth path extraction for single-column data.
+/// Uploads only the ~200 queried tiles (1024 leaves each) to GPU,
+/// builds per-tile Merkle trees on GPU, and extracts auth paths.
+/// Upper tree (subtree roots → final root) built on CPU (small).
+fn gpu_tile_auth_paths_single(
+    host_col: &[u32],
+    subtree_roots: &[[u32; 8]],
+    indices: &[usize],
+) -> Vec<Vec<[u32; 8]>> {
+    use std::collections::{BTreeSet, HashMap};
+
+    const TILE_SIZE: usize = 1024;
+    let n = host_col.len();
+    let n_tiles = n / TILE_SIZE;
+
+    // Collect unique tiles needed
+    let needed_tiles: BTreeSet<usize> = indices.iter().map(|&qi| qi / TILE_SIZE).collect();
+
+    // Build per-tile GPU Merkle trees (only for queried tiles)
+    let mut tile_trees: HashMap<usize, MerkleTree> = HashMap::new();
+    for &tile_idx in &needed_tiles {
+        let base = tile_idx * TILE_SIZE;
+        let tile_data: Vec<u32> = host_col[base..base + TILE_SIZE].to_vec();
+        let d_tile = DeviceBuffer::from_host(&tile_data);
+        let log_tile = 10; // log2(1024)
+        let tree = MerkleTree::commit(std::slice::from_ref(&d_tile), log_tile);
+        tile_trees.insert(tile_idx, tree);
+    }
+
+    // Build upper tree on CPU from ALL subtree roots
+    let upper_layers = MerkleTree::build_cpu_tree_layers(subtree_roots.to_vec());
+
+    // Extract auth paths: intra-tile (GPU) + upper tree (CPU)
+    indices
+        .iter()
+        .map(|&qi| {
+            let tile_idx = qi / TILE_SIZE;
+            let intra_idx = qi % TILE_SIZE;
+            let mut path = Vec::new();
+
+            // Intra-tile path from GPU tree
+            let tree = &tile_trees[&tile_idx];
+            let intra_path = tree.auth_path(intra_idx);
+            path.extend_from_slice(&intra_path);
+
+            // Upper tree path from CPU
+            let mut idx = tile_idx;
+            for layer in &upper_layers[..upper_layers.len() - 1] {
+                path.push(layer[idx ^ 1]);
+                idx /= 2;
+            }
+
+            path
+        })
+        .collect()
+}
+
+/// GPU-accelerated auth path extraction for SoA4 (QM31) data.
+fn gpu_tile_auth_paths_soa4(
+    host_cols: &[Vec<u32>; 4],
+    subtree_roots: &[[u32; 8]],
+    indices: &[usize],
+) -> Vec<Vec<[u32; 8]>> {
+    use std::collections::{BTreeSet, HashMap};
+
+    const TILE_SIZE: usize = 1024;
+    let n = host_cols[0].len();
+
+    // Collect unique tiles needed
+    let needed_tiles: BTreeSet<usize> = indices.iter().map(|&qi| qi / TILE_SIZE).collect();
+
+    // Build per-tile GPU Merkle trees
+    let mut tile_trees: HashMap<usize, MerkleTree> = HashMap::new();
+    for &tile_idx in &needed_tiles {
+        let base = tile_idx * TILE_SIZE;
+        let c0 = DeviceBuffer::from_host(&host_cols[0][base..base + TILE_SIZE]);
+        let c1 = DeviceBuffer::from_host(&host_cols[1][base..base + TILE_SIZE]);
+        let c2 = DeviceBuffer::from_host(&host_cols[2][base..base + TILE_SIZE]);
+        let c3 = DeviceBuffer::from_host(&host_cols[3][base..base + TILE_SIZE]);
+        let tree = MerkleTree::commit_soa4(&c0, &c1, &c2, &c3, 10);
+        tile_trees.insert(tile_idx, tree);
+    }
+
+    // Build upper tree on CPU from ALL subtree roots
+    let upper_layers = MerkleTree::build_cpu_tree_layers(subtree_roots.to_vec());
+
+    // Extract auth paths
+    indices
+        .iter()
+        .map(|&qi| {
+            let tile_idx = qi / TILE_SIZE;
+            let intra_idx = qi % TILE_SIZE;
+            let mut path = Vec::new();
+
+            let tree = &tile_trees[&tile_idx];
+            let intra_path = tree.auth_path(intra_idx);
+            path.extend_from_slice(&intra_path);
+
+            let mut idx = tile_idx;
+            for layer in &upper_layers[..upper_layers.len() - 1] {
+                path.push(layer[idx ^ 1]);
+                idx /= 2;
+            }
+
+            path
+        })
+        .collect()
 }
 
 /// Build CPU Merkle tree from QM31 values and extract auth paths at given indices.

@@ -728,7 +728,7 @@ impl MerkleTree {
     }
 
     /// Build CPU Merkle tree layers from leaf hashes. Returns [leaves, parents, ..., root].
-    fn build_cpu_tree_layers(leaf_hashes: Vec<[u32; HASH_WORDS]>) -> Vec<Vec<[u32; HASH_WORDS]>> {
+    pub fn build_cpu_tree_layers(leaf_hashes: Vec<[u32; HASH_WORDS]>) -> Vec<Vec<[u32; HASH_WORDS]>> {
         use crate::channel::blake2s_hash;
         let mut layers = vec![leaf_hashes];
         while layers.last().unwrap().len() > 1 {
