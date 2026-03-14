@@ -871,6 +871,52 @@ fn prove_with_cache(a: M31, b: M31, cache: &ProverCache, timed: bool) -> StarkPr
     }
 }
 
+/// Build Merkle tree from pre-hashed nodes entirely on GPU using hash_nodes kernel.
+/// Returns layers as host vectors [leaves(=subtree_roots), parents, ..., root].
+/// Uses GPU for the heavy hashing, downloads all layers for path extraction.
+fn gpu_build_upper_tree(subtree_roots: &[[u32; 8]]) -> Vec<Vec<[u32; 8]>> {
+    use crate::merkle::HASH_WORDS;
+
+    let n = subtree_roots.len();
+    if n <= 1 {
+        return vec![subtree_roots.to_vec()];
+    }
+
+    // Upload subtree roots as flat u32 buffer
+    let flat: Vec<u32> = subtree_roots.iter().flat_map(|h| h.iter().copied()).collect();
+    let d_current = DeviceBuffer::from_host(&flat);
+
+    // Download leaf layer
+    let mut layers: Vec<Vec<[u32; HASH_WORDS]>> = vec![subtree_roots.to_vec()];
+    let mut current = d_current;
+    let mut current_size = n as u32;
+
+    // Reduce using GPU hash_nodes
+    while current_size > 1 {
+        let parent_size = current_size / 2;
+        let mut parents = DeviceBuffer::<u32>::alloc((parent_size as usize) * HASH_WORDS);
+        unsafe {
+            ffi::cuda_merkle_hash_nodes(current.as_ptr(), parents.as_mut_ptr(), parent_size);
+        }
+
+        // Download this layer for path extraction
+        let host = parents.to_host();
+        let layer: Vec<[u32; HASH_WORDS]> = (0..parent_size as usize)
+            .map(|i| {
+                let mut h = [0u32; HASH_WORDS];
+                h.copy_from_slice(&host[i * HASH_WORDS..(i + 1) * HASH_WORDS]);
+                h
+            })
+            .collect();
+        layers.push(layer);
+
+        current = parents;
+        current_size = parent_size;
+    }
+
+    layers
+}
+
 /// GPU-accelerated auth path extraction for single-column data.
 /// Uploads only the ~200 queried tiles (1024 leaves each) to GPU,
 /// builds per-tile Merkle trees on GPU, and extracts auth paths.
@@ -900,8 +946,8 @@ fn gpu_tile_auth_paths_single(
         tile_trees.insert(tile_idx, tree);
     }
 
-    // Build upper tree on CPU from ALL subtree roots
-    let upper_layers = MerkleTree::build_cpu_tree_layers(subtree_roots.to_vec());
+    // Build upper tree on GPU using hash_nodes (subtree roots are already hashes)
+    let upper_layers = gpu_build_upper_tree(subtree_roots);
 
     // Extract auth paths: intra-tile (GPU) + upper tree (CPU)
     indices
@@ -916,7 +962,7 @@ fn gpu_tile_auth_paths_single(
             let intra_path = tree.auth_path(intra_idx);
             path.extend_from_slice(&intra_path);
 
-            // Upper tree path from CPU
+            // Upper tree path
             let mut idx = tile_idx;
             for layer in &upper_layers[..upper_layers.len() - 1] {
                 path.push(layer[idx ^ 1]);
@@ -937,7 +983,6 @@ fn gpu_tile_auth_paths_soa4(
     use std::collections::{BTreeSet, HashMap};
 
     const TILE_SIZE: usize = 1024;
-    let n = host_cols[0].len();
 
     // Collect unique tiles needed
     let needed_tiles: BTreeSet<usize> = indices.iter().map(|&qi| qi / TILE_SIZE).collect();
@@ -954,8 +999,8 @@ fn gpu_tile_auth_paths_soa4(
         tile_trees.insert(tile_idx, tree);
     }
 
-    // Build upper tree on CPU from ALL subtree roots
-    let upper_layers = MerkleTree::build_cpu_tree_layers(subtree_roots.to_vec());
+    // Upper tree from subtree roots on GPU
+    let upper_layers = gpu_build_upper_tree(subtree_roots);
 
     // Extract auth paths
     indices
