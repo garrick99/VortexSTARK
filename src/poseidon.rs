@@ -53,6 +53,11 @@ pub fn round_constants_flat() -> Vec<u32> {
 
 /// Apply MDS matrix to state (circulant multiplication).
 #[inline]
+pub fn mds_apply(state: &[M31; STATE_WIDTH]) -> [M31; STATE_WIDTH] {
+    mds(state)
+}
+
+#[inline]
 fn mds(state: &[M31; STATE_WIDTH]) -> [M31; STATE_WIDTH] {
     let mut out = [M31::ZERO; STATE_WIDTH];
     for i in 0..STATE_WIDTH {
