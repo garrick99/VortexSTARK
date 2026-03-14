@@ -281,6 +281,10 @@ fn prove_lean_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     let mut current_eval = quotient_col;
     let mut current_log_size = log_eval_size;
 
+    // FRI layers above this threshold use root-only commit + CPU decommitment.
+    // Below it, full GPU trees are cheap enough to keep.
+    const FRI_LEAN_THRESHOLD_LOG: u32 = 18;
+
     // Circle fold — compute twiddle on demand
     let fri_alpha = channel.draw_felt();
     let mut line_eval = SecureColumn::zeros(current_eval.len / 2);
@@ -290,25 +294,47 @@ fn prove_lean_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
         fri::fold_circle_into_line_with_twiddles(
             &mut line_eval, &current_eval, fri_alpha, &d_twid,
         );
-        // d_twid dropped here
     }
     drop(current_eval);
     current_log_size -= 1;
 
-    let fri_tree = MerkleTree::commit_soa4(
-        &line_eval.cols[0], &line_eval.cols[1],
-        &line_eval.cols[2], &line_eval.cols[3],
-        current_log_size,
-    );
-    let fri_root = fri_tree.root();
-    fri_commitments.push(fri_root);
-    channel.mix_digest(&fri_root);
-    fri_trees.push(fri_tree);
-    fri_evals.push(line_eval);
+    // Track FRI data: either a full GPU tree or host data for CPU decommitment
+    enum FriLayerData {
+        GpuTree(MerkleTree, SecureColumn),
+        HostData([Vec<u32>; 4]),
+    }
+    let mut fri_layer_data: Vec<FriLayerData> = Vec::new();
+
+    // Commit first FRI layer
+    if current_log_size >= FRI_LEAN_THRESHOLD_LOG {
+        let fri_root = MerkleTree::commit_root_soa4(
+            &line_eval.cols[0], &line_eval.cols[1],
+            &line_eval.cols[2], &line_eval.cols[3], current_log_size,
+        );
+        fri_commitments.push(fri_root);
+        channel.mix_digest(&fri_root);
+        let host_data = [
+            line_eval.cols[0].to_host(), line_eval.cols[1].to_host(),
+            line_eval.cols[2].to_host(), line_eval.cols[3].to_host(),
+        ];
+        fri_layer_data.push(FriLayerData::HostData(host_data));
+    } else {
+        let fri_tree = MerkleTree::commit_soa4(
+            &line_eval.cols[0], &line_eval.cols[1],
+            &line_eval.cols[2], &line_eval.cols[3], current_log_size,
+        );
+        fri_commitments.push(fri_tree.root());
+        channel.mix_digest(&fri_tree.root());
+        fri_layer_data.push(FriLayerData::GpuTree(fri_tree, line_eval));
+    }
     if timed {
         unsafe { ffi::cuda_device_sync() };
         eprintln!("    fri[0] circle fold+commit (log={}): {:.3}ms", current_log_size, t0.elapsed().as_secs_f64() * 1000.0);
     }
+
+    // We need to keep the last GPU eval alive for folding into the next layer.
+    // For lean layers (host data), re-upload from host for the fold.
+    // For GPU layers, fold directly from the stored SecureColumn.
 
     // Line folds (GPU path for large sizes) — twiddles on demand
     while current_log_size > FRI_CPU_TAIL_LOG.max(3) {
@@ -316,46 +342,75 @@ fn prove_lean_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
         let fold_alpha = channel.draw_felt();
         let line_domain = Coset::half_coset(current_log_size);
         let d_twid = fri::compute_fold_twiddles_on_demand(&line_domain, false);
-        let folded = fri::fold_line_with_twiddles(
-            fri_evals.last().unwrap(), fold_alpha, &d_twid,
-        );
-        // d_twid dropped here
+
+        // Get the source evaluation for folding
+        let folded = match fri_layer_data.last().unwrap() {
+            FriLayerData::GpuTree(_, eval) => {
+                fri::fold_line_with_twiddles(eval, fold_alpha, &d_twid)
+            }
+            FriLayerData::HostData(host) => {
+                // Re-upload from host for folding (temporary, dropped after fold)
+                let src = SecureColumn {
+                    cols: [
+                        DeviceBuffer::from_host(&host[0]),
+                        DeviceBuffer::from_host(&host[1]),
+                        DeviceBuffer::from_host(&host[2]),
+                        DeviceBuffer::from_host(&host[3]),
+                    ],
+                    len: host[0].len(),
+                };
+                let result = fri::fold_line_with_twiddles(&src, fold_alpha, &d_twid);
+                drop(src); // free re-uploaded data immediately
+                result
+            }
+        };
         current_log_size -= 1;
 
-        let fri_tree = MerkleTree::commit_soa4(
-            &folded.cols[0], &folded.cols[1],
-            &folded.cols[2], &folded.cols[3],
-            current_log_size,
-        );
-        let fri_root = fri_tree.root();
-        fri_commitments.push(fri_root);
-        channel.mix_digest(&fri_root);
-        fri_trees.push(fri_tree);
-        fri_evals.push(folded);
+        if current_log_size >= FRI_LEAN_THRESHOLD_LOG {
+            let fri_root = MerkleTree::commit_root_soa4(
+                &folded.cols[0], &folded.cols[1],
+                &folded.cols[2], &folded.cols[3], current_log_size,
+            );
+            fri_commitments.push(fri_root);
+            channel.mix_digest(&fri_root);
+            let host_data = [
+                folded.cols[0].to_host(), folded.cols[1].to_host(),
+                folded.cols[2].to_host(), folded.cols[3].to_host(),
+            ];
+            fri_layer_data.push(FriLayerData::HostData(host_data));
+        } else {
+            let fri_tree = MerkleTree::commit_soa4(
+                &folded.cols[0], &folded.cols[1],
+                &folded.cols[2], &folded.cols[3], current_log_size,
+            );
+            fri_commitments.push(fri_tree.root());
+            channel.mix_digest(&fri_tree.root());
+            fri_layer_data.push(FriLayerData::GpuTree(fri_tree, folded));
+        }
         if timed {
             eprintln!("    fri gpu fold+commit (log={}): {:.3}ms", current_log_size, ti.elapsed().as_secs_f64() * 1000.0);
         }
     }
 
     // CPU tail
-    let mut cpu_eval = {
-        let last = fri_evals.last().unwrap();
-        last.to_qm31()
+    let mut cpu_eval = match fri_layer_data.last().unwrap() {
+        FriLayerData::GpuTree(_, eval) => eval.to_qm31(),
+        FriLayerData::HostData(host) => {
+            let n = host[0].len();
+            (0..n).map(|i| QM31::from_u32_array([host[0][i], host[1][i], host[2][i], host[3][i]])).collect()
+        }
     };
 
     let mut cpu_fri_trees: Vec<(Vec<QM31>, [u32; 8])> = Vec::new();
     while current_log_size > 3 {
         let ti = Instant::now();
         let fold_alpha = channel.draw_felt();
-        // Compute twiddle on demand, download to host, drop GPU buffer
         let line_domain = Coset::half_coset(current_log_size);
         let d_twid = fri::compute_fold_twiddles_on_demand(&line_domain, false);
         let twid_host = d_twid.to_host();
         drop(d_twid);
 
-        cpu_eval = fri::fold_line_cpu(
-            &cpu_eval, fold_alpha, &twid_host,
-        );
+        cpu_eval = fri::fold_line_cpu(&cpu_eval, fold_alpha, &twid_host);
         current_log_size -= 1;
 
         let fri_root = fri::merkle_root_cpu(&cpu_eval);
@@ -386,16 +441,23 @@ fn prove_lean_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     // Decommit quotient — CPU auth paths from host data
     let quotient_decommitment = decommit_soa4_cpu(&quotient_host, &quotient_commitment, &query_indices, log_eval_size);
 
-    // Decommit FRI layers (GPU layers — these still have full trees)
+    // Decommit FRI layers
     let mut fri_decommitments = Vec::new();
     let mut folded_indices: Vec<usize> = query_indices.iter().map(|&qi| qi / 2).collect();
-    for (tree, eval) in fri_trees.iter().zip(fri_evals.iter()) {
-        let decom = decommit_fri_layer(tree, eval, &folded_indices);
-        fri_decommitments.push(decom);
+    for layer_data in &fri_layer_data {
+        match layer_data {
+            FriLayerData::GpuTree(tree, eval) => {
+                let decom = decommit_fri_layer(tree, eval, &folded_indices);
+                fri_decommitments.push(decom);
+            }
+            FriLayerData::HostData(host) => {
+                let decom = decommit_soa4_cpu(host, &[0u32; 8], &folded_indices, 0);
+                fri_decommitments.push(decom);
+            }
+        }
         folded_indices = folded_indices.iter().map(|&i| i / 2).collect();
     }
-    drop(fri_trees);
-    drop(fri_evals);
+    drop(fri_layer_data);
 
     // Decommit CPU tail FRI layers
     for (cpu_vals, _root) in &cpu_fri_trees {
