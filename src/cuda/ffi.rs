@@ -242,6 +242,48 @@ unsafe extern "C" {
         stream: *mut std::ffi::c_void,
     );
 
+    // LogUp interaction kernels
+    pub fn cuda_logup_memory_denoms(
+        col_pc: *const u32, col_inst_lo: *const u32,
+        col_dst_addr: *const u32, col_dst: *const u32,
+        col_op0_addr: *const u32, col_op0: *const u32,
+        col_op1_addr: *const u32, col_op1: *const u32,
+        denom0: *mut u32, denom1: *mut u32, denom2: *mut u32, denom3: *mut u32,
+        z: *const u32, alpha: *const u32,
+        n: u32,
+    );
+
+    pub fn cuda_logup_memory_combine(
+        col_pc: *const u32, col_inst_lo: *const u32,
+        col_dst_addr: *const u32, col_dst: *const u32,
+        col_op0_addr: *const u32, col_op0: *const u32,
+        col_op1_addr: *const u32, col_op1: *const u32,
+        inv0: *const u32, inv1: *const u32, inv2: *const u32, inv3: *const u32,
+        out0: *mut u32, out1: *mut u32, out2: *mut u32, out3: *mut u32,
+        z: *const u32, alpha: *const u32,
+        n: u32,
+    );
+
+    pub fn cuda_qm31_inverse(
+        in0: *const u32, in1: *const u32, in2: *const u32, in3: *const u32,
+        out0: *mut u32, out1: *mut u32, out2: *mut u32, out3: *mut u32,
+        n: u32,
+    );
+
+    pub fn cuda_qm31_block_scan(
+        c0: *mut u32, c1: *mut u32, c2: *mut u32, c3: *mut u32,
+        block_sums0: *mut u32, block_sums1: *mut u32,
+        block_sums2: *mut u32, block_sums3: *mut u32,
+        n: u32, block_size: u32,
+    );
+
+    pub fn cuda_qm31_add_block_prefix(
+        c0: *mut u32, c1: *mut u32, c2: *mut u32, c3: *mut u32,
+        prefix0: *const u32, prefix1: *const u32,
+        prefix2: *const u32, prefix3: *const u32,
+        n: u32, block_size: u32,
+    );
+
     pub fn cuda_cairo_quotient(
         trace_cols: *const *const u32,
         out0: *mut u32, out1: *mut u32, out2: *mut u32, out3: *mut u32,
