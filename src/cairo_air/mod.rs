@@ -14,3 +14,4 @@ pub mod decode;
 pub mod vm;
 pub mod trace;
 pub mod logup;
+pub mod range_check;

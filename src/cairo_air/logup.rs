@@ -151,7 +151,7 @@ pub fn extract_memory_table(
 }
 
 /// Helper: embed M31 into QM31.
-fn qm31_from_m31(x: M31) -> QM31 {
+pub fn qm31_from_m31(x: M31) -> QM31 {
     QM31 {
         a: CM31 { a: x, b: M31::ZERO },
         b: CM31::ZERO,
