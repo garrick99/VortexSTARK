@@ -298,6 +298,13 @@ unsafe extern "C" {
         offset: u32, chunk_n: u32, global_n: u32,
     );
 
+    // Pedersen GPU
+    pub fn cuda_pedersen_upload_points(px: *const u64, py: *const u64);
+    pub fn cuda_pedersen_hash_batch(
+        inputs_a: *const u64, inputs_b: *const u64,
+        outputs: *mut u64, n: u32,
+    );
+
     pub fn cuda_poseidon_upload_round_consts(host_rc: *const u32);
 
     pub fn cuda_poseidon_trace(

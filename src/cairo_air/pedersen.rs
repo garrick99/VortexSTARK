@@ -235,6 +235,59 @@ pub fn fp_to_stark252(fp: &super::stark252_field::Fp) -> Stark252 {
     Stark252 { limbs }
 }
 
+/// Initialize GPU Pedersen: upload constant points to device.
+pub fn gpu_init() {
+    use super::stark252_field::pedersen_points;
+    use crate::cuda::ffi;
+
+    let points = pedersen_points();
+    let mut px = [0u64; 20]; // 5 points × 4 limbs
+    let mut py = [0u64; 20];
+
+    for (i, pt) in points.iter().enumerate() {
+        if let super::stark252_field::CurvePoint::Affine(x, y) = pt {
+            for j in 0..4 {
+                px[i * 4 + j] = x.v[j];
+                py[i * 4 + j] = y.v[j];
+            }
+        }
+    }
+
+    unsafe { ffi::cuda_pedersen_upload_points(px.as_ptr(), py.as_ptr()); }
+}
+
+/// Batch Pedersen hash on GPU. Returns output Fp values.
+pub fn gpu_hash_batch(
+    inputs_a: &[super::stark252_field::Fp],
+    inputs_b: &[super::stark252_field::Fp],
+) -> Vec<super::stark252_field::Fp> {
+    use crate::cuda::ffi;
+    use crate::device::DeviceBuffer;
+
+    let n = inputs_a.len();
+    assert_eq!(n, inputs_b.len());
+
+    // Flatten Fp values to u64 arrays
+    let flat_a: Vec<u64> = inputs_a.iter().flat_map(|fp| fp.v.iter().copied()).collect();
+    let flat_b: Vec<u64> = inputs_b.iter().flat_map(|fp| fp.v.iter().copied()).collect();
+
+    let d_a = DeviceBuffer::from_host(&flat_a);
+    let d_b = DeviceBuffer::from_host(&flat_b);
+    let mut d_out = DeviceBuffer::<u64>::alloc(n * 4);
+
+    unsafe {
+        ffi::cuda_pedersen_hash_batch(
+            d_a.as_ptr(), d_b.as_ptr(), d_out.as_mut_ptr(), n as u32,
+        );
+        ffi::cuda_device_sync();
+    }
+
+    let flat_out = d_out.to_host();
+    (0..n).map(|i| super::stark252_field::Fp {
+        v: [flat_out[i*4], flat_out[i*4+1], flat_out[i*4+2], flat_out[i*4+3]]
+    }).collect()
+}
+
 pub const PEDERSEN_BUILTIN_BASE: u64 = 0x5000_0000;
 
 fn hex_to_bytes(hex: &str) -> Vec<u8> {
