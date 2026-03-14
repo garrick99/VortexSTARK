@@ -242,6 +242,20 @@ unsafe extern "C" {
         stream: *mut std::ffi::c_void,
     );
 
+    pub fn cuda_cairo_quotient(
+        trace_cols: *const *const u32,
+        out0: *mut u32, out1: *mut u32, out2: *mut u32, out3: *mut u32,
+        alpha_coeffs: *const u32,
+        n: u32,
+    );
+
+    pub fn cuda_cairo_quotient_chunk(
+        trace_cols: *const *const u32,
+        out0: *mut u32, out1: *mut u32, out2: *mut u32, out3: *mut u32,
+        alpha_coeffs: *const u32,
+        offset: u32, chunk_n: u32, global_n: u32,
+    );
+
     pub fn cuda_poseidon_upload_round_consts(host_rc: *const u32);
 
     pub fn cuda_poseidon_trace(
