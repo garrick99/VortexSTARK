@@ -27,8 +27,8 @@ fn main() {
         let stem = src.file_stem().unwrap().to_str().unwrap();
         let obj = out_dir.join(format!("{stem}.obj"));
 
-        let status = Command::new(&nvcc)
-            .args([
+        let mut cmd = Command::new(&nvcc);
+        cmd.args([
                 "-c",
                 "-O3",
                 "-gencode", "arch=compute_89,code=sm_89",
@@ -39,8 +39,12 @@ fn main() {
                 "-o",
             ])
             .arg(&obj)
-            .arg(src)
-            .status()
+            .arg(src);
+        // Register cap experiments: 128 and 96 regs both give ~221K/sec.
+        // Kernel is compute-bound (IMAD throughput), not occupancy-bound.
+        // Default (210 regs, 15% occupancy) performs identically.
+        // if stem == "pedersen_gpu" { cmd.arg("--maxrregcount=128"); }
+        let status = cmd.status()
             .expect("Failed to run nvcc");
 
         assert!(status.success(), "nvcc failed on {}", src.display());
