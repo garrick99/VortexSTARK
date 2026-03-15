@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VortexSTARK Dashboard</title>
+<style>
+:root {
+  --bg: #0d1117; --surface: #161b22; --border: #30363d;
+  --text: #e6edf3; --dim: #8b949e; --accent: #58a6ff;
+  --green: #3fb950; --red: #f85149; --orange: #d29922; --purple: #bc8cff;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:var(--bg); color:var(--text); font-family:'JetBrains Mono','Fira Code',monospace; font-size:14px; }
+h1,h2,h3 { font-weight:600; }
+.header { background:var(--surface); border-bottom:1px solid var(--border); padding:16px 24px; display:flex; justify-content:space-between; align-items:center; }
+.header h1 { font-size:20px; letter-spacing:1px; }
+.header h1 span { color:var(--accent); }
+.gpu-badge { display:flex; gap:16px; font-size:13px; color:var(--dim); }
+.gpu-badge .val { color:var(--text); font-weight:600; }
+.gpu-badge .hot { color:var(--orange); }
+.gpu-badge .crit { color:var(--red); }
+.grid { display:grid; grid-template-columns:1fr 320px; gap:16px; padding:16px 24px; max-width:1400px; }
+@media(max-width:900px) { .grid { grid-template-columns:1fr; } }
+.panel { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:20px; }
+.panel h2 { font-size:15px; color:var(--accent); margin-bottom:14px; text-transform:uppercase; letter-spacing:1px; }
+.controls { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:16px; }
+select, button { background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:4px; padding:8px 14px; font-family:inherit; font-size:13px; cursor:pointer; }
+select:hover, button:hover { border-color:var(--accent); }
+button.primary { background:var(--accent); color:#000; font-weight:700; border:none; }
+button.primary:hover { background:#79c0ff; }
+button.primary:disabled { background:var(--border); color:var(--dim); cursor:not-allowed; }
+table { width:100%; border-collapse:collapse; }
+th { text-align:left; color:var(--dim); font-size:12px; text-transform:uppercase; letter-spacing:.5px; padding:6px 8px; border-bottom:1px solid var(--border); }
+td { padding:8px; border-bottom:1px solid #21262d; font-variant-numeric:tabular-nums; }
+td.mono { font-size:13px; }
+.phase-bar { height:18px; background:var(--accent); border-radius:2px; transition:width .4s ease; min-width:2px; opacity:.8; }
+.phase-row td:first-child { color:var(--dim); }
+.status { display:inline-block; padding:2px 8px; border-radius:3px; font-size:12px; font-weight:700; }
+.status.ok { background:#1a3a2a; color:var(--green); }
+.status.fail { background:#3a1a1a; color:var(--red); }
+.status.running { background:#1a2a3a; color:var(--accent); }
+.gauge { margin-bottom:12px; }
+.gauge-label { display:flex; justify-content:space-between; font-size:12px; color:var(--dim); margin-bottom:4px; }
+.gauge-track { height:8px; background:var(--bg); border-radius:4px; overflow:hidden; }
+.gauge-fill { height:100%; border-radius:4px; transition:width .5s ease; }
+.gauge-fill.vram { background:var(--accent); }
+.gauge-fill.util { background:var(--green); }
+.gauge-fill.power { background:var(--orange); }
+.compare-bar { display:flex; align-items:center; gap:10px; margin:8px 0; }
+.compare-bar .label { width:120px; font-size:12px; color:var(--dim); text-align:right; }
+.compare-bar .bar { height:24px; border-radius:3px; transition:width .6s ease; min-width:4px; }
+.compare-bar .bar.cpu { background:var(--orange); }
+.compare-bar .bar.gpu { background:var(--green); }
+.compare-bar .rate { font-size:12px; color:var(--text); min-width:100px; }
+.speedup-num { font-size:28px; font-weight:700; color:var(--green); text-align:center; margin:12px 0; }
+.log { background:var(--bg); border:1px solid var(--border); border-radius:4px; padding:10px; font-size:12px; color:var(--dim); max-height:120px; overflow-y:auto; margin-top:12px; white-space:pre; }
+.bottom-row { grid-column:1/-1; display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+@media(max-width:900px) { .bottom-row { grid-template-columns:1fr; } }
+.fade-in { animation: fadeIn .3s ease; }
+@keyframes fadeIn { from{opacity:0;transform:translateY(4px)} to{opacity:1;transform:none} }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Vortex<span>STARK</span></h1>
+  <div class="gpu-badge">
+    <span>RTX 5090</span>
+    <span>VRAM: <span class="val" id="hdr-vram">--</span></span>
+    <span>Temp: <span class="val" id="hdr-temp">--</span></span>
+    <span>Power: <span class="val" id="hdr-power">--</span></span>
+    <span id="ws-status" style="color:var(--red)">disconnected</span>
+  </div>
+</div>
+
+<div class="grid">
+  <!-- Live Proof Demo -->
+  <div class="panel">
+    <h2>Live Proof Demo</h2>
+    <div class="controls">
+      <select id="proof-type">
+        <option value="fibonacci">Fibonacci STARK</option>
+        <option value="cairo">Cairo VM STARK</option>
+      </select>
+      <select id="log-n">
+        <option value="16">log_n=16 (65K)</option>
+        <option value="20" selected>log_n=20 (1M)</option>
+        <option value="22">log_n=22 (4M)</option>
+        <option value="24">log_n=24 (16M)</option>
+        <option value="26">log_n=26 (67M)</option>
+        <option value="28">log_n=28 (268M)</option>
+        <option value="30">log_n=30 (1.07B)</option>
+      </select>
+      <button class="primary" id="btn-prove" onclick="startProve()">Prove</button>
+      <span id="prove-status"></span>
+    </div>
+    <table id="phase-table">
+      <thead><tr><th>Phase</th><th>Time</th><th style="width:60%"></th></tr></thead>
+      <tbody id="phase-body"></tbody>
+    </table>
+    <div id="prove-result" style="margin-top:12px;"></div>
+    <div class="log" id="event-log"></div>
+  </div>
+
+  <!-- GPU Monitor -->
+  <div class="panel">
+    <h2>GPU Monitor</h2>
+    <div class="gauge">
+      <div class="gauge-label"><span>VRAM</span><span id="vram-text">-- / -- MB</span></div>
+      <div class="gauge-track"><div class="gauge-fill vram" id="vram-fill" style="width:0%"></div></div>
+    </div>
+    <div class="gauge">
+      <div class="gauge-label"><span>Utilization</span><span id="util-text">--%</span></div>
+      <div class="gauge-track"><div class="gauge-fill util" id="util-fill" style="width:0%"></div></div>
+    </div>
+    <div class="gauge">
+      <div class="gauge-label"><span>Power</span><span id="power-text">-- / 575W</span></div>
+      <div class="gauge-track"><div class="gauge-fill power" id="power-fill" style="width:0%"></div></div>
+    </div>
+    <div class="gauge">
+      <div class="gauge-label"><span>Temperature</span><span id="temp-text">--C</span></div>
+      <div class="gauge-track"><div class="gauge-fill" id="temp-fill" style="width:0%;background:var(--green)"></div></div>
+    </div>
+    <div style="margin-top:20px;">
+      <h2>Pedersen: CPU vs GPU</h2>
+      <div class="controls">
+        <select id="ped-n">
+          <option value="1000">1K hashes</option>
+          <option value="10000" selected>10K hashes</option>
+          <option value="100000">100K hashes</option>
+        </select>
+        <button class="primary" id="btn-ped" onclick="startPedersen()">Compare</button>
+      </div>
+      <div id="ped-result"></div>
+    </div>
+  </div>
+
+  <!-- Bottom row: Benchmark History -->
+  <div class="bottom-row">
+    <div class="panel">
+      <h2>Fibonacci STARK Benchmarks</h2>
+      <table>
+        <thead><tr><th>log_n</th><th>Elements</th><th>Prove</th><th>Verify</th><th>Status</th></tr></thead>
+        <tbody id="fib-bench"></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <h2>Cairo VM STARK Benchmarks</h2>
+      <table>
+        <thead><tr><th>log_n</th><th>Steps</th><th>Prove</th><th>Verify</th><th>Status</th></tr></thead>
+        <tbody id="cairo-bench"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+let ws = null;
+let maxPhaseMs = 0;
+
+function log(msg) {
+  const el = document.getElementById('event-log');
+  const ts = new Date().toLocaleTimeString();
+  el.textContent += `[${ts}] ${msg}\n`;
+  el.scrollTop = el.scrollHeight;
+}
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws`);
+  ws.onopen = () => {
+    document.getElementById('ws-status').textContent = 'connected';
+    document.getElementById('ws-status').style.color = 'var(--green)';
+    log('WebSocket connected');
+  };
+  ws.onclose = () => {
+    document.getElementById('ws-status').textContent = 'disconnected';
+    document.getElementById('ws-status').style.color = 'var(--red)';
+    setTimeout(connect, 2000);
+  };
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    handleMessage(msg);
+  };
+}
+
+function handleMessage(msg) {
+  switch(msg.type) {
+    case 'gpu_stats': updateGpu(msg); break;
+    case 'proof_started':
+      document.getElementById('prove-status').innerHTML = '<span class="status running">PROVING...</span>';
+      document.getElementById('prove-result').innerHTML = '';
+      log(`Started ${msg.proof_type} proof, log_n=${msg.log_n}`);
+      break;
+    case 'phase':
+      addPhase(msg.name, msg.ms);
+      log(`  ${msg.name}: ${msg.ms.toFixed(1)}ms`);
+      break;
+    case 'proof_done':
+      document.getElementById('prove-status').innerHTML = '';
+      const cls = msg.verified ? 'ok' : 'fail';
+      const sym = msg.verified ? 'VERIFIED' : 'FAILED';
+      document.getElementById('prove-result').innerHTML =
+        `<span class="status ${cls}">${sym}</span> &nbsp; `+
+        `Prove: <b>${fmtMs(msg.prove_ms)}</b> &nbsp; Verify: <b>${fmtMs(msg.verify_ms)}</b>`;
+      log(`Done: prove=${fmtMs(msg.prove_ms)}, verify=${fmtMs(msg.verify_ms)}, ${sym}`);
+      addBenchRow(msg);
+      document.getElementById('btn-prove').disabled = false;
+      break;
+    case 'pedersen_compare':
+      showPedersen(msg);
+      document.getElementById('btn-ped').disabled = false;
+      break;
+    case 'error':
+      log(`ERROR: ${msg.message}`);
+      document.getElementById('prove-status').innerHTML = `<span class="status fail">ERROR</span>`;
+      document.getElementById('btn-prove').disabled = false;
+      document.getElementById('btn-ped').disabled = false;
+      break;
+  }
+}
+
+function updateGpu(s) {
+  const vramPct = (s.vram_used_mb / s.vram_total_mb * 100).toFixed(0);
+  document.getElementById('vram-text').textContent = `${s.vram_used_mb} / ${s.vram_total_mb} MB`;
+  document.getElementById('vram-fill').style.width = vramPct + '%';
+  document.getElementById('util-text').textContent = s.util_pct + '%';
+  document.getElementById('util-fill').style.width = s.util_pct + '%';
+  document.getElementById('power-text').textContent = s.power_w.toFixed(0) + ' / 575W';
+  document.getElementById('power-fill').style.width = (s.power_w/575*100).toFixed(0) + '%';
+  const tempPct = (s.temp_c / 90 * 100).toFixed(0);
+  document.getElementById('temp-text').textContent = s.temp_c + 'C';
+  document.getElementById('temp-fill').style.width = tempPct + '%';
+  const tf = document.getElementById('temp-fill');
+  tf.style.background = s.temp_c > 80 ? 'var(--red)' : s.temp_c > 65 ? 'var(--orange)' : 'var(--green)';
+  const ht = document.getElementById('hdr-temp');
+  ht.textContent = s.temp_c + 'C';
+  ht.className = 'val' + (s.temp_c > 80 ? ' crit' : s.temp_c > 65 ? ' hot' : '');
+  document.getElementById('hdr-vram').textContent = vramPct + '%';
+  document.getElementById('hdr-power').textContent = s.power_w.toFixed(0) + 'W';
+}
+
+function addPhase(name, ms) {
+  if (ms > maxPhaseMs) maxPhaseMs = ms;
+  const pct = maxPhaseMs > 0 ? (ms / maxPhaseMs * 100) : 100;
+  const tbody = document.getElementById('phase-body');
+  const tr = document.createElement('tr');
+  tr.className = 'phase-row fade-in';
+  tr.innerHTML = `<td>${name}</td><td class="mono">${fmtMs(ms)}</td><td><div class="phase-bar" style="width:${pct}%"></div></td>`;
+  tbody.appendChild(tr);
+}
+
+function addBenchRow(msg) {
+  const tid = msg.proof_type === 'fibonacci' ? 'fib-bench' : 'cairo-bench';
+  const tbody = document.getElementById(tid);
+  const n = 1 << msg.log_n;
+  const tr = document.createElement('tr');
+  tr.className = 'fade-in';
+  const sym = msg.verified ? '<span class="status ok">OK</span>' : '<span class="status fail">FAIL</span>';
+  tr.innerHTML = `<td>${msg.log_n}</td><td>${fmtNum(n)}</td><td class="mono">${fmtMs(msg.prove_ms)}</td><td class="mono">${fmtMs(msg.verify_ms)}</td><td>${sym}</td>`;
+  tbody.appendChild(tr);
+}
+
+function showPedersen(msg) {
+  const maxRate = Math.max(msg.cpu_rate, msg.gpu_rate);
+  const cpuW = Math.max(1, msg.cpu_rate / maxRate * 100);
+  const gpuW = Math.max(1, msg.gpu_rate / maxRate * 100);
+  document.getElementById('ped-result').innerHTML =
+    `<div class="speedup-num">${fmtNum(Math.round(msg.speedup))}x speedup</div>`+
+    `<div class="compare-bar"><div class="label">CPU (${msg.cpu_threads}T)</div><div class="bar cpu" style="width:${cpuW}%"></div><div class="rate">${fmtRate(msg.cpu_rate)}/s</div></div>`+
+    `<div class="compare-bar"><div class="label">GPU (RTX 5090)</div><div class="bar gpu" style="width:${gpuW}%"></div><div class="rate">${fmtRate(msg.gpu_rate)}/s</div></div>`;
+}
+
+function fmtMs(ms) {
+  if (ms >= 1000) return (ms/1000).toFixed(2) + 's';
+  return ms.toFixed(1) + 'ms';
+}
+function fmtNum(n) {
+  if (n >= 1e9) return (n/1e9).toFixed(2) + 'B';
+  if (n >= 1e6) return (n/1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n/1e3).toFixed(0) + 'K';
+  return n.toString();
+}
+function fmtRate(r) {
+  if (r >= 1e6) return (r/1e6).toFixed(1) + 'M';
+  if (r >= 1e3) return (r/1e3).toFixed(1) + 'K';
+  return r.toFixed(0);
+}
+
+function startProve() {
+  const proofType = document.getElementById('proof-type').value;
+  const logN = parseInt(document.getElementById('log-n').value);
+  document.getElementById('btn-prove').disabled = true;
+  document.getElementById('phase-body').innerHTML = '';
+  document.getElementById('prove-result').innerHTML = '';
+  maxPhaseMs = 0;
+  fetch('/api/prove', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({proof_type: proofType, log_n: logN})
+  }).catch(e => log('Fetch error: ' + e));
+}
+
+function startPedersen() {
+  const n = parseInt(document.getElementById('ped-n').value);
+  document.getElementById('btn-ped').disabled = true;
+  document.getElementById('ped-result').innerHTML = '<span class="status running">RUNNING...</span>';
+  fetch('/api/pedersen-compare', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({n: n})
+  }).catch(e => log('Fetch error: ' + e));
+}
+
+connect();
+</script>
+</body>
+</html>
