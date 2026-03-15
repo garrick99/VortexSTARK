@@ -702,9 +702,100 @@ fn shift_right(val: &Fp, n_bits: usize) -> Fp {
     result
 }
 
+/// Compute Montgomery constant p' = -p^(-1) mod 2^256
+/// Uses Newton's method: x = x * (2 - p*x) mod 2^(2^k)
+pub fn compute_mont_p_prime() -> [u64; 4] {
+    // p^(-1) mod 2 = 1 (p is odd)
+    let mut x = [1u64, 0, 0, 0]; // p^(-1) mod 2
+
+    // Newton iterations: x = x * (2 - p*x) mod 2^(2^k)
+    // Need 8 iterations to reach mod 2^256
+    for _ in 0..8 {
+        // Compute p * x mod 2^256 (only keep low 4 limbs)
+        let px = mul_low_256(&PRIME.v, &x);
+        // Compute 2 - p*x mod 2^256
+        let two_minus_px = sub_256(&[2, 0, 0, 0], &px);
+        // x = x * (2 - p*x) mod 2^256
+        x = mul_low_256(&x, &two_minus_px);
+    }
+
+    // p' = -x mod 2^256
+    sub_256(&[0, 0, 0, 0], &x)
+}
+
+/// Compute R mod p = 2^256 mod p (for converting to Montgomery form)
+pub fn compute_r_mod_p() -> Fp {
+    // We already have this: it's the reduction constant
+    Fp { v: [0xFFFFFFFFFFFFFFE1, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0x07FFFFFFFFFFFDF0] }
+}
+
+/// Compute R^2 mod p (for fast conversion to Montgomery form)
+pub fn compute_r2_mod_p() -> Fp {
+    let r = compute_r_mod_p();
+    r * r // uses standard mul which is correct
+}
+
+// Helper: multiply two 4-limb numbers, keep only low 4 limbs (mod 2^256)
+fn mul_low_256(a: &[u64; 4], b: &[u64; 4]) -> [u64; 4] {
+    let mut r = [0u64; 4];
+    for i in 0..4 {
+        let mut carry = 0u128;
+        for j in 0..4 {
+            if i + j < 4 {
+                carry += r[i + j] as u128 + a[i] as u128 * b[j] as u128;
+                r[i + j] = carry as u64;
+                carry >>= 64;
+            }
+        }
+    }
+    r
+}
+
+// Helper: subtract two 4-limb numbers mod 2^256 (wrapping)
+fn sub_256(a: &[u64; 4], b: &[u64; 4]) -> [u64; 4] {
+    let mut r = [0u64; 4];
+    let mut borrow = 0u64;
+    for i in 0..4 {
+        let (r1, b1) = a[i].overflowing_sub(b[i]);
+        let (r2, b2) = r1.overflowing_sub(borrow);
+        r[i] = r2;
+        borrow = (b1 as u64) + (b2 as u64);
+    }
+    r
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_montgomery_constants() {
+        // Verify p' * p ≡ -1 mod 2^256
+        let p_prime = compute_mont_p_prime();
+        let pp = mul_low_256(&PRIME.v, &p_prime);
+        // pp should be all 1s (= -1 mod 2^256)
+        assert_eq!(pp, [0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF,
+                        0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF],
+            "p' * p should be -1 mod 2^256");
+
+        // Verify R mod p
+        let r = compute_r_mod_p();
+        // R + 32 + 544*2^192 should equal p * 32 + something... just check R < p
+        assert!(!r.ge_prime(), "R mod p should be < p");
+
+        // Verify R^2 mod p
+        let r2 = compute_r2_mod_p();
+        assert!(!r2.ge_prime(), "R^2 mod p should be < p");
+
+        // Print constants for GPU hardcoding
+        eprintln!("Montgomery constants:");
+        eprintln!("  p' = [{:#018x}, {:#018x}, {:#018x}, {:#018x}]",
+            p_prime[0], p_prime[1], p_prime[2], p_prime[3]);
+        eprintln!("  R mod p = [{:#018x}, {:#018x}, {:#018x}, {:#018x}]",
+            r.v[0], r.v[1], r.v[2], r.v[3]);
+        eprintln!("  R² mod p = [{:#018x}, {:#018x}, {:#018x}, {:#018x}]",
+            r2.v[0], r2.v[1], r2.v[2], r2.v[3]);
+    }
 
     #[test]
     fn test_fp_add() {
