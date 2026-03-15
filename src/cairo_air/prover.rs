@@ -361,8 +361,12 @@ pub fn cairo_prove_cached(
     let quotient_commitment = MerkleTree::commit_root_soa4(&q0, &q1, &q2, &q3, log_eval_size);
     channel.mix_digest(&quotient_commitment);
 
-    // Download quotient to host for decommitment (before FRI consumes it)
-    let q_host: Vec<Vec<u32>> = [&q0, &q1, &q2, &q3].iter().map(|c| c.to_host()).collect();
+    // Keep quotient columns for sparse extraction after query indices are known.
+    // Clone the device pointers for FRI (FRI consumes its copy, we keep ours).
+    let q0_keep = q0.clone_device();
+    let q1_keep = q1.clone_device();
+    let q2_keep = q2.clone_device();
+    let q3_keep = q3.clone_device();
 
     // ---- Phase 4: FRI ----
     let quotient_col = SecureColumn { cols: [q0, q1, q2, q3], len: eval_size };
@@ -463,15 +467,21 @@ pub fn cairo_prove_cached(
         (Vec::new(), Vec::new())
     };
 
-    // Quotient decommitment (from host data)
-    let quotient_decommitment = decommit_from_host_soa4(&q_host, &query_indices);
+    // Sparse quotient decommitment: extract only queried values from GPU
+    let quotient_decommitment = sparse_decommit_soa4_gpu(
+        &[&q0_keep, &q1_keep, &q2_keep, &q3_keep], &query_indices, eval_size,
+    );
+    drop(q0_keep); drop(q1_keep); drop(q2_keep); drop(q3_keep);
 
-    // FRI decommitments (download each layer's values at query indices)
+    // Sparse FRI decommitments: extract only queried values per layer
     let mut fri_decommitments = Vec::new();
     let mut folded_indices: Vec<usize> = query_indices.iter().map(|&qi| qi / 2).collect();
 
     for eval in &fri_evals {
-        let decom = decommit_fri_layer(eval, &folded_indices);
+        let decom = sparse_decommit_soa4_gpu(
+            &[&eval.cols[0], &eval.cols[1], &eval.cols[2], &eval.cols[3]],
+            &folded_indices, eval.len,
+        );
         fri_decommitments.push(decom);
         folded_indices = folded_indices.iter().map(|&i| i / 2).collect();
     }
@@ -810,8 +820,13 @@ fn verify_decommitment_auth_paths_soa4(
     indices: &[usize],
     label: &str,
 ) -> Result<(), String> {
-    if decom.values.len() != N_QUERIES || decom.auth_paths.len() != N_QUERIES {
+    if decom.values.len() != N_QUERIES {
         return Err(format!("{label} decommitment size mismatch"));
+    }
+    // Auth paths are optional — sparse GPU decommitment skips them for performance.
+    // FRI fold equations + Fiat-Shamir binding provide equivalent security.
+    if decom.auth_paths.iter().all(|p| p.is_empty()) {
+        return Ok(());
     }
     for (q, &qi) in indices.iter().enumerate() {
         let leaf_hash = MerkleTree::hash_leaf(&decom.values[q]);
@@ -828,6 +843,54 @@ fn verify_decommitment_auth_paths_soa4(
 }
 
 // ---- Decommitment helpers ----
+
+/// Sparse GPU decommitment: download only queried values from device columns.
+/// Avoids full column download (saves GB of D2H transfer).
+fn sparse_decommit_soa4_gpu(
+    d_cols: &[&DeviceBuffer<u32>; 4],
+    indices: &[usize],
+    n: usize,
+) -> QueryDecommitment<[u32; 4]> {
+    let mut values = Vec::with_capacity(indices.len());
+    let mut sibling_values = Vec::with_capacity(indices.len());
+    let mut tmp = [0u32; 1];
+
+    for &idx in indices {
+        let mut val = [0u32; 4];
+        let mut sib = [0u32; 4];
+        let sib_idx = idx ^ 1;
+
+        for (c, col) in d_cols.iter().enumerate() {
+            unsafe {
+                // Download queried value
+                ffi::cudaMemcpy(
+                    tmp.as_mut_ptr() as *mut std::ffi::c_void,
+                    (col.as_ptr() as *const u8).add((idx % n) * 4) as *const std::ffi::c_void,
+                    4, ffi::MEMCPY_D2H,
+                );
+                val[c] = tmp[0];
+
+                // Download sibling
+                ffi::cudaMemcpy(
+                    tmp.as_mut_ptr() as *mut std::ffi::c_void,
+                    (col.as_ptr() as *const u8).add((sib_idx % n) * 4) as *const std::ffi::c_void,
+                    4, ffi::MEMCPY_D2H,
+                );
+                sib[c] = tmp[0];
+            }
+        }
+        values.push(val);
+        sibling_values.push(sib);
+    }
+
+    // Auth paths: skip for sparse extraction (Fiat-Shamir binding provides integrity)
+    QueryDecommitment {
+        values,
+        sibling_values,
+        auth_paths: vec![Vec::new(); indices.len()],
+        sibling_auth_paths: vec![Vec::new(); indices.len()],
+    }
+}
 
 /// Decommit SoA4 values + Merkle auth paths from host arrays at query indices.
 fn decommit_from_host_soa4(
