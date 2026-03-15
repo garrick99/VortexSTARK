@@ -182,7 +182,7 @@ fn main() {
     let warmup_b = vec![Fp::from_u64(2)];
     let _ = pedersen::gpu_hash_batch(&warmup_a, &warmup_b);
 
-    for n in [10, 100, 1000] {
+    for n in [1000, 10000, 100000, 1000000] {
         let inputs_a: Vec<Fp> = (0..n).map(|i| Fp::from_u64(i as u64 + 1)).collect();
         let inputs_b: Vec<Fp> = (0..n).map(|i| Fp::from_u64(i as u64 + 1000)).collect();
 
