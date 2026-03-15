@@ -27,11 +27,25 @@ use super::trace::{N_COLS, N_CONSTRAINTS, COL_PC, COL_INST_LO,
     COL_DST_ADDR, COL_DST, COL_OP0_ADDR, COL_OP0, COL_OP1_ADDR, COL_OP1};
 use super::vm::Memory;
 
+/// Public inputs for a Cairo proof: initial/final VM state + program hash.
+#[derive(Clone, Debug)]
+pub struct CairoPublicInputs {
+    /// Initial program counter
+    pub initial_pc: u32,
+    /// Initial allocation pointer
+    pub initial_ap: u32,
+    /// Number of execution steps
+    pub n_steps: usize,
+    /// Hash of the program bytecode (first 8 words of Blake2s digest)
+    pub program_hash: [u32; 8],
+}
+
 /// Complete Cairo STARK proof.
 #[derive(Clone)]
 pub struct CairoProof {
     pub log_trace_size: u32,
-    pub n_steps: usize,
+    /// Public inputs (verified by both prover and verifier)
+    pub public_inputs: CairoPublicInputs,
     /// Merkle root: VM trace (27 columns)
     pub trace_commitment: [u32; 8],
     /// Merkle root: LogUp interaction trace (4 QM31 columns)
@@ -44,7 +58,7 @@ pub struct CairoProof {
     pub fri_last_layer: Vec<QM31>,
     /// Query indices
     pub query_indices: Vec<usize>,
-    /// Decommitments
+    /// Decommitments (with Merkle auth paths)
     pub quotient_decommitment: QueryDecommitment<[u32; 4]>,
     pub fri_decommitments: Vec<QueryDecommitment<[u32; 4]>>,
 }
@@ -108,6 +122,23 @@ pub fn cairo_prove(program: &[u64], n_steps: usize, log_n: u32) -> CairoProof {
     let eval_size = 2 * n;
     let log_eval_size = log_n + BLOWUP_BITS;
 
+    // ---- Public inputs ----
+    let hash_bytes = crate::channel::blake2s_hash(
+        unsafe { std::slice::from_raw_parts(program.as_ptr() as *const u8, program.len() * 8) }
+    );
+    let mut program_hash = [0u32; 8];
+    for i in 0..8 {
+        program_hash[i] = u32::from_le_bytes([
+            hash_bytes[i*4], hash_bytes[i*4+1], hash_bytes[i*4+2], hash_bytes[i*4+3],
+        ]);
+    }
+    let public_inputs = CairoPublicInputs {
+        initial_pc: 0,
+        initial_ap: 100,
+        n_steps,
+        program_hash,
+    };
+
     // ---- Phase 1: Trace generation + commitment ----
     let mut mem = Memory::with_capacity(n_steps + 200);
     mem.load_program(program);
@@ -135,6 +166,8 @@ pub fn cairo_prove(program: &[u64], n_steps: usize, log_n: u32) -> CairoProof {
     let trace_commitment = MerkleTree::commit_root_only(&d_eval_cols, log_eval_size);
 
     let mut channel = Channel::new();
+    // Bind public inputs into Fiat-Shamir transcript (compositional binding)
+    channel.mix_digest(&public_inputs.program_hash);
     channel.mix_digest(&trace_commitment);
 
     // ---- Phase 2: Fused LogUp interaction ----
@@ -259,7 +292,7 @@ pub fn cairo_prove(program: &[u64], n_steps: usize, log_n: u32) -> CairoProof {
 
     CairoProof {
         log_trace_size: log_n,
-        n_steps,
+        public_inputs,
         trace_commitment,
         interaction_commitment,
         quotient_commitment,
@@ -277,8 +310,17 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
     let log_eval_size = log_n + BLOWUP_BITS;
     let eval_size = 1usize << log_eval_size;
 
-    // ---- Replay Fiat-Shamir ----
+    // ---- Verify public inputs ----
+    if proof.public_inputs.n_steps == 0 {
+        return Err("Zero execution steps".into());
+    }
+    if proof.public_inputs.n_steps > (1 << log_n) {
+        return Err("More steps than trace size".into());
+    }
+
+    // ---- Replay Fiat-Shamir (must match prover exactly) ----
     let mut channel = Channel::new();
+    channel.mix_digest(&proof.public_inputs.program_hash);
     channel.mix_digest(&proof.trace_commitment);
 
     let _z_mem = channel.draw_felt();
@@ -394,10 +436,25 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
         }
     }
 
-    // ---- Verify Merkle auth paths ----
-    // TODO: add full Merkle auth path generation in prover, then enable these checks.
-    // For now, FRI fold equation verification provides algebraic soundness.
-    // Merkle path verification adds data integrity (will be added next).
+    // ---- Verify Merkle auth paths: quotient ----
+    verify_decommitment_auth_paths_soa4(
+        &proof.quotient_commitment,
+        &proof.quotient_decommitment,
+        &proof.query_indices,
+        "quotient",
+    )?;
+
+    // ---- Verify Merkle auth paths: FRI layers ----
+    let mut folded_indices: Vec<usize> = proof.query_indices.iter().map(|&qi| qi / 2).collect();
+    for (layer, (decom, commitment)) in proof.fri_decommitments.iter()
+        .zip(proof.fri_commitments.iter())
+        .enumerate()
+    {
+        verify_decommitment_auth_paths_soa4(
+            commitment, decom, &folded_indices, &format!("FRI layer {layer}"),
+        )?;
+        folded_indices = folded_indices.iter().map(|&i| i / 2).collect();
+    }
 
     Ok(())
 }
@@ -460,7 +517,7 @@ fn verify_decommitment_auth_paths_soa4(
 
 // ---- Decommitment helpers ----
 
-/// Decommit SoA4 values from host arrays at query indices.
+/// Decommit SoA4 values + Merkle auth paths from host arrays at query indices.
 fn decommit_from_host_soa4(
     host_cols: &[Vec<u32>],  // [4] columns
     indices: &[usize],
@@ -468,6 +525,13 @@ fn decommit_from_host_soa4(
     let n = host_cols[0].len();
     let mut values = Vec::with_capacity(indices.len());
     let mut sibling_values = Vec::with_capacity(indices.len());
+
+    // Collect queried + sibling indices for batch auth path generation
+    let mut all_indices: Vec<usize> = Vec::with_capacity(indices.len() * 2);
+    for &idx in indices {
+        all_indices.push(idx % n);
+        all_indices.push((idx ^ 1) % n);
+    }
 
     for &idx in indices {
         let sib = idx ^ 1;
@@ -481,16 +545,24 @@ fn decommit_from_host_soa4(
         ]);
     }
 
-    // Auth paths skipped for now (Merkle path check disabled in verifier for Cairo)
-    QueryDecommitment {
-        values,
-        sibling_values,
-        auth_paths: vec![Vec::new(); indices.len()],
-        sibling_auth_paths: vec![Vec::new(); indices.len()],
+    // Generate Merkle auth paths for both values and siblings
+    let cols4: [Vec<u32>; 4] = [
+        host_cols[0].clone(), host_cols[1].clone(),
+        host_cols[2].clone(), host_cols[3].clone(),
+    ];
+    let all_paths = MerkleTree::cpu_merkle_auth_paths_soa4(&cols4, &all_indices);
+
+    let mut auth_paths = Vec::with_capacity(indices.len());
+    let mut sibling_auth_paths = Vec::with_capacity(indices.len());
+    for i in 0..indices.len() {
+        auth_paths.push(all_paths[i * 2].clone());
+        sibling_auth_paths.push(all_paths[i * 2 + 1].clone());
     }
+
+    QueryDecommitment { values, sibling_values, auth_paths, sibling_auth_paths }
 }
 
-/// Decommit FRI layer values from GPU SecureColumn.
+/// Decommit FRI layer values + auth paths from GPU SecureColumn.
 fn decommit_fri_layer(
     eval: &SecureColumn,
     indices: &[usize],
@@ -523,6 +595,68 @@ mod tests {
         };
         for _ in 0..n.saturating_sub(2) {
             program.push(add_instr.encode());
+        }
+        program
+    }
+
+    /// Build a multiply-accumulate program: acc = acc * val + 1
+    /// Uses different instruction mix than Fibonacci (mul + add + immediate)
+    fn build_mul_acc_program(n: usize) -> Vec<u64> {
+        let mut program = Vec::new();
+
+        // Initialize: [ap] = 1 (accumulator), [ap+1] = 3 (multiplier)
+        let assert_imm = Instruction {
+            off0: 0x8000, off1: 0x8000, off2: 0x8001,
+            op1_imm: 1, opcode_assert: 1, ap_add1: 1,
+            ..Default::default()
+        };
+        program.push(assert_imm.encode());
+        program.push(1); // initial acc = 1
+        program.push(assert_imm.encode());
+        program.push(3); // multiplier = 3
+
+        // Main loop: [ap] = [ap-2] * [ap-1] (mul instruction)
+        let mul_instr = Instruction {
+            off0: 0x8000, off1: 0x8000u16 - 2, off2: 0x8000u16 - 1,
+            op1_ap: 1, res_mul: 1, opcode_assert: 1, ap_add1: 1,
+            ..Default::default()
+        };
+        for _ in 0..n.saturating_sub(2) {
+            program.push(mul_instr.encode());
+        }
+        program
+    }
+
+    /// Build a mixed-instruction program: alternates add and mul
+    fn build_mixed_program(n: usize) -> Vec<u64> {
+        let mut program = Vec::new();
+
+        let assert_imm = Instruction {
+            off0: 0x8000, off1: 0x8000, off2: 0x8001,
+            op1_imm: 1, opcode_assert: 1, ap_add1: 1,
+            ..Default::default()
+        };
+        program.push(assert_imm.encode());
+        program.push(7);
+        program.push(assert_imm.encode());
+        program.push(11);
+
+        let add_instr = Instruction {
+            off0: 0x8000, off1: 0x8000u16 - 2, off2: 0x8000u16 - 1,
+            op1_ap: 1, res_add: 1, opcode_assert: 1, ap_add1: 1,
+            ..Default::default()
+        };
+        let mul_instr = Instruction {
+            off0: 0x8000, off1: 0x8000u16 - 2, off2: 0x8000u16 - 1,
+            op1_ap: 1, res_mul: 1, opcode_assert: 1, ap_add1: 1,
+            ..Default::default()
+        };
+        for i in 0..n.saturating_sub(2) {
+            if i % 2 == 0 {
+                program.push(add_instr.encode());
+            } else {
+                program.push(mul_instr.encode());
+            }
         }
         program
     }
@@ -594,5 +728,53 @@ mod tests {
         proof.quotient_decommitment.values[0][0] ^= 1;
         let result = cairo_verify(&proof);
         assert!(result.is_err(), "Tampered quotient should fail");
+    }
+
+    // ---- Step 6: Non-Fibonacci programs ----
+
+    #[test]
+    fn test_cairo_prove_verify_mul_program() {
+        ffi::init_memory_pool();
+        let program = build_mul_acc_program(256);
+        let proof = cairo_prove(&program, 256, 8);
+        let result = cairo_verify(&proof);
+        assert!(result.is_ok(), "Mul-acc proof failed: {:?}", result);
+    }
+
+    #[test]
+    fn test_cairo_prove_verify_mixed_program() {
+        ffi::init_memory_pool();
+        let program = build_mixed_program(512);
+        let proof = cairo_prove(&program, 512, 9);
+        let result = cairo_verify(&proof);
+        assert!(result.is_ok(), "Mixed program proof failed: {:?}", result);
+    }
+
+    #[test]
+    fn test_cairo_public_inputs() {
+        ffi::init_memory_pool();
+        let program = build_fib_program(64);
+        let proof = cairo_prove(&program, 64, 6);
+
+        assert_eq!(proof.public_inputs.initial_pc, 0);
+        assert_eq!(proof.public_inputs.initial_ap, 100);
+        assert_eq!(proof.public_inputs.n_steps, 64);
+        assert_ne!(proof.public_inputs.program_hash, [0; 8]);
+
+        // Different program should produce different hash
+        let program2 = build_mul_acc_program(64);
+        let proof2 = cairo_prove(&program2, 64, 6);
+        assert_ne!(proof.public_inputs.program_hash, proof2.public_inputs.program_hash);
+    }
+
+    #[test]
+    fn test_cairo_tampered_program_hash() {
+        ffi::init_memory_pool();
+        let program = build_fib_program(64);
+        let mut proof = cairo_prove(&program, 64, 6);
+        proof.public_inputs.program_hash[0] ^= 1;
+        let result = cairo_verify(&proof);
+        // Tampered program hash changes Fiat-Shamir transcript → FRI mismatch
+        assert!(result.is_err(), "Tampered program hash should fail");
     }
 }
