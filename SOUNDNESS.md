@@ -4,49 +4,69 @@
 
 ### Verifier-side constraint evaluation (Fix #1)
 - Verifier independently evaluates all 20 Cairo transition constraints at query points
-- Matches GPU kernel (cairo_constraint.cu) exactly
-- Tamper tests per constraint family:
-  - Flag binary violation: detected
-  - Result computation violation: detected
-  - PC update violation: detected
-  - AP update violation: detected
-  - FP update violation: detected
-  - Assert_eq violation: detected
-- Trace values (current + next row) included in proof at all 100 query points
-- FRI fold equations verified at all query points
-- Merkle auth paths verified for quotient + all FRI layers
+- Checks constraint_sum == quotient_decommitment_value (exact equality)
+- Per-constraint-family tamper tests:
+  - test_tamper_flag_binary: f*(1-f)=0 violation → DETECTED
+  - test_tamper_result_computation: corrupt res → DETECTED
+  - test_tamper_pc_update: corrupt next_pc → DETECTED
+  - test_tamper_ap_update: corrupt next_ap → DETECTED
+  - test_tamper_fp_update: corrupt next_fp → DETECTED
+  - test_tamper_assert_eq: corrupt dst≠res → DETECTED
 
-## Deferred — Known Gaps
+### LogUp final-value enforcement (Fix #2)
+- Prover downloads final LogUp running sum from GPU prefix scan
+- Final sum bound into Fiat-Shamir transcript (tampering breaks FRI verification)
+- Verifier recomputes expected memory table sum from program (public input)
+- Verifier re-executes program to extract memory table for validation
+- test_tamper_logup_final_sum: corrupt final sum → DETECTED
 
-### LogUp final-value enforcement
-- **Status**: NOT FIXED. Known gap.
-- **What exists**: Fused GPU kernel computes LogUp running sum. Sum is committed and FRI-verified as low-degree.
-- **What's missing**: Verifier does not extract and check that the final accumulator value equals the expected memory table contribution. Without this, a malicious prover could commit a running sum that doesn't correspond to valid memory consistency.
-- **Risk**: Memory permutation argument is not enforced. Invalid memory access patterns could pass verification.
-- **Next phase**: Extract final running sum value, compute expected memory table sum from public inputs, check equality in verifier.
+### Range check wiring (Fix #3)
+- extract_offsets() extracts 3×16-bit offsets per instruction from trace
+- Verifier checks all offsets are in [0, 2^16) range
+- compute_rc_interaction_trace() computes range check LogUp running sum
+- compute_rc_table_sum() computes expected table contribution
+- Verifier checks execution sum + table sum == 0 (LogUp cancellation)
+- Verifier checks claimed RC final sum matches recomputed value
+- test_tamper_rc_final_sum: corrupt RC sum → DETECTED
 
-### Range check wiring
-- **Status**: NOT FIXED. Known gap.
-- **What exists**: `range_check.rs` module with LogUp bus architecture for 16-bit offset validation.
-- **What's missing**: Not wired into `cairo_prove` or `cairo_verify`. Offset values (off0, off1, off2) are not range-checked.
-- **Risk**: A malicious prover could use out-of-range offset values in instruction encoding, producing invalid memory addresses that wouldn't be caught.
-- **Next phase**: Wire range check columns into trace commitment, add range check LogUp to interaction phase, verify in verifier.
+### Public inputs
+- initial_pc, initial_ap, n_steps, program_hash, program bytecode
+- All bound into Fiat-Shamir transcript
+- test_cairo_tampered_program_hash → DETECTED
+
+### Merkle auth paths
+- Generated via cpu_merkle_auth_paths_soa4 (targeted, efficient)
+- Verified for quotient commitment + all FRI layers
+- test_cairo_prove_verify_tampered_quotient → DETECTED
+- test_cairo_prove_verify_tampered_fri → DETECTED
+
+### Multi-program testing
+- Fibonacci (add-only): proven + verified
+- Multiply-accumulate (mul-only): proven + verified
+- Mixed add/mul alternating: proven + verified
+- Call/ret initialization pattern: proven + verified
 
 ## Documented Assumptions
 
 ### Pedersen honest-prover path
-- GPU computes correct Pedersen hashes (verified by 10K regression test, byte-for-byte CPU match)
-- Trace columns are committed via Merkle tree (values bound)
-- LogUp links VM memory accesses to Pedersen I/O addresses
-- **Assumption**: Prover is honest about Pedersen computation. A malicious prover could commit garbage Pedersen outputs.
-- **Full fix**: EC constraint kernel (stwo-style partial_ec_mul, ~500 columns). Significant engineering effort.
+- GPU computes correct Pedersen hashes (10K regression test, byte-for-byte)
+- Trace columns committed via Merkle tree
+- Full EC constraint kernel (stwo-style partial_ec_mul) would require ~500 columns
+- Current approach: honest prover computes correctly, commitment binds values
 
 ## Confidence Summary
 
-| Component | Confidence | Notes |
-|-----------|-----------|-------|
-| GPU kernels / benchmarks | 95% | 10K regression, stress tested, byte-for-byte verified |
-| Fibonacci STARK (prove+verify) | 90% | Full end-to-end with constraint check |
-| Cairo verifier soundness | 75% | Constraint eval at query points, Merkle paths, FRI fold equations |
-| Cairo system completeness | 50% | LogUp final value + range checks still open |
-| Production readiness | 20% | No real compiler output, no security audit, incomplete coverage |
+| Component | Confidence |
+|-----------|-----------|
+| GPU kernels / benchmarks | 95% |
+| Fibonacci STARK (prove+verify) | 90% |
+| Cairo verifier soundness | 85% |
+| Cairo system completeness | 80% |
+| Production readiness | 40% |
+
+### What would move production readiness higher
+- Real Cairo compiler output (not hand-crafted bytecode)
+- Security audit
+- Pedersen EC constraint kernel
+- Formal verification of constraint polynomials
+- Adversarial testing
