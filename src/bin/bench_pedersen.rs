@@ -199,6 +199,74 @@ fn main() {
             rate, if ok { "✓" } else { "MISMATCH!" });
     }
 
+    // === Pipeline timing breakdown ===
+    println!("\n--- Pipeline Timing Breakdown ---");
+    for n in [10000, 100000, 1000000] {
+        let inputs_a: Vec<Fp> = (0..n).map(|i| Fp::from_u64(i as u64 + 1)).collect();
+        let inputs_b: Vec<Fp> = (0..n).map(|i| Fp::from_u64(i as u64 + 1000)).collect();
+
+        // Warmup
+        let _ = pedersen::gpu_hash_batch(&inputs_a, &inputs_b);
+
+        // Timed run
+        let (_, t) = pedersen::gpu_hash_batch_timed(&inputs_a, &inputs_b);
+        let total_ms = t.total_us / 1000.0;
+        let rate = n as f64 / (total_ms / 1000.0);
+
+        println!("\n  Batch: {n} hashes ({rate:.0} hash/sec, {total_ms:.1}ms total)");
+        println!("  ┌─────────────────────┬──────────┬────────┐");
+        println!("  │ Phase               │ Time     │ % Tot  │");
+        println!("  ├─────────────────────┼──────────┼────────┤");
+        let phases: [(&str, f64); 7] = [
+            ("Flatten inputs",  t.flatten_us),
+            ("H2D upload",      t.upload_us),
+            ("Alloc output",    t.alloc_us),
+            ("GPU kernel+sync", t.kernel_us),
+            ("D2H download",    t.download_us),
+            ("Repack Fp vecs",  t.repack_us),
+            ("CPU batch inv",   t.inverse_us),
+        ];
+        for (name, us) in &phases {
+            let pct = us / t.total_us * 100.0;
+            let bar = "█".repeat((pct / 2.5) as usize);
+            if *us > 1000.0 {
+                println!("  │ {:<19} │ {:>5.1}ms  │ {:>5.1}% │ {bar}", name, us / 1000.0, pct);
+            } else {
+                println!("  │ {:<19} │ {:>5.0}us  │ {:>5.1}% │ {bar}", name, us, pct);
+            }
+        }
+        println!("  └─────────────────────┴──────────┴────────┘");
+
+        // Overhead = total - (kernel + inverse)
+        let compute_us = t.kernel_us + t.inverse_us;
+        let overhead_us = t.total_us - compute_us;
+        println!("  Compute (kernel+inv): {:.1}ms ({:.1}%)",
+            compute_us / 1000.0, compute_us / t.total_us * 100.0);
+        println!("  Overhead (rest):      {:.1}ms ({:.1}%)",
+            overhead_us / 1000.0, overhead_us / t.total_us * 100.0);
+    }
+    println!();
+
+    // === Pedersen-as-stage benchmark (fused GPU trace columns) ===
+    println!("--- Pedersen-as-Stage (GPU trace columns, no host round-trip) ---");
+    for (n, log_n) in [(10000u64, 14u32), (100000, 17), (1000000, 20)] {
+        let inputs_a: Vec<Fp> = (0..n as usize).map(|i| Fp::from_u64(i as u64 + 1)).collect();
+        let inputs_b: Vec<Fp> = (0..n as usize).map(|i| Fp::from_u64(i as u64 + 1000)).collect();
+
+        // Warmup
+        let _ = pedersen::gpu_pedersen_trace(&inputs_a, &inputs_b, log_n);
+
+        let t0 = Instant::now();
+        let d_cols = pedersen::gpu_pedersen_trace(&inputs_a, &inputs_b, log_n);
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let rate = n as f64 / (ms / 1000.0);
+        let trace_rows = 1u64 << log_n;
+
+        println!("  {n:>7} hashes → {trace_rows:>8} trace rows (27 cols): {ms:>6.1}ms ({rate:.0} hash/sec)");
+        println!("         GPU columns ready for NTT — zero host transfer");
+    }
+    println!();
+
     // Debug: show first hash values
     let a0 = Fp::from_u64(1);
     let b0 = Fp::from_u64(1000);

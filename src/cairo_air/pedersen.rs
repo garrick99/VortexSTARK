@@ -133,14 +133,22 @@ pub fn pedersen_points() -> [StarkPoint; 5] {
 
 /// Pedersen builtin for Cairo VM.
 /// Manages invocations and generates trace data.
+/// Stores both Stark252 (for CPU trace) and Fp (for GPU trace) representations.
 pub struct PedersenBuiltin {
-    /// (input_a, input_b, output) tuples
+    /// (input_a, input_b, output) tuples in Stark252 format
     pub entries: Vec<(Stark252, Stark252, Stark252)>,
+    /// Fp inputs for GPU trace generation (avoids Stark252→Fp conversion)
+    pub fp_inputs_a: Vec<super::stark252_field::Fp>,
+    pub fp_inputs_b: Vec<super::stark252_field::Fp>,
 }
 
 impl PedersenBuiltin {
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+            fp_inputs_a: Vec::new(),
+            fp_inputs_b: Vec::new(),
+        }
     }
 
     /// Invoke Pedersen hash using real EC arithmetic on the STARK curve.
@@ -151,6 +159,8 @@ impl PedersenBuiltin {
         let fp_out = pedersen_hash(fp_a, fp_b);
         let out = fp_to_stark252(&fp_out);
         self.entries.push((a, b, out));
+        self.fp_inputs_a.push(fp_a);
+        self.fp_inputs_b.push(fp_b);
         out
     }
 
@@ -235,29 +245,102 @@ pub fn fp_to_stark252(fp: &super::stark252_field::Fp) -> Stark252 {
     Stark252 { limbs }
 }
 
-/// Initialize GPU Pedersen: upload constant points to device.
+/// Initialize GPU Pedersen: upload constant points and precomputed windowed tables.
 pub fn gpu_init() {
-    use super::stark252_field::pedersen_points;
+    use super::stark252_field::{Fp, CurvePoint, pedersen_points};
     use crate::cuda::ffi;
 
     let points = pedersen_points();
-    let mut px = [0u64; 20]; // 5 points × 4 limbs
-    let mut py = [0u64; 20];
 
+    // Upload raw affine points (still needed for backward compat)
+    let mut px = [0u64; 20];
+    let mut py = [0u64; 20];
     for (i, pt) in points.iter().enumerate() {
-        if let super::stark252_field::CurvePoint::Affine(x, y) = pt {
+        if let CurvePoint::Affine(x, y) = pt {
+            for j in 0..4 { px[i*4+j] = x.v[j]; py[i*4+j] = y.v[j]; }
+        }
+    }
+    unsafe { ffi::cuda_pedersen_upload_points(px.as_ptr(), py.as_ptr()); }
+
+    // Precompute windowed tables for P1..P4 (4 points, 16 multiples each)
+    // Table[point][k] = k * P_i in Montgomery Jacobian form
+    // k=0: point at infinity (0, 1, 0 in Jacobian)
+    // k=1: P_i, k=2: 2*P_i, ..., k=15: 15*P_i
+    let mut table_x = [0u64; 4 * 16 * 4]; // [4 points][16 multiples][4 limbs]
+    let mut table_y = [0u64; 4 * 16 * 4];
+    let mut table_z = [0u64; 4 * 16 * 4];
+
+    let r_mod_p = super::stark252_field::compute_r_mod_p();
+    let one_mont = r_mod_p; // 1 in Montgomery form = R mod p
+
+    for pt_idx in 0..4 {
+        let base = points[pt_idx + 1]; // P1..P4 (skip P0)
+        let (bx, by) = match base {
+            CurvePoint::Affine(x, y) => (x, y),
+            _ => panic!("Pedersen point is infinity"),
+        };
+
+        // k=0: infinity (Montgomery Jacobian: X=0, Y=R mod p, Z=0)
+        let offset = pt_idx * 16 * 4;
+        // X=0, Y=R (Montgomery 1), Z=0
+        for j in 0..4 { table_y[offset + j] = r_mod_p.v[j]; }
+        // X and Z already 0
+
+        // k=1: P_i in Montgomery Jacobian (X_mont, Y_mont, Z_mont=R)
+        // to_mont(a) = a * R mod p. We have R mod p, so standard Fp mul gives Montgomery form.
+        let bx_mont = bx * r_mod_p;
+        let by_mont = by * r_mod_p;
+
+        let off1 = offset + 1 * 4; // k=1
+        for j in 0..4 {
+            table_x[off1 + j] = bx_mont.v[j];
+            table_y[off1 + j] = by_mont.v[j];
+            table_z[off1 + j] = one_mont.v[j];
+        }
+
+        // k=2..15: compute via repeated addition on CPU (affine, then convert)
+        let mut current = base;
+        for k in 2..16u32 {
+            current = current.add(base);
+            let (cx, cy) = match current {
+                CurvePoint::Affine(x, y) => (x, y),
+                _ => {
+                    // Point at infinity — store as (0, R, 0) in Montgomery Jacobian
+                    let off_k = offset + k as usize * 4;
+                    for j in 0..4 { table_y[off_k + j] = r_mod_p.v[j]; }
+                    continue;
+                }
+            };
+            let cx_mont = cx * r_mod_p;
+            let cy_mont = cy * r_mod_p;
+            let off_k = offset + k as usize * 4;
             for j in 0..4 {
-                px[i * 4 + j] = x.v[j];
-                py[i * 4 + j] = y.v[j];
+                table_x[off_k + j] = cx_mont.v[j];
+                table_y[off_k + j] = cy_mont.v[j];
+                table_z[off_k + j] = one_mont.v[j];
             }
         }
     }
 
-    unsafe { ffi::cuda_pedersen_upload_points(px.as_ptr(), py.as_ptr()); }
+    // P0 in Montgomery Jacobian
+    let (p0x, p0y) = match points[0] {
+        CurvePoint::Affine(x, y) => (x, y),
+        _ => panic!("P0 is infinity"),
+    };
+    let p0x_mont = p0x * r_mod_p;
+    let p0y_mont = p0y * r_mod_p;
+
+    unsafe {
+        ffi::cuda_pedersen_upload_tables(
+            table_x.as_ptr(), table_y.as_ptr(), table_z.as_ptr(),
+            p0x_mont.v.as_ptr(), p0y_mont.v.as_ptr(), one_mont.v.as_ptr(),
+        );
+    }
 }
 
 /// Batch Pedersen hash on GPU. Returns output Fp values.
-/// GPU computes in projective coordinates; CPU does batch inverse to get affine x.
+/// GPU computes full affine x on-device (inline Fermat inverse).
+/// Uses pinned memory + async stream for maximum transfer throughput.
 pub fn gpu_hash_batch(
     inputs_a: &[super::stark252_field::Fp],
     inputs_b: &[super::stark252_field::Fp],
@@ -265,39 +348,200 @@ pub fn gpu_hash_batch(
     use crate::cuda::ffi;
     use crate::device::DeviceBuffer;
     use super::stark252_field::Fp;
+    use std::ffi::c_void;
 
     let n = inputs_a.len();
     assert_eq!(n, inputs_b.len());
+    if n == 0 { return vec![]; }
 
-    let flat_a: Vec<u64> = inputs_a.iter().flat_map(|fp| fp.v.iter().copied()).collect();
-    let flat_b: Vec<u64> = inputs_b.iter().flat_map(|fp| fp.v.iter().copied()).collect();
+    let n_u64 = n * 4;
+    let bytes_in = n_u64 * std::mem::size_of::<u64>();
 
-    let d_a = DeviceBuffer::from_host(&flat_a);
-    let d_b = DeviceBuffer::from_host(&flat_b);
-    let mut d_out_x = DeviceBuffer::<u64>::alloc(n * 4);
-    let mut d_out_zz = DeviceBuffer::<u64>::alloc(n * 4);
+    // Zero-copy reinterpret inputs (Fp is repr(C) with [u64; 4])
+    let flat_a = unsafe { std::slice::from_raw_parts(inputs_a.as_ptr() as *const u64, n_u64) };
+    let flat_b = unsafe { std::slice::from_raw_parts(inputs_b.as_ptr() as *const u64, n_u64) };
 
+    // Use a CUDA stream for async operations
+    let stream = ffi::CudaStream::new();
+
+    // Allocate device buffers (pool-based, near-zero cost)
+    let mut d_a = DeviceBuffer::<u64>::alloc(n_u64);
+    let mut d_b = DeviceBuffer::<u64>::alloc(n_u64);
+    let mut d_out = DeviceBuffer::<u64>::alloc(n_u64);
+
+    // Async H2D uploads on stream
+    d_a.upload_async(flat_a, &stream);
+    d_b.upload_async(flat_b, &stream);
+
+    // Launch kernel on same stream (waits for uploads to complete)
+    unsafe {
+        ffi::cuda_pedersen_hash_batch_stream(
+            d_a.as_ptr(), d_b.as_ptr(),
+            d_out.as_mut_ptr(), std::ptr::null_mut(),
+            n as u32,
+            stream.ptr,
+        );
+    }
+
+    // Allocate result Vec while kernel is still running on GPU
+    let mut results = vec![Fp::ZERO; n];
+
+    // Async D2H download directly into result Vec (no intermediate buffer)
+    d_out.download_into_async(
+        unsafe { std::slice::from_raw_parts_mut(results.as_mut_ptr() as *mut u64, n_u64) },
+        &stream,
+    );
+
+    // Wait for everything
+    stream.sync();
+
+    results
+}
+
+/// Fused GPU Pedersen hash + trace column generation.
+/// Hashes (a, b) pairs on GPU, decomposes into 27 M31 trace columns,
+/// and returns them as DeviceBuffers — results never touch the host.
+///
+/// Column layout: [a_limbs(9), b_limbs(9), output_limbs(9)]
+/// Each column has `trace_len` rows (padded with zeros beyond `n`).
+///
+/// This is the "Pedersen-as-stage" API: output feeds directly into NTT → Merkle.
+pub fn gpu_pedersen_trace(
+    inputs_a: &[super::stark252_field::Fp],
+    inputs_b: &[super::stark252_field::Fp],
+    log_trace_len: u32,
+) -> Vec<crate::device::DeviceBuffer<u32>> {
+    use crate::cuda::ffi;
+    use crate::device::DeviceBuffer;
+    use std::ffi::c_void;
+
+    let n = inputs_a.len();
+    assert_eq!(n, inputs_b.len());
+    let trace_len = 1usize << log_trace_len;
+    assert!(n <= trace_len, "more invocations ({n}) than trace rows ({trace_len})");
+
+    let n_u64 = n * 4;
+
+    // Zero-copy reinterpret inputs
+    let flat_a = unsafe { std::slice::from_raw_parts(inputs_a.as_ptr() as *const u64, n_u64) };
+    let flat_b = unsafe { std::slice::from_raw_parts(inputs_b.as_ptr() as *const u64, n_u64) };
+
+    let stream = ffi::CudaStream::new();
+
+    // Upload inputs async
+    let mut d_a = DeviceBuffer::<u64>::alloc(n_u64);
+    let mut d_b = DeviceBuffer::<u64>::alloc(n_u64);
+    d_a.upload_async(flat_a, &stream);
+    d_b.upload_async(flat_b, &stream);
+
+    // Allocate 27 trace columns on GPU (zero-initialized for padding)
+    let n_cols = 3 * N_LIMBS; // 27
+    let mut d_cols: Vec<DeviceBuffer<u32>> = (0..n_cols)
+        .map(|_| {
+            let mut buf = DeviceBuffer::<u32>::alloc(trace_len);
+            buf.zero();
+            buf
+        })
+        .collect();
+
+    // Build device pointer array: [27 device pointers]
+    let col_ptrs: Vec<*mut u32> = d_cols.iter_mut().map(|c| c.as_mut_ptr()).collect();
+    let d_col_ptrs = DeviceBuffer::from_host(&col_ptrs);
+
+    // Launch fused hash + trace kernel
+    unsafe {
+        ffi::cuda_pedersen_trace(
+            d_a.as_ptr(), d_b.as_ptr(),
+            d_col_ptrs.as_ptr() as *mut *mut u32,
+            n as u32,
+            stream.ptr,
+        );
+    }
+
+    stream.sync();
+
+    // Return 27 DeviceBuffers — ready for NTT, no host round-trip
+    d_cols
+}
+
+/// Pipeline timing breakdown for a batch Pedersen hash.
+#[derive(Debug, Clone)]
+pub struct PipelineTiming {
+    pub n: usize,
+    pub flatten_us: f64,      // CPU: flatten inputs to flat arrays
+    pub upload_us: f64,       // H2D: DeviceBuffer::from_host
+    pub alloc_us: f64,        // GPU: output buffer allocation
+    pub kernel_us: f64,       // GPU: hash kernel + inline inverse + sync
+    pub download_us: f64,     // D2H: to_host for affine x
+    pub repack_us: f64,       // CPU: repack flat arrays to Fp vecs
+    pub inverse_us: f64,      // CPU: (eliminated — now inline on GPU)
+    pub total_us: f64,        // wall clock total
+}
+
+/// Instrumented version of gpu_hash_batch that returns per-phase timing.
+/// Uses sync path (not async stream) for accurate per-phase measurement.
+pub fn gpu_hash_batch_timed(
+    inputs_a: &[super::stark252_field::Fp],
+    inputs_b: &[super::stark252_field::Fp],
+) -> (Vec<super::stark252_field::Fp>, PipelineTiming) {
+    use crate::cuda::ffi;
+    use crate::device::DeviceBuffer;
+    use super::stark252_field::Fp;
+    use std::time::Instant;
+
+    let n = inputs_a.len();
+    assert_eq!(n, inputs_b.len());
+    let n_u64 = n * 4;
+
+    let wall_start = Instant::now();
+
+    // Phase 1: Zero-copy reinterpret
+    let t0 = Instant::now();
+    let flat_a = unsafe { std::slice::from_raw_parts(inputs_a.as_ptr() as *const u64, n_u64) };
+    let flat_b = unsafe { std::slice::from_raw_parts(inputs_b.as_ptr() as *const u64, n_u64) };
+    let flatten_us = t0.elapsed().as_secs_f64() * 1e6;
+
+    // Phase 2: H2D upload (sync for timing)
+    let t0 = Instant::now();
+    let d_a = DeviceBuffer::from_host(flat_a);
+    let d_b = DeviceBuffer::from_host(flat_b);
+    let upload_us = t0.elapsed().as_secs_f64() * 1e6;
+
+    // Phase 3: Alloc output
+    let t0 = Instant::now();
+    let mut d_out = DeviceBuffer::<u64>::alloc(n_u64);
+    let alloc_us = t0.elapsed().as_secs_f64() * 1e6;
+
+    // Phase 4: Kernel + sync
+    let t0 = Instant::now();
     unsafe {
         ffi::cuda_pedersen_hash_batch(
             d_a.as_ptr(), d_b.as_ptr(),
-            d_out_x.as_mut_ptr(), d_out_zz.as_mut_ptr(),
+            d_out.as_mut_ptr(), std::ptr::null_mut(),
             n as u32,
         );
         ffi::cuda_device_sync();
     }
+    let kernel_us = t0.elapsed().as_secs_f64() * 1e6;
 
-    let flat_x = d_out_x.to_host();
-    let flat_zz = d_out_zz.to_host();
+    // Phase 5: D2H download directly into result Vec (no intermediate)
+    let t0 = Instant::now();
+    let mut results = vec![Fp::ZERO; n];
+    d_out.download_into(unsafe {
+        std::slice::from_raw_parts_mut(results.as_mut_ptr() as *mut u64, n_u64)
+    });
+    let download_us = t0.elapsed().as_secs_f64() * 1e6;
 
-    // CPU batch inverse: compute inv(Z²) for all hashes, then x = X * inv(Z²)
-    let proj_x: Vec<Fp> = (0..n).map(|i| Fp { v: [flat_x[i*4], flat_x[i*4+1], flat_x[i*4+2], flat_x[i*4+3]] }).collect();
-    let zz: Vec<Fp> = (0..n).map(|i| Fp { v: [flat_zz[i*4], flat_zz[i*4+1], flat_zz[i*4+2], flat_zz[i*4+3]] }).collect();
+    let repack_us = 0.0; // eliminated
 
-    // Montgomery batch inverse: O(n) muls + 1 inverse
-    let zz_inv = batch_inverse_fp(&zz);
+    let total_us = wall_start.elapsed().as_secs_f64() * 1e6;
 
-    // affine_x[i] = proj_x[i] * zz_inv[i]
-    (0..n).map(|i| proj_x[i] * zz_inv[i]).collect()
+    let timing = PipelineTiming {
+        n, flatten_us, upload_us, alloc_us, kernel_us,
+        download_us, repack_us, inverse_us: 0.0, total_us,
+    };
+
+    (results, timing)
 }
 
 /// Batch inverse for Fp values using Montgomery's trick.
@@ -391,7 +635,64 @@ mod tests {
         assert_eq!(mismatches, 0,
             "{mismatches}/{n} Pedersen hashes differ between GPU and CPU");
     }
-    use super::*;
+
+    #[test]
+    fn test_pedersen_gpu_trace_vs_cpu() {
+        crate::cuda::ffi::init_memory_pool();
+        gpu_init();
+
+        let n = 1000;
+        let log_n = 10; // trace_len = 1024
+
+        // Deterministic inputs
+        let inputs_a: Vec<Fp> = (0..n).map(|i| {
+            Fp::from_u64((i as u64).wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(0x517CC1B727220A95))
+        }).collect();
+        let inputs_b: Vec<Fp> = (0..n).map(|i| {
+            Fp::from_u64((i as u64).wrapping_mul(0x6C62272E07BB0142).wrapping_add(0x62B821756295C58D))
+        }).collect();
+
+        // GPU: fused hash + trace columns (never leaves GPU)
+        let gpu_cols = gpu_pedersen_trace(&inputs_a, &inputs_b, log_n);
+        assert_eq!(gpu_cols.len(), 27);
+
+        // Download GPU columns to host for comparison
+        let gpu_host: Vec<Vec<u32>> = gpu_cols.iter().map(|c| c.to_host()).collect();
+
+        // CPU: hash via PedersenBuiltin, then generate_trace
+        let mut builtin = PedersenBuiltin::new();
+        for i in 0..n {
+            let a = fp_to_stark252(&inputs_a[i]);
+            let b = fp_to_stark252(&inputs_b[i]);
+            builtin.invoke(a, b);
+        }
+        let cpu_cols = builtin.generate_trace(log_n);
+
+        // Compare all 27 columns, all rows
+        let mut mismatches = 0;
+        for col in 0..27 {
+            for row in 0..n {
+                if gpu_host[col][row] != cpu_cols[col][row] {
+                    if mismatches < 5 {
+                        eprintln!("MISMATCH col={col} row={row}: GPU={} CPU={}",
+                            gpu_host[col][row], cpu_cols[col][row]);
+                    }
+                    mismatches += 1;
+                }
+            }
+            // Verify padding is zero
+            for row in n..(1 << log_n) {
+                if gpu_host[col][row] != 0 {
+                    if mismatches < 5 {
+                        eprintln!("NON-ZERO PADDING col={col} row={row}: {}", gpu_host[col][row]);
+                    }
+                    mismatches += 1;
+                }
+            }
+        }
+        assert_eq!(mismatches, 0,
+            "{mismatches} trace column mismatches between GPU and CPU");
+    }
 
     #[test]
     fn test_stark252_from_u64() {

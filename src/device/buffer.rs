@@ -146,6 +146,41 @@ impl<T> DeviceBuffer<T> {
         }
     }
 
+    /// Download GPU buffer directly into a caller-provided slice (no allocation).
+    pub fn download_into(&self, dst: &mut [T]) {
+        assert!(dst.len() >= self.len, "dst too small: {} < {}", dst.len(), self.len);
+        if self.len > 0 {
+            let bytes = self.len * std::mem::size_of::<T>();
+            let err = unsafe {
+                ffi::cudaMemcpy(
+                    dst.as_mut_ptr() as *mut c_void,
+                    self.ptr as *const c_void,
+                    bytes,
+                    ffi::MEMCPY_D2H,
+                )
+            };
+            assert!(err == 0, "cudaMemcpy D2H (into) failed: error {err}");
+        }
+    }
+
+    /// Async download into caller-provided buffer on a stream.
+    pub fn download_into_async(&self, dst: &mut [T], stream: &crate::cuda::ffi::CudaStream) {
+        assert!(dst.len() >= self.len);
+        if self.len > 0 {
+            let bytes = self.len * std::mem::size_of::<T>();
+            let err = unsafe {
+                ffi::cudaMemcpyAsync(
+                    dst.as_mut_ptr() as *mut c_void,
+                    self.ptr as *const c_void,
+                    bytes,
+                    ffi::MEMCPY_D2H,
+                    stream.ptr,
+                )
+            };
+            assert!(err == 0, "cudaMemcpyAsync D2H failed: {err}");
+        }
+    }
+
     /// Zero-fill the buffer.
     pub fn zero(&mut self) {
         if self.len > 0 {
@@ -186,6 +221,67 @@ impl<T> DeviceBuffer<T> {
             assert!(err == 0, "cudaMemcpy D2D failed: error {err}");
         }
         new_buf
+    }
+}
+
+/// Page-locked (pinned) host memory buffer.
+/// Enables DMA transfers (faster H2D/D2H) and is required for async memcpy.
+/// Reusable across calls to avoid per-batch allocation overhead.
+pub struct PinnedBuffer<T> {
+    ptr: *mut T,
+    len: usize,
+    _marker: PhantomData<T>,
+}
+
+unsafe impl<T: Send> Send for PinnedBuffer<T> {}
+
+impl<T> PinnedBuffer<T> {
+    /// Allocate `len` elements of pinned host memory.
+    pub fn alloc(len: usize) -> Self {
+        if len == 0 {
+            return Self { ptr: std::ptr::null_mut(), len: 0, _marker: PhantomData };
+        }
+        let bytes = len * std::mem::size_of::<T>();
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        let err = unsafe { ffi::cudaMallocHost(&mut ptr, bytes) };
+        assert!(err == 0, "cudaMallocHost failed: {err}");
+        Self { ptr: ptr as *mut T, len, _marker: PhantomData }
+    }
+
+    /// Grow if needed (realloc).
+    pub fn ensure_capacity(&mut self, needed: usize) {
+        if self.len >= needed { return; }
+        // Free old
+        if !self.ptr.is_null() {
+            unsafe { ffi::cudaFreeHost(self.ptr as *mut c_void) };
+        }
+        let bytes = needed * std::mem::size_of::<T>();
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        let err = unsafe { ffi::cudaMallocHost(&mut ptr, bytes) };
+        assert!(err == 0, "cudaMallocHost failed: {err}");
+        self.ptr = ptr as *mut T;
+        self.len = needed;
+    }
+
+    pub fn as_ptr(&self) -> *const T { self.ptr }
+    pub fn as_mut_ptr(&mut self) -> *mut T { self.ptr }
+
+    pub fn as_slice(&self, len: usize) -> &[T] {
+        assert!(len <= self.len);
+        unsafe { std::slice::from_raw_parts(self.ptr, len) }
+    }
+
+    pub fn as_mut_slice(&mut self, len: usize) -> &mut [T] {
+        assert!(len <= self.len);
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, len) }
+    }
+}
+
+impl<T> Drop for PinnedBuffer<T> {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { ffi::cudaFreeHost(self.ptr as *mut c_void) };
+        }
     }
 }
 

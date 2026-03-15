@@ -1,5 +1,233 @@
 # kraken-stark Benchmark Artifact
 
+## CHECKPOINT: Pedersen-37M-Async (2026-03-14)
+
+### Commit
+```
+4723bcd (dirty — uncommitted async stream + direct download + pinned memory)
+```
+
+### Hardware / Toolkit
+```
+GPU:          NVIDIA GeForce RTX 5090 (32 GB GDDR7, SM 12.0 Blackwell)
+Driver:       595.79
+CUDA:         13.0 (Build cuda_13.0.r13.0/compiler.36424714_0)
+Rust:         1.94 (stable)
+nvcc flags:   -O3 -gencode arch=compute_89,code=sm_89 -gencode arch=compute_120,code=sm_120
+CPU:          Intel Core Ultra 9 285K (24C/24T)
+RAM:          64 GB DDR5
+Power cap:    450W (max 600W)
+OS:           Windows 11
+```
+
+### Pedersen Hash — 37.7M/sec (async stream, zero-alloc pipeline)
+```
+Architecture
+────────────────────────────────────────────────────────────────
+Scalar mul:     Windowed 4-bit fixed-base (62 windows per 248-bit scalar)
+EC addition:    Mixed affine-Jacobian (11 fp_mont_mul, table Z=R)
+EC doubling:    a=1 optimized (9 fp_mont_mul, skip identity mul)
+Affine output:  Inline Fermat inverse on GPU (a^(p-2), 444 fp_mont_mul)
+Data path:      Zero-copy reinterpret (Fp is repr(C), no flatten/repack)
+Transfer:       Async CUDA stream (H2D + kernel + D2H pipelined)
+Download:       Direct into result Vec (no intermediate to_host() alloc)
+Tables:         L1-cached __device__ global memory (18KB)
+Block size:     128 threads/block
+Stack:          65536 bytes (cudaDeviceSetLimit)
+
+Batch Benchmark
+────────────────────────────────────────────────────────────────
+Command: cargo run --release --bin bench_pedersen
+
+Batch       Time        Throughput       Verified
+1,000       0.5ms       1,957,330/sec    ✓
+10,000      0.6ms       15,489,467/sec   ✓
+100,000     2.6ms       38,248,231/sec   ✓
+1,000,000   26.5ms      37,724,318/sec   ✓
+
+Pipeline Timing (1M batch, sync instrumented path)
+────────────────────────────────────────────────────────────────
+Phase                Time      % Total
+Flatten (zero-copy)    0.0ms     0.0%
+H2D upload             4.6ms    13.6%
+Alloc output           0.0ms     0.0%
+GPU kernel+sync       18.1ms    53.1%   ← hash + Fermat inverse
+D2H download          11.3ms    33.2%   ← async path overlaps w/ alloc
+Repack                 0.0ms     0.0%   ← eliminated (direct download)
+CPU batch inv          0.0ms     0.0%   ← eliminated (inline on GPU)
+────────────────────────────────────────────────────────────────
+Total                 34.0ms
+
+Optimization History (this session)
+────────────────────────────────────────────────────────────────
+Stage                                 Throughput    vs Baseline
+Baseline (Montgomery, bit-by-bit)      220,488/s      1x
++ Windowed 4-bit + mixed affine        234,328/s      1.06x
++ Parallel CPU batch inverse         2,762,143/s     12.5x
++ Inline Fermat inverse on GPU       12,915,858/s     58.6x
++ Zero-copy flatten/repack           22,964,169/s    104x
++ Kill to_host() + async stream      37,724,318/s    171x
+```
+- Correctness: byte-for-byte match against CPU (10K random vector regression, zero mismatches)
+- GPU speedup vs CPU (61 hash/sec): 618,431x
+- Remaining wall time: 53% GPU kernel (IMAD-bound), 47% PCIe bus
+- The bus is the enemy. The hard part is done.
+
+---
+
+## CHECKPOINT: Pedersen-23M (2026-03-14)
+
+### Commit
+```
+4723bcd (dirty — uncommitted inline Fermat inverse + zero-copy)
+```
+
+### Hardware / Toolkit
+```
+GPU:          NVIDIA GeForce RTX 5090 (32 GB GDDR7, SM 12.0 Blackwell)
+Driver:       595.79
+CUDA:         13.0 (Build cuda_13.0.r13.0/compiler.36424714_0)
+Rust:         1.94 (stable)
+nvcc flags:   -O3 -gencode arch=compute_89,code=sm_89 -gencode arch=compute_120,code=sm_120
+CPU:          Intel Core Ultra 9 285K (24C/24T)
+RAM:          64 GB DDR5
+Power cap:    450W (max 600W)
+OS:           Windows 11
+```
+
+### Pedersen Hash — 23M/sec (GPU-native affine output)
+```
+Architecture
+────────────────────────────────────────────────────────────────
+Scalar mul:     Windowed 4-bit fixed-base (62 windows per 248-bit scalar)
+EC addition:    Mixed affine-Jacobian (11 fp_mont_mul, table Z=R)
+EC doubling:    a=1 optimized (9 fp_mont_mul, skip identity mul)
+Affine output:  Inline Fermat inverse on GPU (a^(p-2), 444 fp_mont_mul)
+Data path:      Zero-copy reinterpret (Fp is repr(C), no flatten/repack)
+Tables:         L1-cached __device__ global memory (18KB)
+Block size:     128 threads/block
+Stack:          65536 bytes (cudaDeviceSetLimit)
+
+Batch Benchmark
+────────────────────────────────────────────────────────────────
+Command: cargo run --release --bin bench_pedersen
+
+Batch       Time        Throughput       Verified
+1,000       0.5ms       1,960,784/sec    ✓
+10,000      0.8ms       12,118,274/sec   ✓
+100,000     4.3ms       23,176,045/sec   ✓
+1,000,000   43.5ms      22,964,169/sec   ✓
+
+Pipeline Timing (1M batch, 25.6M hash/sec timed run)
+────────────────────────────────────────────────────────────────
+Phase                Time      % Total
+Flatten (zero-copy)    0.0ms     0.0%
+H2D upload             4.4ms    11.2%
+Alloc output           0.0ms     0.0%
+GPU kernel+sync       18.1ms    46.2%   ← hash + Fermat inverse
+D2H download           7.0ms    17.9%
+Repack (memcpy)        9.6ms    24.6%   ← next target: kill to_host() alloc
+CPU batch inv          0.0ms     0.0%   ← eliminated (was 283ms / 81.6%)
+────────────────────────────────────────────────────────────────
+Total                 39.1ms
+
+Optimization History
+────────────────────────────────────────────────────────────────
+Stage                                Throughput    Multiplier
+Baseline (Montgomery, bit-by-bit)    220,488/s     1x
++ Windowed 4-bit + mixed affine      234,328/s     1.06x
++ Parallel CPU batch inverse        2,762,143/s    12.5x
++ Inline Fermat inverse on GPU     12,915,858/s    58.6x
++ Zero-copy flatten/repack         22,964,169/s    104x
+```
+- Correctness: byte-for-byte match against CPU (10K random vector regression, zero mismatches)
+- GPU speedup vs CPU (61 hash/sec): 376,462x
+- GPU power during sustained load: 51-61W (13.3% of 450W cap), 40-58°C, zero throttle events
+
+---
+
+## Frozen Milestone: 2026-03-14
+
+### Commit
+```
+N/A (pre-push)
+```
+
+### Hardware
+```
+GPU:          NVIDIA GeForce RTX 5090
+VRAM:         32 GB GDDR7
+SM:           12.0 (Blackwell)
+Driver:       595.79
+Power limit:  450W (capped, max 600W)
+CPU:          Intel Core Ultra 9 285K (24C/24T)
+RAM:          64 GB DDR5
+OS:           Windows 11
+Ambient:      ~22°C (home office)
+```
+
+### Toolkit
+```
+CUDA:         13.0 (Build cuda_13.0.r13.0/compiler.36424714_0)
+Rust:         1.94 (stable)
+nvcc flags:   -O3 -gencode arch=compute_89,code=sm_89 -gencode arch=compute_120,code=sm_120
+```
+
+### Pedersen Hash (GPU, Montgomery EC, Windowed 4-bit Scalar Mul)
+```
+Config
+──────
+Block size:       128 threads/block
+Batch size:       100,000 hashes
+CPU inverse:      Parallel chunked (all cores, std::thread::scope)
+Tables:           L1-cached __device__ global memory (18KB)
+EC addition:      Mixed affine-Jacobian (11 fp_mont_mul vs 16 standard)
+Doubling:         a=1 optimized (9 fp_mont_mul, skip identity mul)
+Stack:            65536 bytes (cudaDeviceSetLimit)
+
+Batch Benchmark
+──────────────────────────────────────────────────────
+Batch       Time        Throughput      Verified
+1,000       5.0ms       198,047/sec     ✓
+10,000      8.9ms       1,124,923/sec   ✓
+100,000     47.1ms      2,124,125/sec   ✓
+1,000,000   362.0ms     2,762,143/sec   ✓
+
+15-Minute Stress Test (100K batch, continuous)
+──────────────────────────────────────────────────────
+Sustained avg:    1,940,652 hashes/sec
+Peak interval:    1,983,189 hashes/sec
+Min interval:     1,839,854 hashes/sec
+Variance (CoV):   1.91%
+Total hashed:     1,746,600,000 (1.75 billion)
+GPU power:        51-61W sustained (13.3% of 450W cap)
+GPU temp:         40-58°C (no throttling)
+Throttle events:  0 (zero power/thermal/SW throttle)
+GPU speedup:      31,814x vs CPU
+```
+### Pipeline Timing Breakdown (1M batch, 2,877K hash/sec)
+```
+Phase                Time      % Total
+─────────────────────────────────────────
+CPU batch inverse    283.6ms    81.6%    ← dominant bottleneck
+Flatten inputs        32.3ms     9.3%    ← CPU memcpy/reformat
+D2H download          10.0ms     2.9%    ← PCIe gen5
+GPU kernel+sync        9.4ms     2.7%    ← actual EC math (106M/sec raw)
+Repack Fp vecs         7.7ms     2.2%    ← CPU reformat
+H2D upload             4.5ms     1.3%    ← PCIe gen5
+Alloc output           0.0ms     0.0%
+─────────────────────────────────────────
+Compute (kern+inv):  292.9ms    84.3%
+Overhead (rest):      54.6ms    15.7%
+```
+- Next target: GPU batch inverse for Stark252 (eliminate 81.6% CPU bottleneck)
+- Command: `cargo run --release --bin bench_pedersen` / `cargo run --release --bin stress_test`
+- Correctness: byte-for-byte match against CPU (10K random vector regression, zero mismatches)
+- Previous baseline: 220,488/sec (Montgomery, no windowing, single-core batch inverse)
+- Improvement: 8.8x sustained throughput (parallel CPU) + 6.3% GPU kernel speedup (windowing)
+
+---
+
 ## Frozen Milestone: 2026-03-15
 
 ### Commit
@@ -86,6 +314,6 @@ Register cap test:  128 regs → 221K/sec (same), 96 regs → 221K/sec (same)
 
 ### Test Suite
 ```
-114 tests, all passing
+115 tests, all passing
 Includes: 10K GPU vs CPU Pedersen regression test
 ```

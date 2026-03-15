@@ -308,9 +308,39 @@ unsafe extern "C" {
     );
 
     pub fn cuda_pedersen_upload_points(px: *const u64, py: *const u64);
+
+    // Upload precomputed windowed tables + P0 in Montgomery form
+    pub fn cuda_pedersen_upload_tables(
+        table_x: *const u64, table_y: *const u64, table_z: *const u64, // [4][16] each
+        p0_x: *const u64, p0_y: *const u64, p0_z: *const u64, // single point
+    );
     pub fn cuda_pedersen_hash_batch(
         inputs_a: *const u64, inputs_b: *const u64,
         out_x: *mut u64, out_zz: *mut u64, n: u32,
+    );
+
+    pub fn cuda_pedersen_hash_batch_stream(
+        inputs_a: *const u64, inputs_b: *const u64,
+        out_x: *mut u64, out_zz: *mut u64, n: u32,
+        stream: *mut c_void,
+    );
+
+    /// Decompose pre-computed Fp252 values into 27 M31 trace columns (no hashing).
+    pub fn cuda_pedersen_decompose(
+        vals_a: *const u64, vals_b: *const u64, vals_out: *const u64,
+        trace_cols: *mut *mut u32,
+        n: u32,
+        stream: *mut c_void,
+    );
+
+    /// Fused Pedersen hash + trace column generation.
+    /// Hashes (a, b) pairs and decomposes results into 27 M31 trace columns on GPU.
+    /// trace_cols: device pointer to array of 27 device pointers (one per column).
+    pub fn cuda_pedersen_trace(
+        inputs_a: *const u64, inputs_b: *const u64,
+        trace_cols: *mut *mut u32,
+        n: u32,
+        stream: *mut c_void,
     );
 
     pub fn cuda_poseidon_upload_round_consts(host_rc: *const u32);

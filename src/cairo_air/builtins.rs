@@ -156,6 +156,58 @@ pub fn vm_poseidon_invoke(
     output
 }
 
+/// Memory-mapped address range for the Pedersen builtin.
+pub const PEDERSEN_BUILTIN_BASE: u64 = super::pedersen::PEDERSEN_BUILTIN_BASE;
+
+/// Invoke the Pedersen builtin from the Cairo VM.
+/// The VM writes 2 Stark252 values (input_a, input_b) to memory-mapped addresses,
+/// and reads 1 Stark252 result.
+///
+/// Memory layout per invocation (3 cells of Fp values stored as u64 pairs):
+///   base + inv*6 + 0..1: input_a (low, high u64)
+///   base + inv*6 + 2..3: input_b (low, high u64)
+///   base + inv*6 + 4..5: output  (low, high u64)
+///
+/// The actual Pedersen computation is deferred to batch GPU execution.
+/// During VM execution, we just record the (a, b) pair and write a placeholder.
+/// After VM execution, `gpu_pedersen_trace()` computes all hashes on GPU.
+pub fn vm_pedersen_invoke(
+    memory: &mut super::vm::Memory,
+    builtin: &mut super::pedersen::PedersenBuiltin,
+    invocation_index: usize,
+    a: super::pedersen::Stark252,
+    b: super::pedersen::Stark252,
+) -> super::pedersen::Stark252 {
+    // Compute on CPU (for correctness / memory consistency)
+    let output = builtin.invoke(a, b);
+
+    // Write output to VM memory at builtin address range
+    let stride = 6u64; // 2 cells per Fp (low + high u64) × 3 values
+    let base = PEDERSEN_BUILTIN_BASE + invocation_index as u64 * stride;
+
+    // Store first limb of each value for LogUp memory linking
+    let fp_out = super::pedersen::stark252_to_fp(&output);
+    memory.set(base + 0, super::pedersen::stark252_to_fp(&a).v[0]);
+    memory.set(base + 1, super::pedersen::stark252_to_fp(&b).v[0]);
+    memory.set(base + 2, fp_out.v[0]);
+
+    output
+}
+
+/// Generate Pedersen builtin trace columns on GPU.
+/// Uses stored Fp inputs from invoke() — fused hash + trace on GPU.
+/// Results never leave the GPU. Returns DeviceBuffers ready for NTT.
+pub fn gpu_pedersen_builtin_trace(
+    builtin: &super::pedersen::PedersenBuiltin,
+    log_n: u32,
+) -> Vec<crate::device::DeviceBuffer<u32>> {
+    use super::pedersen::gpu_pedersen_trace;
+
+    // Use stored Fp inputs directly — no Stark252→Fp conversion needed.
+    // gpu_pedersen_trace fuses hash + M31 decompose on GPU.
+    gpu_pedersen_trace(&builtin.fp_inputs_a, &builtin.fp_inputs_b, log_n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

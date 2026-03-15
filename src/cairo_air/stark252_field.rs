@@ -40,6 +40,7 @@ pub const P: [u64; 4] = [
 
 /// A 252-bit field element mod p, stored as 4 × u64 (little-endian).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
 pub struct Fp {
     pub v: [u64; 4],
 }
