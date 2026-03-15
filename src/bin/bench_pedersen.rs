@@ -159,19 +159,49 @@ fn main() {
     test_gpu_fp252();
     test_gpu_ec_double();
 
-    // === CPU benchmark ===
-    println!("--- CPU (projective coordinates) ---");
+    // === CPU benchmark (single-threaded + multi-threaded) ===
+    println!("--- CPU: Single-threaded (projective, double-and-add) ---");
     let _ = pedersen_hash(Fp::from_u64(1), Fp::from_u64(2)); // warmup
 
-    let n_cpu = 100;
-    let t0 = Instant::now();
-    for i in 0..n_cpu {
-        let _ = pedersen_hash(Fp::from_u64(i as u64 + 1), Fp::from_u64(i as u64 + 100));
+    for n_cpu in [100, 1000, 10000] {
+        let t0 = Instant::now();
+        for i in 0..n_cpu {
+            let _ = pedersen_hash(Fp::from_u64(i as u64 + 1), Fp::from_u64(i as u64 + 100));
+        }
+        let cpu_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let cpu_per = cpu_ms / n_cpu as f64;
+        println!("  {n_cpu:>6} hashes: {cpu_ms:>8.1}ms ({cpu_per:.2}ms/hash, {:>6.0} hashes/sec)",
+            1000.0 / cpu_per);
     }
-    let cpu_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let cpu_per = cpu_ms / n_cpu as f64;
-    println!("{n_cpu} hashes: {cpu_ms:.1}ms ({cpu_per:.2}ms/hash, {:.0} hashes/sec)\n",
-        1000.0 / cpu_per);
+
+    println!("\n--- CPU: Multi-threaded ({} cores, projective) ---", std::thread::available_parallelism().map_or(1, |n| n.get()));
+    for n_cpu in [1000usize, 10000, 100000] {
+        let inputs_a: Vec<Fp> = (0..n_cpu).map(|i| Fp::from_u64(i as u64 + 1)).collect();
+        let inputs_b: Vec<Fp> = (0..n_cpu).map(|i| Fp::from_u64(i as u64 + 100)).collect();
+
+        let t0 = Instant::now();
+        let _results: Vec<Fp> = std::thread::scope(|s| {
+            let chunk_size = (n_cpu + 7) / 8; // 8 threads
+            let mut handles = Vec::new();
+            for chunk_idx in 0..8 {
+                let start = chunk_idx * chunk_size;
+                let end = (start + chunk_size).min(n_cpu);
+                if start >= end { break; }
+                let a_slice = &inputs_a[start..end];
+                let b_slice = &inputs_b[start..end];
+                handles.push(s.spawn(move || {
+                    a_slice.iter().zip(b_slice.iter())
+                        .map(|(a, b)| pedersen_hash(*a, *b))
+                        .collect::<Vec<_>>()
+                }));
+            }
+            handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+        });
+        let cpu_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let rate = n_cpu as f64 / (cpu_ms / 1000.0);
+        println!("  {n_cpu:>6} hashes: {cpu_ms:>8.1}ms ({rate:>8.0} hashes/sec)");
+    }
+    println!();
 
     // === GPU benchmark ===
     println!("--- GPU (parallel, projective, CUDA) ---");
