@@ -166,6 +166,68 @@ __global__ void logup_memory_combine_kernel(
 }
 
 // ============================================================================
+// FUSED LogUp: denoms + inverse + combine in one kernel (zero intermediate storage)
+// ============================================================================
+
+// Fused kernel: computes per-row sum of 4 memory reciprocals with inline QM31 inverse.
+// Eliminates 2 global memory round-trips (denoms→inverse→combine → single pass).
+// Each thread: compute 4 denoms, product, inline inverse, numerator, multiply → output.
+__global__ void logup_memory_fused_kernel(
+    const uint32_t* __restrict__ col_pc,
+    const uint32_t* __restrict__ col_inst_lo,
+    const uint32_t* __restrict__ col_dst_addr,
+    const uint32_t* __restrict__ col_dst,
+    const uint32_t* __restrict__ col_op0_addr,
+    const uint32_t* __restrict__ col_op0,
+    const uint32_t* __restrict__ col_op1_addr,
+    const uint32_t* __restrict__ col_op1,
+    uint32_t* __restrict__ out0, uint32_t* __restrict__ out1,
+    uint32_t* __restrict__ out2, uint32_t* __restrict__ out3,
+    uint32_t z0, uint32_t z1, uint32_t z2, uint32_t z3,
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t n
+) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    QM31 z = {{z0, z1, z2, z3}};
+    QM31 alpha = {{a0, a1, a2, a3}};
+
+    uint32_t addrs[4] = { col_pc[i], col_dst_addr[i], col_op0_addr[i], col_op1_addr[i] };
+    uint32_t vals[4]  = { col_inst_lo[i], col_dst[i], col_op0[i], col_op1[i] };
+
+    // Compute 4 denominators
+    QM31 d[4];
+    for (int j = 0; j < 4; j++) {
+        QM31 entry = qm31_mul_m31(alpha, vals[j]);
+        entry.v[0] = m31_add(entry.v[0], addrs[j]);
+        d[j] = qm31_sub(z, entry);
+    }
+
+    // Product of all 4 denominators
+    QM31 p01 = qm31_mul(d[0], d[1]);
+    QM31 p23 = qm31_mul(d[2], d[3]);
+    QM31 p0123 = qm31_mul(p01, p23);
+
+    // Numerator = sum of co-factor products
+    QM31 num = qm31_add(
+        qm31_add(qm31_mul(d[1], p23), qm31_mul(d[0], p23)),
+        qm31_add(qm31_mul(p01, d[3]), qm31_mul(p01, d[2]))
+    );
+
+    // Inline QM31 inverse of p0123 (no global memory round-trip)
+    QM31 inv_prod = qm31_inv(p0123);
+
+    // Result = numerator * inv(product)
+    QM31 result = qm31_mul(num, inv_prod);
+
+    out0[i] = result.v[0];
+    out1[i] = result.v[1];
+    out2[i] = result.v[2];
+    out3[i] = result.v[3];
+}
+
+// ============================================================================
 // QM31 Parallel Prefix Sum (Inclusive Scan)
 // ============================================================================
 
@@ -321,6 +383,25 @@ __global__ void qm31_inverse_kernel(
 }
 
 extern "C" {
+
+void cuda_logup_memory_fused(
+    const uint32_t* col_pc, const uint32_t* col_inst_lo,
+    const uint32_t* col_dst_addr, const uint32_t* col_dst,
+    const uint32_t* col_op0_addr, const uint32_t* col_op0,
+    const uint32_t* col_op1_addr, const uint32_t* col_op1,
+    uint32_t* out0, uint32_t* out1, uint32_t* out2, uint32_t* out3,
+    const uint32_t* z, const uint32_t* alpha,
+    uint32_t n
+) {
+    uint32_t threads = 256;
+    uint32_t blocks = (n + threads - 1) / threads;
+    logup_memory_fused_kernel<<<blocks, threads>>>(
+        col_pc, col_inst_lo, col_dst_addr, col_dst,
+        col_op0_addr, col_op0, col_op1_addr, col_op1,
+        out0, out1, out2, out3,
+        z[0], z[1], z[2], z[3], alpha[0], alpha[1], alpha[2], alpha[3], n
+    );
+}
 
 void cuda_logup_memory_denoms(
     const uint32_t* col_pc, const uint32_t* col_inst_lo,

@@ -286,6 +286,123 @@ pub fn execute_to_columns(memory: &mut Memory, n_steps: usize, log_n: u32) -> Ve
     cols
 }
 
+/// Execute and write directly to pre-allocated column buffers.
+/// Accepts mutable slices (can point to pinned host memory or mapped GPU memory).
+/// Same logic as execute_to_columns but avoids Vec allocation.
+pub fn execute_to_columns_into(
+    memory: &mut Memory,
+    n_steps: usize,
+    cols: &mut [&mut [u32]],
+) {
+    use crate::field::m31::P;
+    use super::trace::*;
+
+    assert!(cols.len() >= N_COLS);
+    let n = cols[0].len();
+    assert!(n_steps <= n);
+
+    let estimated_mem = 100 + n_steps + 1000;
+    if memory.data.len() < estimated_mem {
+        memory.data.resize(estimated_mem, 0);
+    }
+
+    let mut state = CairoState { pc: 0, ap: 100, fp: 100 };
+
+    #[inline(always)]
+    fn to_m31(v: u64) -> u32 {
+        let lo = (v & 0x7FFF_FFFF) as u32;
+        let hi = (v >> 31) as u32;
+        let r = lo + hi;
+        if r >= P { r - P } else { r }
+    }
+
+    for i in 0..n_steps {
+        let encoded = memory.get(state.pc);
+        let instr = super::decode::Instruction::decode(encoded);
+
+        let dst_base = if instr.dst_reg == 1 { state.fp } else { state.ap };
+        let dst_addr = dst_base.wrapping_add(instr.off0.wrapping_sub(0x8000) as i16 as i64 as u64);
+        let op0_base = if instr.op0_reg == 1 { state.fp } else { state.ap };
+        let op0_addr = op0_base.wrapping_add(instr.off1.wrapping_sub(0x8000) as i16 as i64 as u64);
+        let op0 = memory.get(op0_addr);
+
+        let op1_base = if instr.op1_imm == 1 { state.pc }
+            else if instr.op1_fp == 1 { state.fp }
+            else if instr.op1_ap == 1 { state.ap }
+            else { op0 };
+        let op1_addr = op1_base.wrapping_add(instr.off2.wrapping_sub(0x8000) as i16 as i64 as u64);
+        let op1 = memory.get(op1_addr);
+
+        let res = if instr.pc_jnz == 1 { 0 }
+            else if instr.res_add == 1 {
+                let sum = op0 + op1;
+                if sum >= P as u64 { sum - P as u64 } else { sum }
+            }
+            else if instr.res_mul == 1 {
+                let prod = op0 as u128 * op1 as u128;
+                let lo = (prod & P as u128) as u64;
+                let hi = (prod >> 31) as u64;
+                let r = lo + hi;
+                if r >= P as u64 { r - P as u64 } else { r }
+            }
+            else { op1 };
+
+        let dst = if instr.opcode_assert == 1 { memory.set(dst_addr, res); res }
+            else if instr.opcode_call == 1 {
+                memory.set(dst_addr, state.fp);
+                memory.set(dst_addr + 1, state.pc + instr.size());
+                state.fp
+            } else { memory.get(dst_addr) };
+
+        let next_pc = if instr.pc_jump_abs == 1 { res }
+            else if instr.pc_jump_rel == 1 { state.pc.wrapping_add(res) }
+            else if instr.pc_jnz == 1 {
+                if dst != 0 { state.pc.wrapping_add(op1) } else { state.pc + instr.size() }
+            } else { state.pc + instr.size() };
+
+        let next_ap = if instr.ap_add == 1 { state.ap.wrapping_add(res) }
+            else if instr.ap_add1 == 1 { state.ap + 1 }
+            else if instr.opcode_call == 1 { state.ap + 2 }
+            else { state.ap };
+
+        let next_fp = if instr.opcode_call == 1 { state.ap + 2 }
+            else if instr.opcode_ret == 1 { dst }
+            else { state.fp };
+
+        cols[COL_PC][i] = to_m31(state.pc);
+        cols[COL_AP][i] = to_m31(state.ap);
+        cols[COL_FP][i] = to_m31(state.fp);
+        cols[COL_INST_LO][i] = (encoded & 0x7FFF_FFFF) as u32;
+        cols[COL_INST_HI][i] = ((encoded >> 31) & 0x7FFF_FFFF) as u32;
+
+        cols[COL_FLAGS_START + 0][i] = instr.dst_reg;
+        cols[COL_FLAGS_START + 1][i] = instr.op0_reg;
+        cols[COL_FLAGS_START + 2][i] = instr.op1_imm;
+        cols[COL_FLAGS_START + 3][i] = instr.op1_fp;
+        cols[COL_FLAGS_START + 4][i] = instr.op1_ap;
+        cols[COL_FLAGS_START + 5][i] = instr.res_add;
+        cols[COL_FLAGS_START + 6][i] = instr.res_mul;
+        cols[COL_FLAGS_START + 7][i] = instr.pc_jump_abs;
+        cols[COL_FLAGS_START + 8][i] = instr.pc_jump_rel;
+        cols[COL_FLAGS_START + 9][i] = instr.pc_jnz;
+        cols[COL_FLAGS_START + 10][i] = instr.ap_add;
+        cols[COL_FLAGS_START + 11][i] = instr.ap_add1;
+        cols[COL_FLAGS_START + 12][i] = instr.opcode_call;
+        cols[COL_FLAGS_START + 13][i] = instr.opcode_ret;
+        cols[COL_FLAGS_START + 14][i] = instr.opcode_assert;
+
+        cols[COL_DST_ADDR][i] = to_m31(dst_addr);
+        cols[COL_DST][i] = to_m31(dst);
+        cols[COL_OP0_ADDR][i] = to_m31(op0_addr);
+        cols[COL_OP0][i] = to_m31(op0);
+        cols[COL_OP1_ADDR][i] = to_m31(op1_addr);
+        cols[COL_OP1][i] = to_m31(op1);
+        cols[COL_RES][i] = to_m31(res);
+
+        state = CairoState { pc: next_pc, ap: next_ap, fp: next_fp };
+    }
+}
+
 /// Execute a single Cairo step.
 #[inline(always)]
 fn execute_step(state: &CairoState, memory: &mut Memory) -> TraceRow {

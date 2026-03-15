@@ -36,7 +36,8 @@ pub const N_QUERIES: usize = 100;
 /// Decommitment data for a set of queries against a Merkle commitment.
 /// Includes both the queried value and its fold-sibling (index ^ 1) for
 /// verifying FRI fold equations.
-pub struct QueryDecommitment<T> {
+#[derive(Clone)]
+pub struct QueryDecommitment<T: Clone> {
     /// Leaf values at queried positions.
     pub values: Vec<T>,
     /// Sibling values at (queried_index ^ 1) — needed for fold verification.
