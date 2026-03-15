@@ -61,9 +61,69 @@ pub const MEMCPY_D2D: i32 = 3;
 // cudaMemPoolAttr
 pub const MEMPOOL_ATTR_RELEASE_THRESHOLD: i32 = 4;
 
+// CUDA memory info
+unsafe extern "C" {
+    pub fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
+}
+
+/// Query current VRAM state. Returns (free_bytes, total_bytes).
+pub fn vram_query() -> (usize, usize) {
+    let mut free: usize = 0;
+    let mut total: usize = 0;
+    let err = unsafe { cudaMemGetInfo(&mut free, &mut total) };
+    assert!(err == 0, "cudaMemGetInfo failed: {err}");
+    (free, total)
+}
+
+/// VRAM safety check. Prints current usage and aborts if another process
+/// is already using significant VRAM (>512 MB).
+/// Call before init_memory_pool() to avoid competing for GPU memory.
+pub fn vram_preflight_check() {
+    let (free, total) = vram_query();
+    let used = total - free;
+    let free_mb = free / (1024 * 1024);
+    let total_mb = total / (1024 * 1024);
+    let used_mb = used / (1024 * 1024);
+
+    eprintln!("[VRAM] {used_mb} MB used / {total_mb} MB total ({free_mb} MB free)");
+
+    if used_mb > 512 {
+        eprintln!("[VRAM] WARNING: {used_mb} MB already in use by another process.");
+        eprintln!("[VRAM] Another GPU workload may be running (PrimePulse, training, etc).");
+        eprintln!("[VRAM] VortexSTARK needs up to 28 GB for large proofs (log_n>=27).");
+        eprintln!("[VRAM] Proceeding, but large proofs may OOM. Kill other GPU processes first.");
+    }
+}
+
 /// Initialize CUDA memory pool for async allocation. Call once at startup.
-/// Sets the default pool's release threshold to MAX so freed memory stays in the pool.
+///
+/// Runs a VRAM preflight check, then configures the default memory pool.
+/// The pool release threshold is set to 2 GB — freed buffers stay cached
+/// up to that limit for fast reuse, but anything beyond 2 GB is returned
+/// to the OS between jobs so other processes can share the GPU.
 pub fn init_memory_pool() {
+    vram_preflight_check();
+
+    unsafe {
+        let mut pool: *mut std::ffi::c_void = std::ptr::null_mut();
+        let err = cudaDeviceGetDefaultMemPool(&mut pool, 0);
+        assert!(err == 0, "cudaDeviceGetDefaultMemPool failed: {err}");
+        // Keep 2 GB cached in the pool for fast reuse; release the rest.
+        let threshold: u64 = 2 * 1024 * 1024 * 1024;
+        let err = cudaMemPoolSetAttribute(
+            pool,
+            MEMPOOL_ATTR_RELEASE_THRESHOLD,
+            &threshold as *const u64 as *const std::ffi::c_void,
+        );
+        assert!(err == 0, "cudaMemPoolSetAttribute failed: {err}");
+    }
+}
+
+/// Initialize with greedy pool (never releases memory). Use only for
+/// back-to-back benchmarks where you know nothing else needs the GPU.
+pub fn init_memory_pool_greedy() {
+    vram_preflight_check();
+
     unsafe {
         let mut pool: *mut std::ffi::c_void = std::ptr::null_mut();
         let err = cudaDeviceGetDefaultMemPool(&mut pool, 0);

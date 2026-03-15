@@ -11,7 +11,7 @@ fn main() {
     println!("║         RTX 5090 · Rust + CUDA · Circle STARK              ║");
     println!("╚══════════════════════════════════════════════════════════════╝\n");
 
-    ffi::init_memory_pool();
+    ffi::init_memory_pool_greedy();
 
     // Warmup
     let _ = vortexstark::prover::prove(M31(1), M31(1), 8);

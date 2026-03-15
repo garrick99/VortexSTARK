@@ -154,7 +154,7 @@ fn main() {
     println!("Pedersen Hash Benchmark: CPU vs GPU");
     println!("====================================\n");
 
-    ffi::init_memory_pool();
+    ffi::init_memory_pool_greedy();
     pedersen::gpu_init();
     test_gpu_fp252();
     test_gpu_ec_double();

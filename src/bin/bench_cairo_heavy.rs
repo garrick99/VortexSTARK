@@ -88,7 +88,7 @@ fn main() {
     println!("║  Cairo STARK: prove + verify, full constraint checking     ║");
     println!("╚══════════════════════════════════════════════════════════════╝\n");
 
-    ffi::init_memory_pool();
+    ffi::init_memory_pool_greedy();
     gpu_init();
 
     // ================================================================

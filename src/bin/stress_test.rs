@@ -29,7 +29,7 @@ fn main() {
 
     // Init
     println!("[INIT] Initializing CUDA memory pool...");
-    ffi::init_memory_pool();
+    ffi::init_memory_pool_greedy();
     println!("[INIT] Uploading Pedersen tables (windowed + P0 Montgomery)...");
     gpu_init();
 
