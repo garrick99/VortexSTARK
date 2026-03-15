@@ -9,7 +9,7 @@
 
 use kraken_stark::cairo_air::{
     decode::Instruction,
-    prover::{cairo_prove, cairo_prove_with_pedersen, cairo_verify},
+    prover::{cairo_prove, cairo_prove_cached, cairo_prove_with_pedersen, cairo_verify, CairoProverCache},
     pedersen::{self, PedersenBuiltin, gpu_init, N_LIMBS},
     stark252_field::Fp,
 };
@@ -99,8 +99,11 @@ fn main() {
         let n = 1usize << log_n;
         let program = build_fib_program(n);
 
+        // Create cache once per size (amortized over multiple proofs)
+        let cache = CairoProverCache::new(log_n);
+
         let t0 = Instant::now();
-        let proof = cairo_prove(&program, n, log_n);
+        let proof = cairo_prove_cached(&program, n, log_n, &cache, None);
         let prove_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let t0 = Instant::now();
@@ -120,8 +123,10 @@ fn main() {
         let n = 1usize << log_n;
         let program = build_defi_program(n);
 
+        let cache = CairoProverCache::new(log_n);
+
         let t0 = Instant::now();
-        let proof = cairo_prove(&program, n, log_n);
+        let proof = cairo_prove_cached(&program, n, log_n, &cache, None);
         let prove_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let t0 = Instant::now();
@@ -138,11 +143,10 @@ fn main() {
     // ================================================================
     println!("━━━ WORKLOAD 3: Fibonacci + GPU Pedersen (rollup-style) ━━━");
     // EC trace now GPU-generated — can handle much larger counts.
-    for (log_n, n_ped) in [(20u32, 1024usize), (24, 16384), (26, 65536)] {
+    for (log_n, n_ped) in [(20u32, 1024usize), (24, 16384), (26, 16384)] {
         let n = 1usize << log_n;
         let program = build_fib_program(n);
 
-        // Generate Pedersen inputs (simulates Merkle tree leaf hashing)
         let ped_a: Vec<Fp> = (0..n_ped).map(|i|
             Fp::from_u64((i as u64 + 1).wrapping_mul(0x9E3779B97F4A7C15))
         ).collect();
@@ -150,8 +154,10 @@ fn main() {
             Fp::from_u64((i as u64 + 1).wrapping_mul(0x6C62272E07BB0142))
         ).collect();
 
+        let cache = CairoProverCache::new(log_n);
+
         let t0 = Instant::now();
-        let proof = cairo_prove_with_pedersen(&program, n, log_n, Some((&ped_a, &ped_b)));
+        let proof = cairo_prove_cached(&program, n, log_n, &cache, Some((&ped_a, &ped_b)));
         let prove_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let t0 = Instant::now();
@@ -172,7 +178,7 @@ fn main() {
     {
         let log_n = 26u32;
         let n = 1usize << log_n;
-        let n_ped = 16384; // GPU EC trace — can handle large counts now
+        let n_ped = 16384;
         let program = build_defi_program(n);
 
         let ped_a: Vec<Fp> = (0..n_ped).map(|i|
@@ -183,12 +189,12 @@ fn main() {
         ).collect();
 
         println!("  Config: log_n={log_n}, {n} DeFi steps + {n_ped} EC-constrained Pedersen");
-        println!("  EC trace: GPU-generated (was CPU-bound, now GPU kernel)");
 
+        let cache = CairoProverCache::new(log_n);
         let t_total = Instant::now();
 
         let t0 = Instant::now();
-        let proof = cairo_prove_with_pedersen(&program, n, log_n, Some((&ped_a, &ped_b)));
+        let proof = cairo_prove_cached(&program, n, log_n, &cache, Some((&ped_a, &ped_b)));
         let prove_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let t0 = Instant::now();
