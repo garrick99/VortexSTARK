@@ -153,16 +153,16 @@ fn prove_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
 /// Generate a STARK proof with lazy VRAM management.
 /// Uses root-only Merkle commits and computes auth paths on CPU from host data.
 pub fn prove_lean(a: M31, b: M31, log_n: u32) -> StarkProof {
-    if log_n == 30 {
-        return prove_lean_max(a, b, false);
+    if log_n >= 20 {
+        return prove_lean_fused(a, b, log_n, false);
     }
     prove_lean_inner(a, b, log_n, false)
 }
 
 /// Generate a STARK proof with lazy VRAM management and timing output.
 pub fn prove_lean_timed(a: M31, b: M31, log_n: u32) -> StarkProof {
-    if log_n == 30 {
-        return prove_lean_max(a, b, true);
+    if log_n >= 20 {
+        return prove_lean_fused(a, b, log_n, true);
     }
     prove_lean_inner(a, b, log_n, true)
 }
@@ -530,12 +530,13 @@ fn prove_lean_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
 /// Uses twin-coset evaluation (half_coset(30) + subgroup(30)) since half_coset(31)
 /// doesn't exist (the M31 circle group has order 2^31). Quotient and FRI are
 /// streamed in chunks to fit in 32GB VRAM.
-fn prove_lean_max(a: M31, b: M31, timed: bool) -> StarkProof {
+/// Fused prover path: zero host transfer for quotient, GPU-resident FRI.
+/// Works for any log_n >= 4. Uses full-group NTT for log_n=30, standard for others.
+fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     ensure_pool_init();
-    let log_n: u32 = 30;
-    let n = 1usize << log_n; // 2^30
-    let log_eval_size: u32 = 31;
-    let eval_size = 1usize << log_eval_size; // 2^31
+    let n = 1usize << log_n;
+    let log_eval_size = log_n + BLOWUP_BITS;
+    let eval_size = 1usize << log_eval_size;
 
     let t_total = Instant::now();
 
@@ -554,7 +555,7 @@ fn prove_lean_max(a: M31, b: M31, timed: bool) -> StarkProof {
     if timed { unsafe { ffi::cuda_device_sync() }; eprintln!("  trace_upload: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0); }
     unsafe { ffi::cudaFreeHost(pinned_ptr) };
 
-    // --- Step 2: Interpolate on trace domain (half_coset(30)) ---
+    // --- Step 2: Interpolate on trace domain ---
     let t0 = Instant::now();
     let trace_domain = Coset::half_coset(log_n);
     let trace_inv = InverseTwiddleCache::new(&trace_domain);
@@ -570,9 +571,13 @@ fn prove_lean_max(a: M31, b: M31, timed: bool) -> StarkProof {
     }
     drop(d_coeffs);
 
-    // Try standard ForwardTwiddleCache (all twiddles on GPU, single NTT call).
-    // Peak VRAM ~32GB during twiddle construction — tight but should fit.
-    let eval_domain = Coset::subgroup(log_eval_size);
+    // For log_n=30: eval domain is full circle group (subgroup(31), half_coset(31) doesn't exist)
+    // For log_n<30: standard half_coset(log_eval_size)
+    let eval_domain = if log_eval_size <= 30 {
+        Coset::half_coset(log_eval_size)
+    } else {
+        Coset::subgroup(log_eval_size)
+    };
     let eval_fwd = ForwardTwiddleCache::new(&eval_domain);
     ntt::evaluate(&mut d_eval_full, &eval_fwd);
     drop(eval_fwd);
@@ -603,8 +608,8 @@ fn prove_lean_max(a: M31, b: M31, timed: bool) -> StarkProof {
 
     // Quotient chunk size: 2^27 (2GB output per chunk, 16 chunks)
     // This matches fold_chunk_size so each quotient chunk feeds one fold chunk.
-    const QUOTIENT_CHUNK_LOG: u32 = 27;
-    let chunk_size = 1usize << QUOTIENT_CHUNK_LOG;
+    let quotient_chunk_log = log_eval_size.min(27); // cap at eval domain size
+    let chunk_size = 1usize << quotient_chunk_log;
     let n_chunks = eval_size / chunk_size; // 16 chunks
 
     let mut all_quotient_subtrees: Vec<[u32; 8]> = Vec::new();
@@ -667,11 +672,15 @@ fn prove_lean_max(a: M31, b: M31, timed: bool) -> StarkProof {
     let mut fri_layer_data: Vec<FriLayerData> = Vec::new();
 
     let fri_alpha = channel.draw_felt();
-    let fold_domain = Coset::subgroup(log_eval_size);
+    let fold_domain = if log_eval_size <= 30 {
+        Coset::half_coset(log_eval_size)
+    } else {
+        Coset::subgroup(log_eval_size)
+    };
     let d_fold_twid = fri::compute_fold_twiddles_on_demand(&fold_domain, true);
 
     let fold_chunk_size = chunk_size / 2; // 2^26 fold outputs per quotient chunk
-    let fold_chunk_log: u32 = QUOTIENT_CHUNK_LOG - 1; // 26
+    let fold_chunk_log: u32 = quotient_chunk_log - 1;
     let n_fold_output = eval_size / 2; // 2^30
 
     let fri_alpha_arr = fri_alpha.to_u32_array();
