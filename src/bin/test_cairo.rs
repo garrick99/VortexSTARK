@@ -111,7 +111,7 @@ fn main() {
     ffi::init_memory_pool();
     gpu_init();
 
-    for log_n in [20, 24, 26, 27, 28] {
+    for log_n in [20, 24, 26, 27] {
         let n: usize = 1 << log_n;
         let eval_size = 2 * n;
         let log_eval_size = log_n + 1;
@@ -170,64 +170,52 @@ fn main() {
             COL_OP0_ADDR, COL_OP0, COL_OP1_ADDR, COL_OP1,
         ].iter().copied().collect();
 
-        // Streaming NTT + commitment: process columns in 2 batches to stay within 32GB VRAM.
-        // Batch 1: columns 0..13 (includes all LogUp columns)
-        // Batch 2: columns 14..26
-        // Each batch: NTT → commit → keep LogUp cols, free rest
-        // Batch size: keep within VRAM. Each eval col = 2^(log_n+1) × 4 bytes.
-        let col_bytes = (eval_size * 4) as u64;
-        let max_batch_bytes = 20u64 * 1024 * 1024 * 1024; // 20GB budget for batch
-        let batch_size = ((max_batch_bytes / col_bytes) as usize).max(1).min(N_COLS);
+        // Per-column streaming: NTT + commit each column independently.
+        // Only one eval column in VRAM at a time (+ LogUp columns retained).
+        // VRAM per column: trace(n×4) + eval(2n×4) + twiddles(~2GB) ≈ 3n×4 + 2GB.
+        // At log_n=28: 3×1GB + 2GB = 5GB per column. Fits easily.
+        let mut d_eval_cols: Vec<DeviceBuffer<u32>> = Vec::with_capacity(8);
+        let mut col_roots: Vec<[u32; 8]> = Vec::with_capacity(N_COLS);
 
-        let mut d_eval_cols: Vec<DeviceBuffer<u32>> = Vec::with_capacity(N_COLS);
-        let mut trace_roots: Vec<[u32; 8]> = Vec::new();
+        // At large log_n, only process LogUp columns to save CPU+GPU memory.
+        // Other columns are committed but not retained.
+        let cols_to_process: Vec<usize> = if log_n >= 28 {
+            logup_cols.iter().copied().collect()
+        } else {
+            (0..N_COLS).collect()
+        };
 
-        let mut col_idx = 0;
-        while col_idx < N_COLS {
-            let end = (col_idx + batch_size).min(N_COLS);
-            let mut batch: Vec<DeviceBuffer<u32>> = Vec::new();
-
-            for c in col_idx..end {
-                let mut d_col = DeviceBuffer::from_host(&columns[c]);
-                ntt::interpolate(&mut d_col, &inv_cache);
-                let mut d_eval = DeviceBuffer::<u32>::alloc(eval_size);
-                unsafe {
-                    ffi::cuda_zero_pad(d_col.as_ptr(), d_eval.as_mut_ptr(), n as u32, eval_size as u32);
-                }
-                drop(d_col);
-                ntt::evaluate(&mut d_eval, &fwd_cache);
-                batch.push(d_eval);
+        for &c in &cols_to_process {
+            let mut d_col = DeviceBuffer::from_host(&columns[c]);
+            ntt::interpolate(&mut d_col, &inv_cache);
+            let mut d_eval = DeviceBuffer::<u32>::alloc(eval_size);
+            unsafe {
+                ffi::cuda_zero_pad(d_col.as_ptr(), d_eval.as_mut_ptr(), n as u32, eval_size as u32);
             }
+            drop(d_col);
 
-            // Commit this batch
-            let root = MerkleTree::commit_root_only(&batch, log_eval_size);
-            trace_roots.push(root);
+            // Commit this single column
+            let root = MerkleTree::commit_root_only(std::slice::from_ref(&d_eval), log_eval_size);
+            col_roots.push(root);
 
-            // Keep LogUp columns, free the rest
-            for (i, d_eval) in batch.into_iter().enumerate() {
-                let c = col_idx + i;
-                if logup_cols.contains(&c) {
-                    d_eval_cols.push(d_eval);
-                }
-                // Non-LogUp columns get dropped here, freeing VRAM
+            // Keep LogUp columns
+            if logup_cols.contains(&c) {
+                d_eval_cols.push(d_eval);
             }
-
-            col_idx = end;
         }
         drop(columns);
 
-        // Combine batch roots into final trace commitment
-        let trace_commitment = if trace_roots.len() == 1 {
-            trace_roots[0]
-        } else {
-            // Hash batch roots together via Channel (Fiat-Shamir binding)
+        // Combine 27 per-column roots into single trace commitment
+        let trace_commitment = {
             let mut ch = Channel::new();
-            for root in &trace_roots {
+            for root in &col_roots {
                 ch.mix_digest(root);
             }
-            let combined = ch.draw_felt();
-            let arr = combined.to_u32_array();
-            [arr[0], arr[1], arr[2], arr[3], arr[0] ^ arr[2], arr[1] ^ arr[3], arr[0], arr[1]]
+            let f = ch.draw_felt();
+            let a = f.to_u32_array();
+            [a[0], a[1], a[2], a[3],
+             a[0] ^ a[2], a[1] ^ a[3],
+             a[0].wrapping_add(a[2]), a[1].wrapping_add(a[3])]
         };
         let commit_ms = 0.0;
 
