@@ -345,6 +345,53 @@ fn hex_to_bytes(hex: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cairo_air::stark252_field::{Fp, pedersen_hash};
+
+    #[test]
+    fn test_pedersen_gpu_vs_cpu_random_vectors() {
+        crate::cuda::ffi::init_memory_pool();
+        gpu_init();
+
+        let n = 10_000;
+
+        // Deterministic "random" inputs via simple hash-like mixing
+        let inputs_a: Vec<Fp> = (0..n).map(|i| {
+            let seed = (i as u64).wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(0x517CC1B727220A95);
+            Fp::from_u64(seed)
+        }).collect();
+
+        let inputs_b: Vec<Fp> = (0..n).map(|i| {
+            let seed = (i as u64).wrapping_mul(0x6C62272E07BB0142).wrapping_add(0x62B821756295C58D);
+            Fp::from_u64(seed)
+        }).collect();
+
+        // GPU batch
+        let gpu_results = gpu_hash_batch(&inputs_a, &inputs_b);
+
+        // CPU one-by-one
+        let cpu_results: Vec<Fp> = inputs_a.iter().zip(&inputs_b)
+            .map(|(&a, &b)| pedersen_hash(a, b))
+            .collect();
+
+        // Byte-for-byte equality
+        let mut mismatches = 0;
+        for i in 0..n {
+            if gpu_results[i] != cpu_results[i] {
+                if mismatches < 3 {
+                    eprintln!("MISMATCH at index {i}:");
+                    eprintln!("  CPU: [{:016x}, {:016x}, {:016x}, {:016x}]",
+                        cpu_results[i].v[0], cpu_results[i].v[1], cpu_results[i].v[2], cpu_results[i].v[3]);
+                    eprintln!("  GPU: [{:016x}, {:016x}, {:016x}, {:016x}]",
+                        gpu_results[i].v[0], gpu_results[i].v[1], gpu_results[i].v[2], gpu_results[i].v[3]);
+                }
+                mismatches += 1;
+            }
+        }
+
+        assert_eq!(mismatches, 0,
+            "{mismatches}/{n} Pedersen hashes differ between GPU and CPU");
+    }
+    use super::*;
 
     #[test]
     fn test_stark252_from_u64() {
