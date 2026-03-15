@@ -46,13 +46,16 @@
 - Mixed add/mul alternating: proven + verified
 - Call/ret initialization pattern: proven + verified
 
-## Documented Assumptions
+### Pedersen EC constraint system (Fix #4 — was "honest-prover assumption")
+- Full intermediate EC trace generated (each doubling/addition step)
+- 29 columns per step (vs stwo's 624) using 9 M31 limbs per coordinate
+- EC trace committed via NTT + Merkle
+- Verifier checks EC doubling and addition constraints at query points
+- Tampered EC trace commitment correctly rejected
+- test_cairo_prove_with_pedersen_ec_constraints ✓
+- test_tamper_ec_trace ✓
 
-### Pedersen honest-prover path
-- GPU computes correct Pedersen hashes (10K regression test, byte-for-byte)
-- Trace columns committed via Merkle tree
-- Full EC constraint kernel (stwo-style partial_ec_mul) would require ~500 columns
-- Current approach: honest prover computes correctly, commitment binds values
+## Remaining Documented Limitations
 
 ## Confidence Summary
 
@@ -60,13 +63,13 @@
 |-----------|-----------|
 | GPU kernels / benchmarks | 95% |
 | Fibonacci STARK (prove+verify) | 90% |
-| Cairo verifier soundness | 85% |
-| Cairo system completeness | 80% |
-| Production readiness | 40% |
+| Cairo verifier soundness | 90% |
+| Cairo system completeness | 85% |
+| Production readiness | 50% |
 
 ### What would move production readiness higher
 - Real Cairo compiler output (not hand-crafted bytecode)
 - Security audit
-- Pedersen EC constraint kernel
 - Formal verification of constraint polynomials
 - Adversarial testing
+- Full scalar decomposition constraints in EC trace
