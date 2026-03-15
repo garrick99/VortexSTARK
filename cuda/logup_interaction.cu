@@ -228,6 +228,49 @@ __global__ void logup_memory_fused_kernel(
 }
 
 // ============================================================================
+// CHUNKED LogUp: process one (addr, value) pair at a time.
+// Accumulates 1/(z - addr - alpha*val) into running output.
+// Called 4 times (once per memory access) with only 2 columns in VRAM.
+// Enables log_n=28+ by never holding more than 2 eval columns.
+// ============================================================================
+
+__global__ void logup_accumulate_pair_kernel(
+    const uint32_t* __restrict__ col_addr,
+    const uint32_t* __restrict__ col_val,
+    uint32_t* __restrict__ acc0, uint32_t* __restrict__ acc1,
+    uint32_t* __restrict__ acc2, uint32_t* __restrict__ acc3,
+    uint32_t z0, uint32_t z1, uint32_t z2, uint32_t z3,
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t n,
+    uint32_t is_first  // if 1, write instead of accumulate
+) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    QM31 z = {{z0, z1, z2, z3}};
+    QM31 alpha = {{a0, a1, a2, a3}};
+
+    // denom = z - (addr + alpha * val)
+    QM31 entry = qm31_mul_m31(alpha, col_val[i]);
+    entry.v[0] = m31_add(entry.v[0], col_addr[i]);
+    QM31 denom = qm31_sub(z, entry);
+
+    // 1/denom via inline QM31 inverse
+    QM31 inv = qm31_inv(denom);
+
+    if (is_first) {
+        acc0[i] = inv.v[0]; acc1[i] = inv.v[1];
+        acc2[i] = inv.v[2]; acc3[i] = inv.v[3];
+    } else {
+        // Accumulate: acc += 1/denom
+        QM31 prev = {{acc0[i], acc1[i], acc2[i], acc3[i]}};
+        QM31 sum = qm31_add(prev, inv);
+        acc0[i] = sum.v[0]; acc1[i] = sum.v[1];
+        acc2[i] = sum.v[2]; acc3[i] = sum.v[3];
+    }
+}
+
+// ============================================================================
 // QM31 Parallel Prefix Sum (Inclusive Scan)
 // ============================================================================
 
@@ -383,6 +426,21 @@ __global__ void qm31_inverse_kernel(
 }
 
 extern "C" {
+
+void cuda_logup_accumulate_pair(
+    const uint32_t* col_addr, const uint32_t* col_val,
+    uint32_t* acc0, uint32_t* acc1, uint32_t* acc2, uint32_t* acc3,
+    const uint32_t* z, const uint32_t* alpha,
+    uint32_t n, uint32_t is_first
+) {
+    uint32_t threads = 256;
+    uint32_t blocks = (n + threads - 1) / threads;
+    logup_accumulate_pair_kernel<<<blocks, threads>>>(
+        col_addr, col_val, acc0, acc1, acc2, acc3,
+        z[0], z[1], z[2], z[3], alpha[0], alpha[1], alpha[2], alpha[3],
+        n, is_first
+    );
+}
 
 void cuda_logup_memory_fused(
     const uint32_t* col_pc, const uint32_t* col_inst_lo,

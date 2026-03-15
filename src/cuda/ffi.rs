@@ -243,6 +243,15 @@ unsafe extern "C" {
     );
 
     // LogUp interaction kernels
+    /// Chunked LogUp: process one (addr, value) pair, accumulate into running sum.
+    /// Call 4 times (once per memory access) with is_first=1 for the first call.
+    pub fn cuda_logup_accumulate_pair(
+        col_addr: *const u32, col_val: *const u32,
+        acc0: *mut u32, acc1: *mut u32, acc2: *mut u32, acc3: *mut u32,
+        z: *const u32, alpha: *const u32,
+        n: u32, is_first: u32,
+    );
+
     pub fn cuda_logup_memory_fused(
         col_pc: *const u32, col_inst_lo: *const u32,
         col_dst_addr: *const u32, col_dst: *const u32,
