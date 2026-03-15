@@ -3,11 +3,11 @@
 /// with both VM constraints and Poseidon round constraints verified.
 use kraken_stark::cairo_air::{
     decode::Instruction,
-    vm::{Memory, execute_to_columns, CairoState},
+    vm::{Memory, execute_to_columns},
     trace::{self, N_COLS},
     builtins::{PoseidonBuiltin, POSEIDON_BUILTIN_BASE, vm_poseidon_invoke},
 };
-use kraken_stark::poseidon::{STATE_WIDTH, NUM_ROUNDS};
+use kraken_stark::poseidon::STATE_WIDTH;
 use kraken_stark::circle::Coset;
 use kraken_stark::cuda::ffi;
 use kraken_stark::device::DeviceBuffer;

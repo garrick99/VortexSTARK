@@ -13,8 +13,6 @@
 //!
 //! For M31 representation: 252 bits decomposed into 8 chunks of 31-32 bits.
 
-use crate::field::M31;
-
 /// Bitwise builtin entry: (input_a, input_b, and, xor, or)
 pub struct BitwiseBuiltin {
     pub entries: Vec<BitwiseEntry>,

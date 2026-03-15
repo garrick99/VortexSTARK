@@ -9,8 +9,8 @@
 
 use kraken_stark::cairo_air::{
     builtins::gpu_pedersen_builtin_trace,
-    pedersen::{self, PedersenBuiltin, Stark252, N_LIMBS, gpu_init, stark252_to_fp, fp_to_stark252},
-    stark252_field::{Fp, pedersen_hash},
+    pedersen::{self, PedersenBuiltin, gpu_init, fp_to_stark252},
+    stark252_field::Fp,
 };
 use kraken_stark::circle::Coset;
 use kraken_stark::cuda::ffi;

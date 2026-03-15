@@ -674,7 +674,7 @@ impl MerkleTree {
     /// This is O(n_queries * 1024) instead of O(n).
     pub fn targeted_auth_paths_with_tile_roots(
         tile_roots: &[[u32; HASH_WORDS]],
-        n_leaves: usize,
+        _n_leaves: usize,
         indices: &[usize],
         hash_leaf: &dyn Fn(usize) -> [u32; HASH_WORDS],
     ) -> Vec<Vec<[u32; HASH_WORDS]>> {
@@ -729,7 +729,6 @@ impl MerkleTree {
 
     /// Build CPU Merkle tree layers from leaf hashes. Returns [leaves, parents, ..., root].
     pub fn build_cpu_tree_layers(leaf_hashes: Vec<[u32; HASH_WORDS]>) -> Vec<Vec<[u32; HASH_WORDS]>> {
-        use crate::channel::blake2s_hash;
         let mut layers = vec![leaf_hashes];
         while layers.last().unwrap().len() > 1 {
             let prev = layers.last().unwrap();
@@ -800,7 +799,7 @@ impl MerkleTree {
         let n_leaves = 1u32 << log_n_leaves;
 
         // Use fused leaf+merge to get n/2 parent hashes
-        let mut current_size = n_leaves / 2;
+        let current_size = n_leaves / 2;
         let mut current = DeviceBuffer::<u32>::alloc((current_size as usize) * HASH_WORDS);
         unsafe {
             ffi::cuda_merkle_hash_leaves_merge_soa4(

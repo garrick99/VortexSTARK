@@ -339,8 +339,8 @@ fn reduce_512_old(full: &[u64; 8]) -> Fp {
 
     // hi[2]*544 goes to position 5 — we need a second fold.
     // hi[3]*544 goes to position 6 — also needs folding.
-    let overflow2 = hi[2] * 544; // goes to 2^(64*5) = 2^320
-    let overflow3 = hi[3] * 544; // goes to 2^(64*6) = 2^384
+    let _overflow2 = hi[2] * 544; // goes to 2^(64*5) = 2^320
+    let _overflow3 = hi[3] * 544; // goes to 2^(64*6) = 2^384
 
     // 2^320 = 2^256 * 2^64 ≡ -(544·2^192+32) * 2^64 mod p
     //   = -(544·2^256 + 32·2^64) ≡ -(-544*(544·2^192+32) + 32·2^64) ... getting recursive.
@@ -492,6 +492,7 @@ impl ProjectivePoint {
         Self { x, y, z: Fp::ONE }
     }
 
+    #[allow(dead_code)]
     fn is_infinity(&self) -> bool {
         self.z.is_zero()
     }
@@ -518,8 +519,8 @@ impl ProjectivePoint {
         let xx = self.x * self.x;
         let yy = self.y * self.y;
         let zz = self.z * self.z;
-        let xy2 = (self.x * self.y) + (self.x * self.y); // 2*x*y
-        let w = xx + xx + xx + a * zz * zz; // 3x² + a*z⁴... simplified for a=1
+        let _xy2 = (self.x * self.y) + (self.x * self.y); // 2*x*y
+        let _w = xx + xx + xx + a * zz * zz; // 3x² + a*z⁴... simplified for a=1
         // Actually for short Weierstrass y²=x³+ax+b in Jacobian coords:
         // Use simpler formulas. Let me use the standard Jacobian doubling:
         // For y²=x³+ax+b, Jacobian: (X:Y:Z) represents (X/Z², Y/Z³)

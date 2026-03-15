@@ -2,7 +2,7 @@
 use kraken_stark::cuda::ffi;
 use kraken_stark::field::M31;
 use kraken_stark::poseidon;
-use kraken_stark::cairo_air::{decode::Instruction, vm::{Memory, execute_to_columns}, trace, builtins};
+use kraken_stark::cairo_air::{decode::Instruction, vm::{Memory, execute_to_columns}, trace};
 use std::time::Instant;
 
 fn main() {

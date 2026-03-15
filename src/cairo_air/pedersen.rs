@@ -153,7 +153,7 @@ impl PedersenBuiltin {
 
     /// Invoke Pedersen hash using real EC arithmetic on the STARK curve.
     pub fn invoke(&mut self, a: Stark252, b: Stark252) -> Stark252 {
-        use super::stark252_field::{Fp, pedersen_hash};
+        use super::stark252_field::pedersen_hash;
         let fp_a = stark252_to_fp(&a);
         let fp_b = stark252_to_fp(&b);
         let fp_out = pedersen_hash(fp_a, fp_b);
@@ -247,7 +247,7 @@ pub fn fp_to_stark252(fp: &super::stark252_field::Fp) -> Stark252 {
 
 /// Initialize GPU Pedersen: upload constant points and precomputed windowed tables.
 pub fn gpu_init() {
-    use super::stark252_field::{Fp, CurvePoint, pedersen_points};
+    use super::stark252_field::{CurvePoint, pedersen_points};
     use crate::cuda::ffi;
 
     let points = pedersen_points();
@@ -348,14 +348,12 @@ pub fn gpu_hash_batch(
     use crate::cuda::ffi;
     use crate::device::DeviceBuffer;
     use super::stark252_field::Fp;
-    use std::ffi::c_void;
-
     let n = inputs_a.len();
     assert_eq!(n, inputs_b.len());
     if n == 0 { return vec![]; }
 
     let n_u64 = n * 4;
-    let bytes_in = n_u64 * std::mem::size_of::<u64>();
+    let _bytes_in = n_u64 * std::mem::size_of::<u64>();
 
     // Zero-copy reinterpret inputs (Fp is repr(C) with [u64; 4])
     let flat_a = unsafe { std::slice::from_raw_parts(inputs_a.as_ptr() as *const u64, n_u64) };
@@ -413,8 +411,6 @@ pub fn gpu_pedersen_trace(
 ) -> Vec<crate::device::DeviceBuffer<u32>> {
     use crate::cuda::ffi;
     use crate::device::DeviceBuffer;
-    use std::ffi::c_void;
-
     let n = inputs_a.len();
     assert_eq!(n, inputs_b.len());
     let trace_len = 1usize << log_trace_len;
@@ -544,7 +540,7 @@ pub fn gpu_hash_batch_timed(
     (results, timing)
 }
 
-/// Batch inverse for Fp values using Montgomery's trick.
+#[allow(dead_code)]
 fn batch_inverse_fp(values: &[super::stark252_field::Fp]) -> Vec<super::stark252_field::Fp> {
     use super::stark252_field::Fp;
 

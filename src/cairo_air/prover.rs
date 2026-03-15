@@ -23,11 +23,18 @@ use crate::fri::{self, SecureColumn};
 use crate::merkle::MerkleTree;
 use crate::ntt::{self, ForwardTwiddleCache, InverseTwiddleCache};
 use crate::prover::{QueryDecommitment, N_QUERIES, BLOWUP_BITS};
-use super::trace::{N_COLS, N_CONSTRAINTS, COL_PC, COL_INST_LO,
+use super::trace::{N_COLS, N_CONSTRAINTS, COL_PC, COL_INST_LO, COL_INST_HI,
     COL_DST_ADDR, COL_DST, COL_OP0_ADDR, COL_OP0, COL_OP1_ADDR, COL_OP1};
+
+/// Columns the LogUp kernel reads (memory address/value pairs).
+const LOGUP_COLS: [usize; 8] = [COL_PC, COL_INST_LO, COL_DST_ADDR, COL_DST,
+    COL_OP0_ADDR, COL_OP0, COL_OP1_ADDR, COL_OP1];
+
+/// Columns NOT read by the quotient kernel (address cols + instruction encoding).
+/// Freeing these before quotient allocation saves ~5 GiB VRAM.
+const QUOTIENT_UNUSED_COLS: [usize; 5] = [COL_INST_LO, COL_INST_HI, COL_DST_ADDR,
+    COL_OP0_ADDR, COL_OP1_ADDR];
 use super::vm::Memory;
-use super::logup;
-use super::range_check;
 use super::ec_constraint;
 
 /// Public inputs for a Cairo proof: initial/final VM state + program hash.
@@ -202,7 +209,7 @@ pub fn cairo_prove_cached(
     let mut mem = Memory::with_capacity(n_steps + 200);
     mem.load_program(program);
     let columns = super::vm::execute_to_columns(&mut mem, n_steps, log_n);
-    let vm_ms = t_phase1.elapsed().as_secs_f64() * 1000.0;
+    let _vm_ms = t_phase1.elapsed().as_secs_f64() * 1000.0;
 
     // Memory table and range check extraction are expensive (BTreeMap over n_steps×4 entries).
     // The LogUp/RC final sums are bound into Fiat-Shamir — the verifier doesn't need
@@ -225,6 +232,20 @@ pub fn cairo_prove_cached(
     let _ntt_ms = t_ntt.elapsed().as_secs_f64() * 1000.0;
 
     let trace_commitment = MerkleTree::commit_root_only(&d_eval_cols, log_eval_size);
+
+    // ---- VRAM streaming: download all eval cols to host, free non-LogUp cols ----
+    // At log_n=27 the 27 columns consume 28.9 GiB. We download all to host and
+    // keep only the 8 LogUp columns on GPU, freeing ~20 GiB before LogUp allocation.
+    let host_eval_cols: Vec<Vec<u32>> = d_eval_cols.iter().map(|c| c.to_host_fast()).collect();
+    {
+        let logup_set: std::collections::HashSet<usize> = LOGUP_COLS.iter().copied().collect();
+        for c in (0..N_COLS).rev() {
+            if !logup_set.contains(&c) {
+                // Replace with empty buffer, Drop frees GPU memory
+                d_eval_cols[c] = DeviceBuffer::<u32>::alloc(0);
+            }
+        }
+    }
 
     let mut channel = Channel::new();
     channel.mix_digest(&public_inputs.program_hash);
@@ -253,7 +274,7 @@ pub fn cairo_prove_cached(
             let mut d_eval = DeviceBuffer::<u32>::alloc(ec_eval_size);
             unsafe {
                 ffi::cuda_zero_pad(d_col.as_ptr(), d_eval.as_mut_ptr(),
-                    (1u32 << ec_log), ec_eval_size as u32);
+                    1u32 << ec_log, ec_eval_size as u32);
             }
             drop(d_col);
             ntt::evaluate(&mut d_eval, &ec_fwd);
@@ -332,13 +353,29 @@ pub fn cairo_prove_cached(
     ]);
     drop(d_logup0); drop(d_logup1); drop(d_logup2); drop(d_logup3);
 
+    // Free remaining LogUp eval cols — all trace data now lives on host only
+    drop(d_eval_cols);
+
     // ---- Phase 3: Quotient ----
     let constraint_alphas: Vec<QM31> = (0..N_CONSTRAINTS).map(|_| channel.draw_felt()).collect();
     let alpha_flat: Vec<u32> = constraint_alphas.iter().flat_map(|a| a.to_u32_array()).collect();
 
-    // Trace values will be extracted after query indices are known (avoid 14GB download)
-
-    let col_ptrs: Vec<*const u32> = d_eval_cols.iter().map(|c| c.as_ptr()).collect();
+    // Re-upload only the 22 columns the quotient kernel actually reads.
+    // The 5 unused columns (INST_LO, INST_HI, DST_ADDR, OP0_ADDR, OP1_ADDR)
+    // get a dummy pointer — the kernel never dereferences them.
+    let unused_set: std::collections::HashSet<usize> = QUOTIENT_UNUSED_COLS.iter().copied().collect();
+    let mut d_quot_cols: Vec<DeviceBuffer<u32>> = Vec::with_capacity(N_COLS);
+    let d_dummy = DeviceBuffer::<u32>::alloc(1); // 4-byte valid pointer for unused slots
+    for c in 0..N_COLS {
+        if unused_set.contains(&c) {
+            d_quot_cols.push(DeviceBuffer::<u32>::alloc(0));
+        } else {
+            d_quot_cols.push(DeviceBuffer::from_host(&host_eval_cols[c]));
+        }
+    }
+    let col_ptrs: Vec<*const u32> = (0..N_COLS).map(|c| {
+        if unused_set.contains(&c) { d_dummy.as_ptr() } else { d_quot_cols[c].as_ptr() }
+    }).collect();
     let d_col_ptrs = DeviceBuffer::from_host(&col_ptrs);
     let d_alpha = DeviceBuffer::from_host(&alpha_flat);
 
@@ -356,17 +393,21 @@ pub fn cairo_prove_cached(
         );
         ffi::cuda_device_sync();
     }
-    // Keep d_eval_cols alive for sparse trace extraction after query indices are known
+    // Free quotient-phase eval cols — trace data stays on host_eval_cols
+    drop(d_quot_cols);
+    drop(d_dummy);
+    drop(d_col_ptrs);
+    drop(d_alpha);
 
     let quotient_commitment = MerkleTree::commit_root_soa4(&q0, &q1, &q2, &q3, log_eval_size);
     channel.mix_digest(&quotient_commitment);
 
-    // Keep quotient columns for sparse extraction after query indices are known.
-    // Clone the device pointers for FRI (FRI consumes its copy, we keep ours).
-    let q0_keep = q0.clone_device();
-    let q1_keep = q1.clone_device();
-    let q2_keep = q2.clone_device();
-    let q3_keep = q3.clone_device();
+    // Download quotient to host for sparse extraction (replaces clone_device).
+    // This avoids 4 × eval_size GPU clones that pushed VRAM over 32 GiB.
+    let host_q0 = q0.to_host_fast();
+    let host_q1 = q1.to_host_fast();
+    let host_q2 = q2.to_host_fast();
+    let host_q3 = q3.to_host_fast();
 
     // ---- Phase 4: FRI ----
     let quotient_col = SecureColumn { cols: [q0, q1, q2, q3], len: eval_size };
@@ -412,44 +453,26 @@ pub fn cairo_prove_cached(
         .map(|_| channel.draw_number(eval_size))
         .collect();
 
-    // Sparse trace extraction: download only ~200 values per column (not 134M)
+    // Sparse trace extraction from host (eval cols already downloaded after commitment)
     let trace_values_at_queries: Vec<[u32; N_COLS]> = {
         let mut result: Vec<[u32; N_COLS]> = vec![[0u32; N_COLS]; query_indices.len()];
-        let mut tmp = [0u32; 1];
         for c in 0..N_COLS {
             for (q, &qi) in query_indices.iter().enumerate() {
-                let idx = qi % eval_size;
-                unsafe {
-                    ffi::cudaMemcpy(
-                        tmp.as_mut_ptr() as *mut std::ffi::c_void,
-                        (d_eval_cols[c].as_ptr() as *const u8).add(idx * 4) as *const std::ffi::c_void,
-                        4, ffi::MEMCPY_D2H,
-                    );
-                }
-                result[q][c] = tmp[0];
+                result[q][c] = host_eval_cols[c][qi % eval_size];
             }
         }
         result
     };
     let trace_values_at_queries_next: Vec<[u32; N_COLS]> = {
         let mut result: Vec<[u32; N_COLS]> = vec![[0u32; N_COLS]; query_indices.len()];
-        let mut tmp = [0u32; 1];
         for c in 0..N_COLS {
             for (q, &qi) in query_indices.iter().enumerate() {
-                let idx = (qi + 1) % eval_size;
-                unsafe {
-                    ffi::cudaMemcpy(
-                        tmp.as_mut_ptr() as *mut std::ffi::c_void,
-                        (d_eval_cols[c].as_ptr() as *const u8).add(idx * 4) as *const std::ffi::c_void,
-                        4, ffi::MEMCPY_D2H,
-                    );
-                }
-                result[q][c] = tmp[0];
+                result[q][c] = host_eval_cols[c][(qi + 1) % eval_size];
             }
         }
         result
     };
-    drop(d_eval_cols);
+    drop(host_eval_cols);
 
     // EC trace at query points
     let (ec_trace_at_queries, ec_trace_at_queries_next) = if let Some(ref ec_host) = ec_trace_host {
@@ -467,11 +490,11 @@ pub fn cairo_prove_cached(
         (Vec::new(), Vec::new())
     };
 
-    // Sparse quotient decommitment: extract only queried values from GPU
-    let quotient_decommitment = sparse_decommit_soa4_gpu(
-        &[&q0_keep, &q1_keep, &q2_keep, &q3_keep], &query_indices, eval_size,
+    // Sparse quotient decommitment from host (downloaded after quotient commitment)
+    let quotient_decommitment = sparse_decommit_soa4_host(
+        &host_q0, &host_q1, &host_q2, &host_q3, &query_indices, eval_size,
     );
-    drop(q0_keep); drop(q1_keep); drop(q2_keep); drop(q3_keep);
+    drop(host_q0); drop(host_q1); drop(host_q2); drop(host_q3);
 
     // Sparse FRI decommitments: extract only queried values per layer
     let mut fri_decommitments = Vec::new();
@@ -526,8 +549,8 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
     channel.mix_digest(&proof.public_inputs.program_hash);
     channel.mix_digest(&proof.trace_commitment);
 
-    let z_mem = channel.draw_felt();
-    let alpha_mem = channel.draw_felt();
+    let _z_mem = channel.draw_felt();
+    let _alpha_mem = channel.draw_felt();
 
     // Verify EC trace commitment is bound into Fiat-Shamir
     if let Some(ref ec_commit) = proof.ec_trace_commitment {
@@ -892,7 +915,37 @@ fn sparse_decommit_soa4_gpu(
     }
 }
 
-/// Decommit SoA4 values + Merkle auth paths from host arrays at query indices.
+/// Host-side sparse decommitment for SoA4 columns (no GPU memory needed).
+fn sparse_decommit_soa4_host(
+    h0: &[u32], h1: &[u32], h2: &[u32], h3: &[u32],
+    indices: &[usize],
+    n: usize,
+) -> QueryDecommitment<[u32; 4]> {
+    let cols = [h0, h1, h2, h3];
+    let mut values = Vec::with_capacity(indices.len());
+    let mut sibling_values = Vec::with_capacity(indices.len());
+
+    for &idx in indices {
+        let sib_idx = idx ^ 1;
+        let mut val = [0u32; 4];
+        let mut sib = [0u32; 4];
+        for c in 0..4 {
+            val[c] = cols[c][idx % n];
+            sib[c] = cols[c][sib_idx % n];
+        }
+        values.push(val);
+        sibling_values.push(sib);
+    }
+
+    QueryDecommitment {
+        values,
+        sibling_values,
+        auth_paths: vec![Vec::new(); indices.len()],
+        sibling_auth_paths: vec![Vec::new(); indices.len()],
+    }
+}
+
+#[allow(dead_code)]
 fn decommit_from_host_soa4(
     host_cols: &[Vec<u32>],  // [4] columns
     indices: &[usize],
@@ -937,7 +990,7 @@ fn decommit_from_host_soa4(
     QueryDecommitment { values, sibling_values, auth_paths, sibling_auth_paths }
 }
 
-/// Decommit FRI layer values + auth paths from GPU SecureColumn.
+#[allow(dead_code)]
 fn decommit_fri_layer(
     eval: &SecureColumn,
     indices: &[usize],

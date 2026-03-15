@@ -284,9 +284,9 @@ fn prove_lean_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     // --- Step 7: FRI ---
     let t0 = Instant::now();
     let mut fri_commitments = Vec::new();
-    let mut fri_trees: Vec<MerkleTree> = Vec::new();
-    let mut fri_evals: Vec<SecureColumn> = Vec::new();
-    let mut current_eval = quotient_col;
+    let _fri_trees: Vec<MerkleTree> = Vec::new();
+    let _fri_evals: Vec<SecureColumn> = Vec::new();
+    let current_eval = quotient_col;
     let mut current_log_size = log_eval_size;
 
     // FRI layers above this threshold use root-only commit + CPU decommitment.
@@ -681,7 +681,7 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     let d_fold_twid = fri::compute_fold_twiddles_on_demand(&fold_domain, true);
 
     let fold_chunk_size = chunk_size / 2; // 2^26 fold outputs per quotient chunk
-    let fold_chunk_log: u32 = quotient_chunk_log - 1;
+    let _fold_chunk_log: u32 = quotient_chunk_log - 1;
     let n_fold_output = eval_size / 2; // 2^30
 
     let fri_alpha_arr = fri_alpha.to_u32_array();
@@ -1065,8 +1065,7 @@ fn decommit_soa4_gpu(
     }
 }
 
-/// Decommit single-column trace directly from GPU DeviceBuffer.
-/// Downloads only the ~200 needed tiles (~3.2MB) instead of 8GB.
+#[allow(dead_code)]
 fn decommit_trace_from_gpu_resident(
     d_eval: &DeviceBuffer<u32>,
     subtree_roots: &[[u32; 8]],
@@ -1128,8 +1127,7 @@ fn decommit_trace_from_gpu_resident(
     }
 }
 
-/// Decommit quotient from GPU eval data: recompute quotient values on CPU,
-/// build tile trees from GPU-gathered tile data.
+#[allow(dead_code)]
 fn decommit_quotient_from_gpu(
     d_eval: &DeviceBuffer<u32>,
     eval_size: usize,
@@ -1154,9 +1152,9 @@ fn decommit_quotient_from_gpu(
         let base = tile_idx * TILE_SIZE;
         // Download tile + 2 extra elements for constraint boundary
         let fetch_size = TILE_SIZE + 2;
-        let mut buf = vec![0u32; fetch_size];
+        let _buf = vec![0u32; fetch_size];
         for j in 0..fetch_size {
-            let idx = (base + j) % eval_size;
+            let _idx = (base + j) % eval_size;
             // Single-element D2H (batching would be faster but this is ~200 tiles × 1026 = 205K reads)
             // Actually let me download the tile in one shot and handle boundary separately
             if j < TILE_SIZE {
@@ -1193,7 +1191,7 @@ fn decommit_quotient_from_gpu(
     // Recompute quotient values and build tile Merkle trees
     let mut tile_trees: HashMap<usize, MerkleTree> = HashMap::new();
     for &tile_idx in &needed_tiles {
-        let base = tile_idx * TILE_SIZE;
+        let _base = tile_idx * TILE_SIZE;
         let eval_tile = &tile_eval[&tile_idx];
         let mut cols = [vec![0u32; TILE_SIZE], vec![0u32; TILE_SIZE],
                        vec![0u32; TILE_SIZE], vec![0u32; TILE_SIZE]];
@@ -1553,7 +1551,7 @@ fn prove_with_cache(a: M31, b: M31, cache: &ProverCache, timed: bool) -> StarkPr
     let mut fri_commitments = Vec::new();
     let mut fri_trees: Vec<MerkleTree> = Vec::new();
     let mut fri_evals: Vec<SecureColumn> = Vec::new();
-    let mut current_eval = quotient_col;
+    let current_eval = quotient_col;
     let mut current_log_size = log_eval_size;
 
     // Circle fold
@@ -1763,7 +1761,7 @@ fn gpu_tile_auth_paths_single(
 
     const TILE_SIZE: usize = 1024;
     let n = host_col.len();
-    let n_tiles = n / TILE_SIZE;
+    let _n_tiles = n / TILE_SIZE;
 
     // Collect unique tiles needed
     let needed_tiles: BTreeSet<usize> = indices.iter().map(|&qi| qi / TILE_SIZE).collect();

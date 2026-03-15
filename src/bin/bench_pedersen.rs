@@ -257,7 +257,7 @@ fn main() {
         let _ = pedersen::gpu_pedersen_trace(&inputs_a, &inputs_b, log_n);
 
         let t0 = Instant::now();
-        let d_cols = pedersen::gpu_pedersen_trace(&inputs_a, &inputs_b, log_n);
+        let _d_cols = pedersen::gpu_pedersen_trace(&inputs_a, &inputs_b, log_n);
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         let rate = n as f64 / (ms / 1000.0);
         let trace_rows = 1u64 << log_n;

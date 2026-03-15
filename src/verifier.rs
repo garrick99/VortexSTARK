@@ -259,7 +259,7 @@ fn verify_decommitment_auth_paths(
     auth_paths: &[Vec<[u32; 8]>],
     sibling_auth_paths: &[Vec<[u32; 8]>],
     indices: &[usize],
-    n_cols: usize,
+    _n_cols: usize,
     label: &str,
 ) -> Result<(), String> {
     if values.len() != N_QUERIES || auth_paths.len() != N_QUERIES {

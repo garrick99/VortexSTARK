@@ -134,6 +134,9 @@ fn fib_at(a: M31, b: M31, k: usize) -> (M31, M31) {
 /// Each chunk computes its starting values via matrix exponentiation, then fills forward.
 /// SAFETY: `out` must point to pinned memory of at least `n` u32 elements.
 pub unsafe fn fibonacci_trace_parallel(a: M31, b: M31, log_n: u32, out: *mut u32) {
+  // SAFETY: caller guarantees `out` points to pinned memory of >= (1<<log_n) u32s.
+  // Each chunk writes to disjoint indices.
+  unsafe {
     let n = 1usize << log_n;
     let p = crate::field::m31::P;
 
@@ -183,7 +186,7 @@ pub unsafe fn fibonacci_trace_parallel(a: M31, b: M31, log_n: u32, out: *mut u32
             });
         }
     });
-}
+}}
 
 /// Evaluate the transition constraint at a single point.
 /// Returns t[i+2] - t[i+1] - t[i] (should be 0 for valid trace).

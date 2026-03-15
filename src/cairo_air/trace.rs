@@ -127,7 +127,7 @@ pub fn eval_transition_constraints(
 
     // Flag values
     let f = |i: usize| -> M31 { val(COL_FLAGS_START + i, row) };
-    let dst_reg = f(0);
+    let _dst_reg = f(0);
     let _op0_reg = f(1);
     let _op1_imm = f(2);
     let _op1_fp = f(3);
@@ -171,7 +171,7 @@ pub fn eval_transition_constraints(
     // jnz: if dst != 0, pc += op1; else pc += inst_size
     // This is hard to express as a single polynomial. Use: pc_jnz * (dst * (next_pc - pc - op1) + (1-dst_nonzero) * (next_pc - pc - inst_size))
     // For now, simplified constraint (works when trace is correct):
-    let expected_pc = pc_regular + pc_abs + pc_rel + pc_jnz * (pc + op1);
+    let _expected_pc = pc_regular + pc_abs + pc_rel + pc_jnz * (pc + op1);
     // Only check when not jnz with dst=0 (degenerate case handled by the VM)
     constraints.push((one - pc_jnz) * (next_pc - (pc_regular + pc_abs + pc_rel))
         + pc_jnz * dst * (next_pc - pc - op1));

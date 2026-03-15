@@ -6,20 +6,17 @@
 /// Then: combined quotient → FRI
 use kraken_stark::cairo_air::{
     decode::Instruction,
-    vm::{Memory, execute},
-    trace::{self, N_COLS, N_CONSTRAINTS, COL_PC, COL_INST_LO, COL_DST_ADDR, COL_DST,
+    vm::Memory,
+    trace::{N_COLS, N_CONSTRAINTS, COL_PC, COL_INST_LO, COL_DST_ADDR, COL_DST,
             COL_OP0_ADDR, COL_OP0, COL_OP1_ADDR, COL_OP1},
-    logup,
-    range_check,
-    pedersen::{self, PedersenBuiltin, Stark252, gpu_init, N_LIMBS},
+    pedersen::{PedersenBuiltin, gpu_init, N_LIMBS},
     builtins::gpu_pedersen_builtin_trace,
     stark252_field::Fp,
 };
 use kraken_stark::circle::Coset;
 use kraken_stark::cuda::ffi;
 use kraken_stark::device::DeviceBuffer;
-use kraken_stark::field::{M31, QM31};
-use kraken_stark::field::cm31::CM31;
+use kraken_stark::field::QM31;
 use kraken_stark::fri::{self, SecureColumn};
 use kraken_stark::merkle::MerkleTree;
 use kraken_stark::ntt::{self, ForwardTwiddleCache, InverseTwiddleCache};
@@ -111,7 +108,7 @@ fn main() {
     ffi::init_memory_pool();
     gpu_init();
 
-    for log_n in [20, 24, 26, 27] {
+    for log_n in [28] {
         let n: usize = 1 << log_n;
         let eval_size = 2 * n;
         let log_eval_size = log_n + 1;
@@ -203,7 +200,8 @@ fn main() {
                 d_eval_cols.push(d_eval);
             }
         }
-        drop(columns);
+        // Keep columns for chunked LogUp at large log_n
+        let columns_for_logup = columns;
 
         // Combine 27 per-column roots into single trace commitment
         let trace_commitment = {
@@ -249,7 +247,7 @@ fn main() {
             channel.mix_digest(&ped_commitment);
         }
 
-        let phase1_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let _phase1_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         // =============================================
         // Phase 2: LogUp interaction trace
@@ -268,22 +266,82 @@ fn main() {
         let mut d_logup2 = DeviceBuffer::<u32>::alloc(eval_size);
         let mut d_logup3 = DeviceBuffer::<u32>::alloc(eval_size);
 
-        // d_eval_cols now contains only the 8 LogUp columns in order:
-        // [0]=COL_PC, [1]=COL_INST_LO, [2]=COL_DST_ADDR, [3]=COL_DST,
-        // [4]=COL_OP0_ADDR, [5]=COL_OP0, [6]=COL_OP1_ADDR, [7]=COL_OP1
+        // Free NTT caches — they'll be recreated if needed for chunked LogUp or FRI.
+        drop(inv_cache);
+        drop(fwd_cache);
+
         let t_denoms = Instant::now();
-        unsafe {
-            ffi::cuda_logup_memory_fused(
-                d_eval_cols[0].as_ptr(), d_eval_cols[1].as_ptr(),
-                d_eval_cols[2].as_ptr(), d_eval_cols[3].as_ptr(),
-                d_eval_cols[4].as_ptr(), d_eval_cols[5].as_ptr(),
-                d_eval_cols[6].as_ptr(), d_eval_cols[7].as_ptr(),
-                d_logup0.as_mut_ptr(), d_logup1.as_mut_ptr(),
-                d_logup2.as_mut_ptr(), d_logup3.as_mut_ptr(),
-                z_arr.as_ptr(), alpha_arr.as_ptr(),
-                eval_size as u32,
-            );
-            ffi::cuda_device_sync();
+        if log_n < 28 {
+            // Standard fused path: all 8 LogUp columns in VRAM simultaneously
+            unsafe {
+                ffi::cuda_logup_memory_fused(
+                    d_eval_cols[0].as_ptr(), d_eval_cols[1].as_ptr(),
+                    d_eval_cols[2].as_ptr(), d_eval_cols[3].as_ptr(),
+                    d_eval_cols[4].as_ptr(), d_eval_cols[5].as_ptr(),
+                    d_eval_cols[6].as_ptr(), d_eval_cols[7].as_ptr(),
+                    d_logup0.as_mut_ptr(), d_logup1.as_mut_ptr(),
+                    d_logup2.as_mut_ptr(), d_logup3.as_mut_ptr(),
+                    z_arr.as_ptr(), alpha_arr.as_ptr(),
+                    eval_size as u32,
+                );
+                ffi::cuda_device_sync();
+            }
+        } else {
+            // Chunked path: process one (addr, val) pair at a time.
+            // Only 2 eval columns in VRAM at once. Scales to log_n=30.
+            // Memory access pairs: (pc, inst), (dst_addr, dst), (op0_addr, op0), (op1_addr, op1)
+            let access_pairs: [(usize, usize); 4] = [
+                (COL_PC, COL_INST_LO),
+                (COL_DST_ADDR, COL_DST),
+                (COL_OP0_ADDR, COL_OP0),
+                (COL_OP1_ADDR, COL_OP1),
+            ];
+
+            // Recreate NTT caches (were freed to make room)
+            let trace_domain2 = Coset::half_coset(log_n);
+            let eval_domain2 = Coset::half_coset(log_eval_size);
+            let inv_cache2 = InverseTwiddleCache::new(&trace_domain2);
+            let fwd_cache2 = ForwardTwiddleCache::new(&eval_domain2);
+
+            for (pair_idx, &(addr_col, val_col)) in access_pairs.iter().enumerate() {
+                let mut d_addr = DeviceBuffer::from_host(&columns_for_logup[addr_col]);
+                ntt::interpolate(&mut d_addr, &inv_cache2);
+                let mut d_addr_eval = DeviceBuffer::<u32>::alloc(eval_size);
+                unsafe {
+                    ffi::cuda_zero_pad(d_addr.as_ptr(), d_addr_eval.as_mut_ptr(),
+                        n as u32, eval_size as u32);
+                }
+                drop(d_addr);
+                ntt::evaluate(&mut d_addr_eval, &fwd_cache2);
+
+                let mut d_val = DeviceBuffer::from_host(&columns_for_logup[val_col]);
+                ntt::interpolate(&mut d_val, &inv_cache2);
+                let mut d_val_eval = DeviceBuffer::<u32>::alloc(eval_size);
+                unsafe {
+                    ffi::cuda_zero_pad(d_val.as_ptr(), d_val_eval.as_mut_ptr(),
+                        n as u32, eval_size as u32);
+                }
+                drop(d_val);
+                ntt::evaluate(&mut d_val_eval, &fwd_cache2);
+
+                // Accumulate this pair's LogUp contribution
+                unsafe {
+                    ffi::cuda_logup_accumulate_pair(
+                        d_addr_eval.as_ptr(), d_val_eval.as_ptr(),
+                        d_logup0.as_mut_ptr(), d_logup1.as_mut_ptr(),
+                        d_logup2.as_mut_ptr(), d_logup3.as_mut_ptr(),
+                        z_arr.as_ptr(), alpha_arr.as_ptr(),
+                        eval_size as u32,
+                        if pair_idx == 0 { 1 } else { 0 },
+                    );
+                    ffi::cuda_device_sync();
+                }
+                // Free this pair's eval columns — next pair will use the VRAM
+                drop(d_addr_eval);
+                drop(d_val_eval);
+            }
+            drop(inv_cache2);
+            drop(fwd_cache2);
         }
         let denoms_ms = t_denoms.elapsed().as_secs_f64() * 1000.0;
         let inv_ms = 0.0;  // fused into denoms
@@ -315,7 +373,7 @@ fn main() {
         // At log_n>=27, we use streaming column batches and can't hold all 27
         // columns for the quotient kernel simultaneously. Use a zero quotient
         // (the NTT + LogUp + commitment pipeline is the scaling test).
-        let constraint_alphas: Vec<QM31> = (0..N_CONSTRAINTS).map(|_| channel.draw_felt()).collect();
+        let _constraint_alphas: Vec<QM31> = (0..N_CONSTRAINTS).map(|_| channel.draw_felt()).collect();
 
         let mut q0 = DeviceBuffer::<u32>::alloc(eval_size);
         let mut q1 = DeviceBuffer::<u32>::alloc(eval_size);
@@ -356,8 +414,7 @@ fn main() {
         let phase3_ms = t_phase3.elapsed().as_secs_f64() * 1000.0;
 
         let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        drop(inv_cache);
-        drop(fwd_cache);
+        drop(columns_for_logup);
 
         if all_zero {
             println!("SUSPICIOUS in {total_ms:.0}ms");

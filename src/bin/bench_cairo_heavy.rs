@@ -9,8 +9,8 @@
 
 use kraken_stark::cairo_air::{
     decode::Instruction,
-    prover::{cairo_prove, cairo_prove_cached, cairo_prove_with_pedersen, cairo_verify, CairoProverCache},
-    pedersen::{self, PedersenBuiltin, gpu_init, N_LIMBS},
+    prover::{cairo_prove_cached, cairo_verify, CairoProverCache},
+    pedersen::gpu_init,
     stark252_field::Fp,
 };
 use kraken_stark::cuda::ffi;

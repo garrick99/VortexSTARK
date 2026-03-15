@@ -4,7 +4,7 @@ use kraken_stark::poseidon::{self, STATE_WIDTH, NUM_ROUNDS};
 use kraken_stark::circle::Coset;
 use kraken_stark::cuda::ffi;
 use kraken_stark::device::DeviceBuffer;
-use kraken_stark::field::{M31, QM31};
+use kraken_stark::field::QM31;
 use kraken_stark::fri::{self, SecureColumn};
 use kraken_stark::merkle::MerkleTree;
 use kraken_stark::ntt::{self, ForwardTwiddleCache, InverseTwiddleCache};
@@ -52,7 +52,7 @@ fn main() {
         drop(d_trace_cols);
         drop(inv_cache);
         drop(fwd_cache);
-        let ntt_ms = Instant::now().duration_since(t0 + std::time::Duration::from_secs_f64(trace_ms / 1000.0)).as_secs_f64() * 1000.0;
+        let _ntt_ms = Instant::now().duration_since(t0 + std::time::Duration::from_secs_f64(trace_ms / 1000.0)).as_secs_f64() * 1000.0;
 
         // 3. Commit trace (all columns)
         let trace_commitment = MerkleTree::commit_root_only(&d_eval_cols, log_eval_size);

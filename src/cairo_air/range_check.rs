@@ -15,7 +15,6 @@
 //! Each row has 3 offsets → 3 LogUp contributions per row.
 
 use crate::field::{M31, QM31};
-use crate::field::cm31::CM31;
 use super::logup::qm31_from_m31;
 
 /// Number of offset values per row (off0, off1, off2).
@@ -118,6 +117,7 @@ pub fn extract_offsets(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::field::cm31::CM31;
     use crate::cairo_air::{decode::Instruction, vm::{Memory, execute}, trace};
 
     #[test]

@@ -79,12 +79,10 @@ fn main() {
     let mut total_hashes: u64 = 0;
     let mut interval_hashes: u64 = 0;
     let mut total_batches: u64 = 0;
-    let mut interval_batches: u64 = 0;
     let mut peak_throughput: f64 = 0.0;
     let mut min_throughput: f64 = f64::MAX;
     let mut max_batch_ms: f64 = 0.0;
     let mut min_batch_ms: f64 = f64::MAX;
-    let mut interval_count: u32 = 0;
 
     // Per-interval tracking for variance
     let mut interval_throughputs: Vec<f64> = Vec::new();
@@ -110,7 +108,6 @@ fn main() {
         total_hashes += batch_size as u64;
         interval_hashes += batch_size as u64;
         total_batches += 1;
-        interval_batches += 1;
 
         if batch_ms > max_batch_ms { max_batch_ms = batch_ms; }
         if batch_ms < min_batch_ms { min_batch_ms = batch_ms; }
@@ -118,7 +115,6 @@ fn main() {
         // Report every interval
         let interval_elapsed = interval_start.elapsed();
         if interval_elapsed >= report_interval {
-            interval_count += 1;
             let interval_secs = interval_elapsed.as_secs_f64();
             let interval_tp = interval_hashes as f64 / interval_secs;
             let sustained_tp = total_hashes as f64 / elapsed.as_secs_f64();
@@ -142,7 +138,6 @@ fn main() {
 
             interval_start = Instant::now();
             interval_hashes = 0;
-            interval_batches = 0;
         }
     }
 

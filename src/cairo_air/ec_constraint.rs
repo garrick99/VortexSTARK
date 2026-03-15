@@ -22,7 +22,6 @@
 //!   GPU-generated trace (no CPU witness generation)
 //!   ~100 columns per step
 
-use crate::field::M31;
 use super::pedersen::N_LIMBS;
 
 /// Number of columns in the EC multiplication trace.
@@ -89,7 +88,7 @@ pub fn generate_ec_trace(
 
     let points = pedersen_points();
     // Base points for the 4 scalars (P1..P4)
-    let base_points: Vec<(Fp, Fp)> = (1..=4).map(|i| match points[i] {
+    let _base_points: Vec<(Fp, Fp)> = (1..=4).map(|i| match points[i] {
         CurvePoint::Affine(x, y) => (x, y),
         _ => panic!("base point is infinity"),
     }).collect();
@@ -386,7 +385,7 @@ pub fn verify_ec_double_cpu(
     lambda: &[u32; N_LIMBS],
 ) -> bool {
     use super::stark252_field::Fp;
-    use super::pedersen::{stark252_to_fp, fp_to_stark252, Stark252};
+    use super::pedersen::{stark252_to_fp, Stark252};
 
     // Convert from limbs to Fp for verification
     let to_fp = |limbs: &[u32; N_LIMBS]| -> Fp {
@@ -455,7 +454,7 @@ pub fn verify_ec_add_cpu(
 
 /// Verify a point is on the STARK curve: y² = x³ + x + β
 pub fn verify_on_curve_cpu(x: &[u32; N_LIMBS], y: &[u32; N_LIMBS]) -> bool {
-    use super::stark252_field::Fp;
+    
     use super::pedersen::{stark252_to_fp, Stark252};
 
     let fx = stark252_to_fp(&Stark252 { limbs: *x });

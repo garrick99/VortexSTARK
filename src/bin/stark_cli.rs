@@ -7,7 +7,7 @@
 
 use kraken_stark::cuda::ffi;
 use kraken_stark::field::M31;
-use kraken_stark::prover::{self, StarkProof, QueryDecommitment, N_QUERIES};
+use kraken_stark::prover::{self, StarkProof, QueryDecommitment};
 use kraken_stark::verifier;
 use kraken_stark::field::QM31;
 use std::io::{Read, Write, BufWriter, BufReader};
