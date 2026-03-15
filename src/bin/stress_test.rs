@@ -3,10 +3,10 @@
 //! Designed to detect thermal throttling, power spikes, and sustained throughput degradation.
 
 use std::time::{Duration, Instant};
-use kraken_stark::cairo_air::pedersen::gpu_init;
-use kraken_stark::cairo_air::pedersen::gpu_hash_batch;
-use kraken_stark::cairo_air::stark252_field::Fp;
-use kraken_stark::cuda::ffi;
+use vortex_stark::cairo_air::pedersen::gpu_init;
+use vortex_stark::cairo_air::pedersen::gpu_hash_batch;
+use vortex_stark::cairo_air::stark252_field::Fp;
+use vortex_stark::cuda::ffi;
 
 fn main() {
     let test_duration = Duration::from_secs(15 * 60); // 15 minutes
@@ -15,7 +15,7 @@ fn main() {
     let warmup_batches = 3;
 
     println!("╔══════════════════════════════════════════════════════════════════════════╗");
-    println!("║          KRAKEN-STARK GPU STRESS TEST — RTX 5090 @ 450W CAP            ║");
+    println!("║          VORTEXSTARK GPU STRESS TEST — RTX 5090 @ 450W CAP            ║");
     println!("╠══════════════════════════════════════════════════════════════════════════╣");
     println!("║  Duration:       15 minutes                                            ║");
     println!("║  Batch size:     100,000 Pedersen hashes                               ║");
@@ -47,7 +47,7 @@ fn main() {
     // Correctness check — hash first pair on CPU and GPU
     println!("[INIT] Correctness check...");
     let gpu_first = gpu_hash_batch(&inputs_a[..1], &inputs_b[..1]);
-    let cpu_first = kraken_stark::cairo_air::stark252_field::pedersen_hash(inputs_a[0], inputs_b[0]);
+    let cpu_first = vortex_stark::cairo_air::stark252_field::pedersen_hash(inputs_a[0], inputs_b[0]);
     if gpu_first[0] == cpu_first {
         println!("[INIT] Correctness: PASS (GPU == CPU for test vector)");
     } else {

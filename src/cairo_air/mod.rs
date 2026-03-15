@@ -1,4 +1,4 @@
-//! Cairo VM AIR for kraken-stark.
+//! Cairo VM AIR for VortexSTARK.
 //!
 //! Implements the full Cairo CPU constraint system:
 //! - Instruction decoding (15 flag bits)

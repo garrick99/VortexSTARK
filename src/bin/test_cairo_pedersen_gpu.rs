@@ -7,16 +7,16 @@
 /// VM execution with CPU Pedersen is a one-time cost (same in both paths).
 /// The GPU path eliminates CPU trace generation + 27 H2D transfers.
 
-use kraken_stark::cairo_air::{
+use vortex_stark::cairo_air::{
     builtins::gpu_pedersen_builtin_trace,
     pedersen::{self, PedersenBuiltin, gpu_init, fp_to_stark252},
     stark252_field::Fp,
 };
-use kraken_stark::circle::Coset;
-use kraken_stark::cuda::ffi;
-use kraken_stark::device::DeviceBuffer;
-use kraken_stark::merkle::MerkleTree;
-use kraken_stark::ntt::{self, ForwardTwiddleCache, InverseTwiddleCache};
+use vortex_stark::circle::Coset;
+use vortex_stark::cuda::ffi;
+use vortex_stark::device::DeviceBuffer;
+use vortex_stark::merkle::MerkleTree;
+use vortex_stark::ntt::{self, ForwardTwiddleCache, InverseTwiddleCache};
 use std::time::Instant;
 
 fn main() {

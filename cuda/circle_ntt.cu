@@ -1,4 +1,4 @@
-// M31 Circle NTT for kraken-stark.
+// M31 Circle NTT for VortexSTARK.
 // Forward (evaluate) and inverse (interpolate), single and batched.
 // Butterfly structure matches Circle STARK NTT exactly.
 

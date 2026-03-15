@@ -4,7 +4,7 @@
 /// Phase 1: Commit execution trace (27 VM columns + 27 Pedersen columns)
 /// Phase 2: Draw challenges → compute LogUp interaction trace → commit
 /// Then: combined quotient → FRI
-use kraken_stark::cairo_air::{
+use vortex_stark::cairo_air::{
     decode::Instruction,
     vm::Memory,
     trace::{N_COLS, N_CONSTRAINTS, COL_PC, COL_INST_LO, COL_DST_ADDR, COL_DST,
@@ -13,14 +13,14 @@ use kraken_stark::cairo_air::{
     builtins::gpu_pedersen_builtin_trace,
     stark252_field::Fp,
 };
-use kraken_stark::circle::Coset;
-use kraken_stark::cuda::ffi;
-use kraken_stark::device::DeviceBuffer;
-use kraken_stark::field::QM31;
-use kraken_stark::fri::{self, SecureColumn};
-use kraken_stark::merkle::MerkleTree;
-use kraken_stark::ntt::{self, ForwardTwiddleCache, InverseTwiddleCache};
-use kraken_stark::channel::Channel;
+use vortex_stark::circle::Coset;
+use vortex_stark::cuda::ffi;
+use vortex_stark::device::DeviceBuffer;
+use vortex_stark::field::QM31;
+use vortex_stark::fri::{self, SecureColumn};
+use vortex_stark::merkle::MerkleTree;
+use vortex_stark::ntt::{self, ForwardTwiddleCache, InverseTwiddleCache};
+use vortex_stark::channel::Channel;
 use std::time::Instant;
 
 /// Build a Fibonacci program in Cairo bytecode.
@@ -129,7 +129,7 @@ fn main() {
         let program = build_fib_program(n);
         let mut mem = Memory::with_capacity(n + 200);
         mem.load_program(&program);
-        let columns = kraken_stark::cairo_air::vm::execute_to_columns(&mut mem, n, log_n);
+        let columns = vortex_stark::cairo_air::vm::execute_to_columns(&mut mem, n, log_n);
         let vm_ms = t_vm.elapsed().as_secs_f64() * 1000.0;
 
         // Pedersen builtin: generate invocations + GPU trace columns

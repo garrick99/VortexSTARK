@@ -1,15 +1,15 @@
-/// kraken-stark CLI: prove and verify Fibonacci STARK proofs.
+/// VortexSTARK CLI: prove and verify Fibonacci STARK proofs.
 ///
 /// Usage:
 ///   stark_cli prove <log_n> [a] [b] [-o proof.bin]
 ///   stark_cli verify <proof.bin>
 ///   stark_cli bench <log_n>
 
-use kraken_stark::cuda::ffi;
-use kraken_stark::field::M31;
-use kraken_stark::prover::{self, StarkProof, QueryDecommitment};
-use kraken_stark::verifier;
-use kraken_stark::field::QM31;
+use vortex_stark::cuda::ffi;
+use vortex_stark::field::M31;
+use vortex_stark::prover::{self, StarkProof, QueryDecommitment};
+use vortex_stark::verifier;
+use vortex_stark::field::QM31;
 use std::io::{Read, Write, BufWriter, BufReader};
 use std::time::Instant;
 

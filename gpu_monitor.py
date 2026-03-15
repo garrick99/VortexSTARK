@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GPU watchdog monitor for kraken-stark benchmarking.
+"""GPU watchdog monitor for VortexSTARK benchmarking.
 
 Polls nvidia-smi at 1-second intervals, logs everything to CSV,
 and prints real-time alerts for anomalies: throttling, temp spikes,

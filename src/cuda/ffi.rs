@@ -1,4 +1,4 @@
-//! Raw FFI bindings to CUDA runtime and kraken-stark kernels.
+//! Raw FFI bindings to CUDA runtime and VortexSTARK kernels.
 
 use std::ffi::c_void;
 

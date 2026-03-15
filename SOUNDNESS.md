@@ -1,4 +1,4 @@
-# kraken-stark Soundness Status
+# VortexSTARK Soundness Status
 
 ## Done
 

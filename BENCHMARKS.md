@@ -1,4 +1,4 @@
-# kraken-stark Benchmark Artifact
+# VortexSTARK Benchmark Artifact
 
 ## CHECKPOINT: Pedersen-37M-Async (2026-03-14)
 

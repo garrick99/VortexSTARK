@@ -1,11 +1,11 @@
 [package]
-name = "kraken-stark"
+name = "vortex-stark"
 version = "0.1.0"
 edition = "2024"
 description = "GPU-native Circle STARK prover for RTX 5090"
 
 [lib]
-name = "kraken_stark"
+name = "vortex_stark"
 path = "src/lib.rs"
 
 [[bin]]

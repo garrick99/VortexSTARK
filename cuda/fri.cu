@@ -1,4 +1,4 @@
-// FRI fold kernels (SoA layout) for kraken-stark.
+// FRI fold kernels (SoA layout) for VortexSTARK.
 // fold_line: halves a line evaluation using alpha.
 // fold_circle_into_line: folds a circle evaluation into a line evaluation.
 

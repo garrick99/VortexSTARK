@@ -1,6 +1,6 @@
 /// Quick test: prove_lean at large log_n values to verify VRAM fits.
-use kraken_stark::field::M31;
-use kraken_stark::prover;
+use vortex_stark::field::M31;
+use vortex_stark::prover;
 use std::time::Instant;
 
 fn main() {
@@ -23,7 +23,7 @@ fn main() {
                     proof.fri_commitments.len(), proof.query_indices.len());
 
                 // Quick verify
-                match kraken_stark::verifier::verify(&proof) {
+                match vortex_stark::verifier::verify(&proof) {
                     Ok(()) => println!("  -> verified OK"),
                     Err(e) => println!("  -> VERIFY FAILED: {e}"),
                 }

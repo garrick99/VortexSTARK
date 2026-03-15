@@ -1,8 +1,8 @@
-use kraken_stark::circle::Coset;
-use kraken_stark::cuda::ffi;
-use kraken_stark::device::DeviceBuffer;
-use kraken_stark::field::M31;
-use kraken_stark::ntt::{self, TwiddleCache};
+use vortex_stark::circle::Coset;
+use vortex_stark::cuda::ffi;
+use vortex_stark::device::DeviceBuffer;
+use vortex_stark::field::M31;
+use vortex_stark::ntt::{self, TwiddleCache};
 use std::time::Instant;
 
 /// Benchmark statistics for a set of timings (in milliseconds).
@@ -40,7 +40,7 @@ fn print_stats(label: &str, stats: &Stats) {
 }
 
 fn main() {
-    println!("kraken-stark robust benchmark");
+    println!("VortexSTARK robust benchmark");
     println!("==============================");
     println!("GPU: RTX 5090 (SM 12.0), CUDA 13.0\n");
 
@@ -51,7 +51,7 @@ fn main() {
     let _ = DeviceBuffer::<u32>::alloc(1024);
     unsafe { ffi::cuda_device_sync() };
     // Run a throwaway prove to fully warm the GPU (context, caches, JIT)
-    let _ = kraken_stark::prover::prove(M31(1), M31(1), 8);
+    let _ = vortex_stark::prover::prove(M31(1), M31(1), 8);
 
     // =============================================
     // Field operations
@@ -182,8 +182,8 @@ fn main() {
         let n_elem = 1u32 << log_n;
 
         // warmup (2 runs)
-        let _ = kraken_stark::prover::prove(a, b, log_n);
-        let _ = kraken_stark::prover::prove(a, b, log_n);
+        let _ = vortex_stark::prover::prove(a, b, log_n);
+        let _ = vortex_stark::prover::prove(a, b, log_n);
 
         let iters = match log_n {
             20 => 20,
@@ -194,7 +194,7 @@ fn main() {
         let mut times = Vec::with_capacity(iters);
         for _ in 0..iters {
             let t0 = Instant::now();
-            let _proof = kraken_stark::prover::prove(a, b, log_n);
+            let _proof = vortex_stark::prover::prove(a, b, log_n);
             times.push(t0.elapsed().as_secs_f64() * 1000.0);
         }
         let stats = compute_stats(&mut times);
@@ -211,11 +211,11 @@ fn main() {
         let a = M31(1);
         let b = M31(1);
         let n_elem = 1u32 << log_n;
-        let cache = kraken_stark::prover::ProverCache::new(log_n);
+        let cache = vortex_stark::prover::ProverCache::new(log_n);
 
         // warmup
-        let _ = kraken_stark::prover::prove_cached(a, b, &cache);
-        let _ = kraken_stark::prover::prove_cached(a, b, &cache);
+        let _ = vortex_stark::prover::prove_cached(a, b, &cache);
+        let _ = vortex_stark::prover::prove_cached(a, b, &cache);
 
         let iters = match log_n {
             20 => 30,
@@ -226,7 +226,7 @@ fn main() {
         let mut times = Vec::with_capacity(iters);
         for _ in 0..iters {
             let t0 = Instant::now();
-            let _proof = kraken_stark::prover::prove_cached(a, b, &cache);
+            let _proof = vortex_stark::prover::prove_cached(a, b, &cache);
             times.push(t0.elapsed().as_secs_f64() * 1000.0);
         }
         let stats = compute_stats(&mut times);
@@ -241,7 +241,7 @@ fn main() {
     println!("=== STARK Prover (pipelined, overlapped trace gen) ===");
     for log_n in [8u32, 12, 16, 20] {
         let n_elem = 1u32 << log_n;
-        let pipeline = kraken_stark::prover::ProverPipeline::new(log_n);
+        let pipeline = vortex_stark::prover::ProverPipeline::new(log_n);
 
         // warmup
         let _ = pipeline.prove_batch(&[(M31(1), M31(1)); 3]);
@@ -274,14 +274,14 @@ fn main() {
     // =============================================
     for profile_log_n in [16u32, 20] {
         println!("=== Stage Profile uncached (log_n={profile_log_n}) ===");
-        let _ = kraken_stark::prover::prove_timed(M31(1), M31(1), profile_log_n);
+        let _ = vortex_stark::prover::prove_timed(M31(1), M31(1), profile_log_n);
         println!();
     }
     for profile_log_n in [16u32, 20] {
         println!("=== Stage Profile cached (log_n={profile_log_n}) ===");
-        let cache = kraken_stark::prover::ProverCache::new(profile_log_n);
-        let _ = kraken_stark::prover::prove_cached(M31(1), M31(1), &cache); // warmup
-        let _ = kraken_stark::prover::prove_cached_timed(M31(1), M31(1), &cache);
+        let cache = vortex_stark::prover::ProverCache::new(profile_log_n);
+        let _ = vortex_stark::prover::prove_cached(M31(1), M31(1), &cache); // warmup
+        let _ = vortex_stark::prover::prove_cached_timed(M31(1), M31(1), &cache);
         println!();
     }
 
@@ -294,12 +294,12 @@ fn main() {
     for log_n in [8u32, 12, 16, 20] {
         let a = M31(1);
         let b = M31(1);
-        let cache = kraken_stark::prover::ProverCache::new(log_n);
-        let pipeline = kraken_stark::prover::ProverPipeline::new(log_n);
+        let cache = vortex_stark::prover::ProverCache::new(log_n);
+        let pipeline = vortex_stark::prover::ProverPipeline::new(log_n);
 
         // warmup
-        let _ = kraken_stark::prover::prove(a, b, log_n);
-        let _ = kraken_stark::prover::prove_cached(a, b, &cache);
+        let _ = vortex_stark::prover::prove(a, b, log_n);
+        let _ = vortex_stark::prover::prove_cached(a, b, &cache);
         let _ = pipeline.prove_batch(&[(a, b); 3]);
 
         let iters = match log_n {
@@ -311,13 +311,13 @@ fn main() {
         let mut uncached_times = Vec::with_capacity(iters);
         for _ in 0..iters {
             let t0 = Instant::now();
-            let _proof = kraken_stark::prover::prove(a, b, log_n);
+            let _proof = vortex_stark::prover::prove(a, b, log_n);
             uncached_times.push(t0.elapsed().as_secs_f64() * 1000.0);
         }
         let mut cached_times = Vec::with_capacity(iters);
         for _ in 0..iters {
             let t0 = Instant::now();
-            let _proof = kraken_stark::prover::prove_cached(a, b, &cache);
+            let _proof = vortex_stark::prover::prove_cached(a, b, &cache);
             cached_times.push(t0.elapsed().as_secs_f64() * 1000.0);
         }
 
@@ -365,7 +365,7 @@ fn main() {
 
         // Try to create cache; if it fails (OOM), stop gracefully
         let cache = match std::panic::catch_unwind(|| {
-            kraken_stark::prover::ProverCache::new(log_n)
+            vortex_stark::prover::ProverCache::new(log_n)
         }) {
             Ok(c) => c,
             Err(_) => {
@@ -377,8 +377,8 @@ fn main() {
 
         // warmup — also catch OOM during prove
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = kraken_stark::prover::prove_cached(a, b, &cache);
-            let _ = kraken_stark::prover::prove_cached(a, b, &cache);
+            let _ = vortex_stark::prover::prove_cached(a, b, &cache);
+            let _ = vortex_stark::prover::prove_cached(a, b, &cache);
         })).is_err() {
             println!("  {:>8}  {:>10}  {:>14}  {:>14}  {:>14}  OOM during prove",
                 log_n, format_n(n), "-", "-", "-");
@@ -402,7 +402,7 @@ fn main() {
         let mut times = Vec::with_capacity(iters);
         for _ in 0..iters {
             let t0 = Instant::now();
-            let _proof = kraken_stark::prover::prove_cached(a, b, &cache);
+            let _proof = vortex_stark::prover::prove_cached(a, b, &cache);
             times.push(t0.elapsed().as_secs_f64() * 1000.0);
         }
         let stats = compute_stats(&mut times);

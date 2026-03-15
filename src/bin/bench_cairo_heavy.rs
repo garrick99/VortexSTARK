@@ -1,19 +1,19 @@
 /// Heavy Cairo STARK benchmark: simulates real-world workloads.
 ///
-/// Three workloads that push kraken-stark to its limits:
+/// Three workloads that push VortexSTARK to its limits:
 ///   1. Merkle tree construction (Pedersen hash chain — rollup-style)
 ///   2. Matrix multiply (dense arithmetic — DeFi pricing engine)
 ///   3. Mixed control flow (branching + calls — smart contract execution)
 ///
 /// Each workload: prove + verify end-to-end with full constraint checking.
 
-use kraken_stark::cairo_air::{
+use vortex_stark::cairo_air::{
     decode::Instruction,
     prover::{cairo_prove_cached, cairo_verify, CairoProverCache},
     pedersen::gpu_init,
     stark252_field::Fp,
 };
-use kraken_stark::cuda::ffi;
+use vortex_stark::cuda::ffi;
 use std::time::Instant;
 
 /// Build a Fibonacci program (arithmetic-heavy baseline)
@@ -84,7 +84,7 @@ fn build_defi_program(n: usize) -> Vec<u64> {
 
 fn main() {
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║      KRAKEN-STARK HEAVY BENCHMARK — RTX 5090 @ 450W       ║");
+    println!("║      VORTEXSTARK HEAVY BENCHMARK — RTX 5090 @ 450W       ║");
     println!("║  Cairo STARK: prove + verify, full constraint checking     ║");
     println!("╚══════════════════════════════════════════════════════════════╝\n");
 

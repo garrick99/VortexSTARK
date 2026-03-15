@@ -1,4 +1,4 @@
-# kraken-stark
+# VortexSTARK
 
 GPU-native Circle STARK prover. Rust + CUDA. RTX 5090.
 
