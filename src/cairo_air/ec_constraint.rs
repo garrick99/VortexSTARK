@@ -53,6 +53,244 @@ pub const COL_CARRY_0: usize = 29;  // 29..37: carries for mul constraint 1
 pub const COL_CARRY_1: usize = 38;  // 38..46: carries for mul constraint 2
 pub const COL_CARRY_2: usize = 47;  // 47..55: carries for mul constraint 3
 
+/// Compact EC trace: 29 columns per row.
+/// acc_x (9) + acc_y (9) + lambda (9) + window_val (1) + op_type (1) = 29
+pub const EC_TRACE_COLS_COMPACT: usize = 29;
+
+/// Operation types
+pub const OP_DOUBLE: u32 = 0;
+pub const OP_ADD: u32 = 1;
+pub const OP_INIT: u32 = 2; // first row of an invocation (no constraint)
+
+/// Generate the full EC intermediate trace for a batch of Pedersen hashes.
+/// Each hash traces the windowed scalar multiplication step-by-step.
+/// Returns 28 trace columns as Vec<Vec<u32>>.
+///
+/// For each invocation:
+///   - Start: acc = P0
+///   - For each 248-bit scalar (a_low, b_low): 62 windows of 4 bits each
+///     - 4 doubling steps + 1 table addition per window = 5 rows
+///   - For each 4-bit scalar (a_high, b_high): 1 table addition = 1 row
+///   - Total: 2 * (62*5) + 2 = 622 rows per invocation
+pub fn generate_ec_trace(
+    inputs_a: &[super::stark252_field::Fp],
+    inputs_b: &[super::stark252_field::Fp],
+    log_trace_len: u32,
+) -> Vec<Vec<u32>> {
+    use super::stark252_field::{Fp, CurvePoint, pedersen_points};
+    use super::pedersen::{fp_to_stark252, N_LIMBS};
+
+    let n_hashes = inputs_a.len();
+    let trace_len = 1usize << log_trace_len;
+    let n_rows = n_hashes * ROWS_PER_INVOCATION;
+    assert!(n_rows <= trace_len, "EC trace too large: {n_rows} rows > {trace_len}");
+
+    let mut cols: Vec<Vec<u32>> = (0..EC_TRACE_COLS_COMPACT).map(|_| vec![0u32; trace_len]).collect();
+
+    let points = pedersen_points();
+    // Base points for the 4 scalars (P1..P4)
+    let base_points: Vec<(Fp, Fp)> = (1..=4).map(|i| match points[i] {
+        CurvePoint::Affine(x, y) => (x, y),
+        _ => panic!("base point is infinity"),
+    }).collect();
+
+    // Precompute window tables: table[point_idx][k] = k * P_i (affine)
+    let mut tables: Vec<Vec<Option<(Fp, Fp)>>> = Vec::new();
+    for pi in 0..4 {
+        let mut table = vec![None; 16];
+        table[0] = None; // 0 * P = infinity
+        let base = points[pi + 1];
+        let mut current = base;
+        table[1] = match base { CurvePoint::Affine(x, y) => Some((x, y)), _ => None };
+        for k in 2..16u32 {
+            current = current.add(base);
+            table[k as usize] = match current {
+                CurvePoint::Affine(x, y) => Some((x, y)),
+                _ => None,
+            };
+        }
+        tables.push(table);
+    }
+
+    let (p0x, p0y) = match points[0] {
+        CurvePoint::Affine(x, y) => (x, y),
+        _ => panic!("P0 is infinity"),
+    };
+
+    let mut row = 0;
+    let write_point = |cols: &mut Vec<Vec<u32>>, row: usize, x: Fp, y: Fp, lambda: Fp, op: u32| {
+        let sx = fp_to_stark252(&x);
+        let sy = fp_to_stark252(&y);
+        let sl = fp_to_stark252(&lambda);
+        for j in 0..N_LIMBS { cols[COL_ACC_X + j][row] = sx.limbs[j]; }
+        for j in 0..N_LIMBS { cols[COL_ACC_Y + j][row] = sy.limbs[j]; }
+        for j in 0..N_LIMBS { cols[COL_LAMBDA + j][row] = sl.limbs[j]; }
+        cols[COL_OP_TYPE][row] = op;
+    };
+
+    for hash_idx in 0..n_hashes {
+        let a = inputs_a[hash_idx];
+        let b = inputs_b[hash_idx];
+
+        // Scalars for windowed mul (extract bits from Fp limbs)
+        let scalars_248 = [a, b]; // a_low, b_low (248 bits each)
+        let scalar_4 = [
+            ((a.v[3] >> 56) & 0xF) as u32, // a_high (top 4 bits)
+            ((b.v[3] >> 56) & 0xF) as u32, // b_high
+        ];
+        let point_indices_248 = [0usize, 2]; // P1, P3
+        let point_indices_4 = [1usize, 3];   // P2, P4
+
+        // Start: accumulated = P0
+        let mut acc_x = p0x;
+        let mut acc_y = p0y;
+
+        // Write initial point
+        write_point(&mut cols, row, acc_x, acc_y, Fp::ZERO, OP_INIT);
+        row += 1;
+
+        // Process 2 big scalars (a_low * P1, b_low * P3)
+        for (si, &pi) in point_indices_248.iter().enumerate() {
+            let scalar = scalars_248[si];
+
+            // 62 windows, MSB to LSB
+            for w in (0..62).rev() {
+                // 4 doublings
+                for _d in 0..4 {
+                    if acc_x == Fp::ZERO && acc_y == Fp::ZERO {
+                        // Point at infinity — skip doubling
+                        write_point(&mut cols, row, acc_x, acc_y, Fp::ZERO, OP_DOUBLE);
+                    } else {
+                        let lambda = (acc_x * acc_x + acc_x * acc_x + acc_x * acc_x + Fp::ONE)
+                            * (acc_y + acc_y).inverse();
+                        let new_x = lambda * lambda - acc_x - acc_x;
+                        let new_y = lambda * (acc_x - new_x) - acc_y;
+                        write_point(&mut cols, row, acc_x, acc_y, lambda, OP_DOUBLE);
+                        acc_x = new_x;
+                        acc_y = new_y;
+                    }
+                    row += 1;
+                }
+
+                // Extract 4-bit window
+                let bit_offset = w * 4;
+                let limb_idx = bit_offset / 64;
+                let bit_in_limb = bit_offset % 64;
+                let nibble = if limb_idx < 4 {
+                    let mut n = (scalar.v[limb_idx] >> bit_in_limb) & 0xF;
+                    if bit_in_limb > 60 && limb_idx + 1 < 4 {
+                        n |= (scalar.v[limb_idx + 1] << (64 - bit_in_limb)) & 0xF;
+                    }
+                    n as u32
+                } else { 0 };
+
+                // Table addition
+                if nibble != 0 {
+                    if let Some((tx, ty)) = tables[pi][nibble as usize] {
+                        if acc_x == Fp::ZERO && acc_y == Fp::ZERO {
+                            acc_x = tx; acc_y = ty;
+                            write_point(&mut cols, row, acc_x, acc_y, Fp::ZERO, OP_INIT);
+                        } else {
+                            let lambda = (ty - acc_y) * (tx - acc_x).inverse();
+                            let new_x = lambda * lambda - acc_x - tx;
+                            let new_y = lambda * (acc_x - new_x) - acc_y;
+                            write_point(&mut cols, row, acc_x, acc_y, lambda, OP_ADD);
+                            acc_x = new_x;
+                            acc_y = new_y;
+                        }
+                    } else {
+                        write_point(&mut cols, row, acc_x, acc_y, Fp::ZERO, OP_ADD);
+                    }
+                } else {
+                    write_point(&mut cols, row, acc_x, acc_y, Fp::ZERO, OP_ADD);
+                }
+                row += 1;
+            }
+        }
+
+        // Process 2 small scalars (a_high * P2, b_high * P4)
+        for (si, &pi) in point_indices_4.iter().enumerate() {
+            let nibble = scalar_4[si];
+            if nibble != 0 {
+                if let Some((tx, ty)) = tables[pi][nibble as usize] {
+                    let lambda = (ty - acc_y) * (tx - acc_x).inverse();
+                    let new_x = lambda * lambda - acc_x - tx;
+                    let new_y = lambda * (acc_x - new_x) - acc_y;
+                    write_point(&mut cols, row, acc_x, acc_y, lambda, OP_ADD);
+                    acc_x = new_x;
+                    acc_y = new_y;
+                } else {
+                    write_point(&mut cols, row, acc_x, acc_y, Fp::ZERO, OP_ADD);
+                }
+            } else {
+                write_point(&mut cols, row, acc_x, acc_y, Fp::ZERO, OP_ADD);
+            }
+            row += 1;
+        }
+    }
+
+    cols
+}
+
+/// Verify EC trace constraints at a specific row.
+/// Returns Ok(()) if the transition from row i to row i+1 is valid.
+pub fn verify_ec_step(
+    trace_cols: &[Vec<u32>],
+    row: usize,
+    next_row: usize,
+) -> Result<(), String> {
+    use super::stark252_field::Fp;
+    use super::pedersen::{stark252_to_fp, Stark252, N_LIMBS};
+
+    let read_fp = |col_base: usize, r: usize| -> Fp {
+        let mut limbs = [0u32; N_LIMBS];
+        for j in 0..N_LIMBS { limbs[j] = trace_cols[col_base + j][r]; }
+        stark252_to_fp(&Stark252 { limbs })
+    };
+
+    let op = trace_cols[COL_OP_TYPE][row];
+    if op == OP_INIT { return Ok(()); } // no constraint on init rows
+
+    let x = read_fp(COL_ACC_X, row);
+    let y = read_fp(COL_ACC_Y, row);
+    let x_next = read_fp(COL_ACC_X, next_row);
+    let y_next = read_fp(COL_ACC_Y, next_row);
+    let lambda = read_fp(COL_LAMBDA, row);
+
+    if op == OP_DOUBLE {
+        // Skip if point is zero (infinity)
+        if x == Fp::ZERO && y == Fp::ZERO { return Ok(()); }
+
+        if !verify_ec_double_cpu(
+            &fp_to_limbs(&x), &fp_to_limbs(&y),
+            &fp_to_limbs(&x_next), &fp_to_limbs(&y_next),
+            &fp_to_limbs(&lambda),
+        ) {
+            return Err(format!("EC doubling constraint failed at row {row}"));
+        }
+    } else if op == OP_ADD {
+        // Addition verification requires the table point, which the verifier
+        // can derive from the scalar decomposition. For now, verify the
+        // algebraic relation holds (lambda defines the line through the two points).
+        if lambda == Fp::ZERO { return Ok(()); } // skip zero-lambda (no-op add)
+
+        // Verify: lambda² = x_next + x + x_table
+        // We can extract x_table = lambda² - x_next - x
+        // Then verify: lambda * (x - x_next) = y_next + y
+        let lhs = lambda * (x - x_next);
+        let rhs = y_next + y;
+        if lhs != rhs {
+            return Err(format!("EC addition y-constraint failed at row {row}"));
+        }
+    }
+
+    Ok(())
+}
+
+fn fp_to_limbs(fp: &super::stark252_field::Fp) -> [u32; N_LIMBS] {
+    super::pedersen::fp_to_stark252(fp).limbs
+}
+
 /// Stark252 prime limbs (9 × 31-bit, little-endian)
 /// p = 2^251 + 17·2^192 + 1
 pub const P_LIMBS: [u32; N_LIMBS] = {
