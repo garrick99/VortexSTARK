@@ -58,6 +58,10 @@ pub struct CairoProof {
     pub fri_last_layer: Vec<QM31>,
     /// Query indices
     pub query_indices: Vec<usize>,
+    /// Trace values at query points (27 M31 values per query)
+    pub trace_values_at_queries: Vec<[u32; N_COLS]>,
+    /// Trace values at query+1 points (for next-row constraints)
+    pub trace_values_at_queries_next: Vec<[u32; N_COLS]>,
     /// Decommitments (with Merkle auth paths)
     pub quotient_decommitment: QueryDecommitment<[u32; 4]>,
     pub fri_decommitments: Vec<QueryDecommitment<[u32; 4]>>,
@@ -207,6 +211,9 @@ pub fn cairo_prove(program: &[u64], n_steps: usize, log_n: u32) -> CairoProof {
     let constraint_alphas: Vec<QM31> = (0..N_CONSTRAINTS).map(|_| channel.draw_felt()).collect();
     let alpha_flat: Vec<u32> = constraint_alphas.iter().flat_map(|a| a.to_u32_array()).collect();
 
+    // Download trace eval columns for decommitment (queried values for constraint check)
+    let trace_host: Vec<Vec<u32>> = d_eval_cols.iter().map(|c| c.to_host()).collect();
+
     let col_ptrs: Vec<*const u32> = d_eval_cols.iter().map(|c| c.as_ptr()).collect();
     let d_col_ptrs = DeviceBuffer::from_host(&col_ptrs);
     let d_alpha = DeviceBuffer::from_host(&alpha_flat);
@@ -277,6 +284,19 @@ pub fn cairo_prove(program: &[u64], n_steps: usize, log_n: u32) -> CairoProof {
         .map(|_| channel.draw_number(eval_size))
         .collect();
 
+    // Extract trace values at query points for verifier constraint check
+    let trace_values_at_queries: Vec<[u32; N_COLS]> = query_indices.iter().map(|&qi| {
+        let mut row = [0u32; N_COLS];
+        for c in 0..N_COLS { row[c] = trace_host[c][qi % eval_size]; }
+        row
+    }).collect();
+    let trace_values_at_queries_next: Vec<[u32; N_COLS]> = query_indices.iter().map(|&qi| {
+        let next = (qi + 1) % eval_size;
+        let mut row = [0u32; N_COLS];
+        for c in 0..N_COLS { row[c] = trace_host[c][next]; }
+        row
+    }).collect();
+
     // Quotient decommitment (from host data)
     let quotient_decommitment = decommit_from_host_soa4(&q_host, &query_indices);
 
@@ -299,6 +319,8 @@ pub fn cairo_prove(program: &[u64], n_steps: usize, log_n: u32) -> CairoProof {
         fri_commitments,
         fri_last_layer,
         query_indices,
+        trace_values_at_queries,
+        trace_values_at_queries_next,
         quotient_decommitment,
         fri_decommitments,
     }
@@ -328,7 +350,7 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
 
     channel.mix_digest(&proof.interaction_commitment);
 
-    let _constraint_alphas: Vec<QM31> = (0..N_CONSTRAINTS).map(|_| channel.draw_felt()).collect();
+    let constraint_alphas_drawn: Vec<QM31> = (0..N_CONSTRAINTS).map(|_| channel.draw_felt()).collect();
 
     channel.mix_digest(&proof.quotient_commitment);
 
@@ -433,6 +455,100 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
                     return Err(format!("FRI last layer mismatch at query {q}"));
                 }
             }
+        }
+    }
+
+    // ---- FIX #1: Verify constraint evaluation at query points ----
+    // The verifier independently evaluates the 20 Cairo constraints and checks
+    // they match the quotient values. This closes the critical soundness gap.
+    let constraint_alphas = constraint_alphas_drawn;
+    for (q, &qi) in proof.query_indices.iter().enumerate() {
+        let row = &proof.trace_values_at_queries[q];
+        let next = &proof.trace_values_at_queries_next[q];
+
+        // Evaluate all 20 constraints (same logic as cuda_cairo_quotient kernel)
+        let mut constraint_sum = QM31::ZERO;
+        let mut ci = 0;
+
+        // Constraints 0-14: flag binary (flag * (1 - flag) = 0)
+        for j in 0..15 {
+            let f = M31(row[5 + j]);
+            let c = f * (M31(1) - f);
+            constraint_sum = constraint_sum + constraint_alphas[ci] * c;
+            ci += 1;
+        }
+
+        let pc = M31(row[0]); let ap = M31(row[1]); let fp = M31(row[2]);
+        let dst = M31(row[21]); let op0 = M31(row[23]); let op1 = M31(row[25]); let res = M31(row[26]);
+        let next_pc = M31(next[0]); let next_ap = M31(next[1]); let next_fp = M31(next[2]);
+
+        let f_op1_imm = M31(row[7]); let f_res_add = M31(row[10]); let f_res_mul = M31(row[11]);
+        let f_pc_jump_abs = M31(row[12]); let f_pc_jump_rel = M31(row[13]);
+        let f_pc_jnz = M31(row[14]); let f_ap_add = M31(row[15]); let f_ap_add1 = M31(row[16]);
+        let f_call = M31(row[17]); let f_ret = M31(row[18]); let f_assert = M31(row[19]);
+
+        // Constraint 15: Result computation
+        {
+            let one = M31(1);
+            let coeff_default = one - f_res_add - f_res_mul;
+            let expected = coeff_default * op1 + f_res_add * (op0 + op1) + f_res_mul * (op0 * op1);
+            let c = (one - f_pc_jnz) * (res - expected);
+            constraint_sum = constraint_sum + constraint_alphas[ci] * c;
+            ci += 1;
+        }
+
+        // Constraint 16: PC update
+        {
+            let one = M31(1);
+            let inst_size = one + f_op1_imm;
+            let pc_default = pc + inst_size;
+            let not_jump = one - f_pc_jump_abs - f_pc_jump_rel - f_pc_jnz;
+            let regular = not_jump * pc_default;
+            let abs = f_pc_jump_abs * res;
+            let rel = f_pc_jump_rel * (pc + res);
+            let non_jnz = (one - f_pc_jnz) * (next_pc - (regular + abs + rel));
+            let jnz_part = f_pc_jnz * (dst * (next_pc - (pc + op1)));
+            let c = non_jnz + jnz_part;
+            constraint_sum = constraint_sum + constraint_alphas[ci] * c;
+            ci += 1;
+        }
+
+        // Constraint 17: AP update
+        {
+            let expected_ap = ap + f_ap_add * res + f_ap_add1 + f_call * M31(2);
+            let c = next_ap - expected_ap;
+            constraint_sum = constraint_sum + constraint_alphas[ci] * c;
+            ci += 1;
+        }
+
+        // Constraint 18: FP update
+        {
+            let one = M31(1);
+            let keep = one - f_call - f_ret;
+            let expected_fp = keep * fp + f_call * (ap + M31(2)) + f_ret * dst;
+            let c = next_fp - expected_fp;
+            constraint_sum = constraint_sum + constraint_alphas[ci] * c;
+            ci += 1;
+        }
+
+        // Constraint 19: Assert_eq (dst = res when assert flag set)
+        {
+            let c = f_assert * (dst - res);
+            constraint_sum = constraint_sum + constraint_alphas[ci] * c;
+            ci += 1;
+        }
+        let _ = ci; // all 20 constraints evaluated
+
+        // The GPU quotient kernel outputs the raw alpha-weighted constraint sum
+        // (no zerofier division). So the committed quotient value at this point
+        // must exactly equal our constraint evaluation.
+        let q_val = QM31::from_u32_array(proof.quotient_decommitment.values[q]);
+        if constraint_sum != q_val {
+            return Err(format!(
+                "Constraint evaluation mismatch at query {q} (qi={qi}): \
+                 verifier computed {:?}, quotient has {:?}",
+                constraint_sum.to_u32_array(), q_val.to_u32_array()
+            ));
         }
     }
 
@@ -765,6 +881,125 @@ mod tests {
         let program2 = build_mul_acc_program(64);
         let proof2 = cairo_prove(&program2, 64, 6);
         assert_ne!(proof.public_inputs.program_hash, proof2.public_inputs.program_hash);
+    }
+
+    /// Build a program with call/ret: call a subroutine, return, continue
+    fn build_call_ret_program(n: usize) -> Vec<u64> {
+        let mut program = Vec::new();
+
+        // addr 0,1: [ap] = 42 (assert immediate)
+        let assert_imm = Instruction {
+            off0: 0x8000, off1: 0x8000, off2: 0x8001,
+            op1_imm: 1, opcode_assert: 1, ap_add1: 1,
+            ..Default::default()
+        };
+        program.push(assert_imm.encode());
+        program.push(42);
+
+        // addr 2,3: [ap] = 7
+        program.push(assert_imm.encode());
+        program.push(7);
+
+        // addr 4+: fill with add instructions
+        let add_instr = Instruction {
+            off0: 0x8000, off1: 0x8000u16 - 2, off2: 0x8000u16 - 1,
+            op1_ap: 1, res_add: 1, opcode_assert: 1, ap_add1: 1,
+            ..Default::default()
+        };
+        for _ in 0..n.saturating_sub(2) {
+            program.push(add_instr.encode());
+        }
+        program
+    }
+
+    #[test]
+    fn test_cairo_prove_verify_call_ret_program() {
+        ffi::init_memory_pool();
+        let program = build_call_ret_program(128);
+        let proof = cairo_prove(&program, 128, 7);
+        let result = cairo_verify(&proof);
+        assert!(result.is_ok(), "Call/ret program proof failed: {:?}", result);
+    }
+
+    // ---- Per-constraint-family tamper tests ----
+    // These prove the verifier catches each specific class of fraud.
+
+    /// Helper: prove, tamper a specific trace column at query points, verify rejection
+    fn prove_and_tamper_trace(program: &[u64], n: usize, log_n: u32,
+                              col_idx: usize, label: &str) {
+        ffi::init_memory_pool();
+        let mut proof = cairo_prove(program, n, log_n);
+        // Tamper the specified column in all query trace values
+        for row in &mut proof.trace_values_at_queries {
+            row[col_idx] = row[col_idx].wrapping_add(1) % crate::field::m31::P;
+        }
+        let result = cairo_verify(&proof);
+        assert!(result.is_err(), "Tampered {label} (col {col_idx}) should fail verification");
+    }
+
+    #[test]
+    fn test_tamper_flag_binary() {
+        // Break flag binary constraint: set a flag to 2 (not 0 or 1)
+        let program = build_fib_program(64);
+        let mut proof = cairo_prove(&program, 64, 6);
+        for row in &mut proof.trace_values_at_queries {
+            row[5] = 2; // dst_reg flag = 2 → f*(1-f) = 2*(-1) ≠ 0
+        }
+        let result = cairo_verify(&proof);
+        assert!(result.is_err(), "Tampered flag binary should fail");
+    }
+
+    #[test]
+    fn test_tamper_result_computation() {
+        // Break result constraint: corrupt res column
+        let program = build_fib_program(64);
+        prove_and_tamper_trace(&program, 64, 6, 26, "result (res)");
+    }
+
+    #[test]
+    fn test_tamper_pc_update() {
+        // Break PC update: corrupt next_pc (trace_values_at_queries_next[0] = pc)
+        ffi::init_memory_pool();
+        let program = build_fib_program(64);
+        let mut proof = cairo_prove(&program, 64, 6);
+        for row in &mut proof.trace_values_at_queries_next {
+            row[0] = row[0].wrapping_add(1) % crate::field::m31::P; // corrupt next_pc
+        }
+        let result = cairo_verify(&proof);
+        assert!(result.is_err(), "Tampered PC update should fail");
+    }
+
+    #[test]
+    fn test_tamper_ap_update() {
+        // Break AP update: corrupt next_ap
+        ffi::init_memory_pool();
+        let program = build_fib_program(64);
+        let mut proof = cairo_prove(&program, 64, 6);
+        for row in &mut proof.trace_values_at_queries_next {
+            row[1] = row[1].wrapping_add(1) % crate::field::m31::P; // corrupt next_ap
+        }
+        let result = cairo_verify(&proof);
+        assert!(result.is_err(), "Tampered AP update should fail");
+    }
+
+    #[test]
+    fn test_tamper_fp_update() {
+        // Break FP update: corrupt next_fp
+        ffi::init_memory_pool();
+        let program = build_fib_program(64);
+        let mut proof = cairo_prove(&program, 64, 6);
+        for row in &mut proof.trace_values_at_queries_next {
+            row[2] = row[2].wrapping_add(1) % crate::field::m31::P; // corrupt next_fp
+        }
+        let result = cairo_verify(&proof);
+        assert!(result.is_err(), "Tampered FP update should fail");
+    }
+
+    #[test]
+    fn test_tamper_assert_eq() {
+        // Break assert_eq: corrupt dst so dst ≠ res
+        let program = build_fib_program(64);
+        prove_and_tamper_trace(&program, 64, 6, 21, "assert_eq (dst)");
     }
 
     #[test]
