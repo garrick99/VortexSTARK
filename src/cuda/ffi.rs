@@ -343,6 +343,20 @@ unsafe extern "C" {
         stream: *mut c_void,
     );
 
+    /// EC trace generation: outputs intermediate Jacobian points per step.
+    pub fn cuda_pedersen_ec_trace(
+        inputs_a: *const u64, inputs_b: *const u64,
+        ec_trace: *mut u64, ec_ops: *mut u32,
+        n: u32, stream: *mut c_void,
+    );
+
+    /// Decompose raw EC trace (u64 Jacobian) into M31 SoA columns.
+    pub fn cuda_ec_trace_decompose(
+        ec_trace: *const u64, ec_ops: *const u32,
+        trace_cols: *mut *mut u32,
+        n_rows: u32, stream: *mut c_void,
+    );
+
     /// Fused Pedersen hash + trace column generation.
     /// Hashes (a, b) pairs and decomposes results into 27 M31 trace columns on GPU.
     /// trace_cols: device pointer to array of 27 device pointers (one per column).

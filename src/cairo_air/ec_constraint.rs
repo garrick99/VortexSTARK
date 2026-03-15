@@ -291,6 +291,74 @@ fn fp_to_limbs(fp: &super::stark252_field::Fp) -> [u32; N_LIMBS] {
     super::pedersen::fp_to_stark252(fp).limbs
 }
 
+/// GPU-accelerated EC trace generation.
+/// Replaces the CPU generate_ec_trace with a GPU kernel that outputs
+/// intermediate Jacobian points at each doubling/addition step.
+/// Returns 28 DeviceBuffer<u32> columns ready for NTT.
+pub fn gpu_generate_ec_trace(
+    inputs_a: &[super::stark252_field::Fp],
+    inputs_b: &[super::stark252_field::Fp],
+    log_trace_len: u32,
+) -> Vec<crate::device::DeviceBuffer<u32>> {
+    use crate::cuda::ffi;
+    use crate::device::DeviceBuffer;
+
+    let n_hashes = inputs_a.len();
+    let n_rows = n_hashes * ROWS_PER_INVOCATION;
+    let trace_len = 1usize << log_trace_len;
+    assert!(n_rows <= trace_len, "EC trace too large: {n_rows} > {trace_len}");
+
+    let n_u64 = n_hashes * 4;
+    let flat_a = unsafe { std::slice::from_raw_parts(inputs_a.as_ptr() as *const u64, n_u64) };
+    let flat_b = unsafe { std::slice::from_raw_parts(inputs_b.as_ptr() as *const u64, n_u64) };
+
+    let stream = ffi::CudaStream::new();
+
+    // Upload inputs
+    let mut d_a = DeviceBuffer::<u64>::alloc(n_u64);
+    let mut d_b = DeviceBuffer::<u64>::alloc(n_u64);
+    d_a.upload_async(flat_a, &stream);
+    d_b.upload_async(flat_b, &stream);
+
+    // Allocate raw trace buffer: n_hashes * 622 rows * 12 u64 (X,Y,Z per row)
+    let mut d_ec_raw = DeviceBuffer::<u64>::alloc(n_rows * 12);
+    let mut d_ec_ops = DeviceBuffer::<u32>::alloc(n_rows);
+
+    // Launch EC trace kernel
+    unsafe {
+        ffi::cuda_pedersen_ec_trace(
+            d_a.as_ptr(), d_b.as_ptr(),
+            d_ec_raw.as_mut_ptr(), d_ec_ops.as_mut_ptr(),
+            n_hashes as u32, stream.ptr,
+        );
+    }
+
+    // Allocate 28 output columns (zero-initialized for padding)
+    let mut d_cols: Vec<DeviceBuffer<u32>> = (0..EC_TRACE_COLS_COMPACT)
+        .map(|_| {
+            let mut buf = DeviceBuffer::<u32>::alloc(trace_len);
+            buf.zero();
+            buf
+        })
+        .collect();
+
+    // Build column pointer array
+    let col_ptrs: Vec<*mut u32> = d_cols.iter_mut().map(|c| c.as_mut_ptr()).collect();
+    let d_col_ptrs = DeviceBuffer::from_host(&col_ptrs);
+
+    // Decompose raw trace into M31 SoA columns
+    unsafe {
+        ffi::cuda_ec_trace_decompose(
+            d_ec_raw.as_ptr(), d_ec_ops.as_ptr(),
+            d_col_ptrs.as_ptr() as *mut *mut u32,
+            n_rows as u32, stream.ptr,
+        );
+    }
+
+    stream.sync();
+    d_cols
+}
+
 /// Stark252 prime limbs (9 × 31-bit, little-endian)
 /// p = 2^251 + 17·2^192 + 1
 pub const P_LIMBS: [u32; N_LIMBS] = {

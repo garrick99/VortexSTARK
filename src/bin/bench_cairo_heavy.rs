@@ -137,9 +137,8 @@ fn main() {
     // WORKLOAD 3: Fibonacci + GPU Pedersen (rollup Merkle tree style)
     // ================================================================
     println!("━━━ WORKLOAD 3: Fibonacci + GPU Pedersen (rollup-style) ━━━");
-    // EC trace generated on CPU — cap Pedersen count to keep runtime sane.
-    // GPU Pedersen hash runs at 43.9M/sec; EC trace generation is CPU-bound.
-    for (log_n, n_ped) in [(20u32, 64usize), (24, 256), (26, 1024)] {
+    // EC trace now GPU-generated — can handle much larger counts.
+    for (log_n, n_ped) in [(20u32, 1024usize), (24, 16384), (26, 65536)] {
         let n = 1usize << log_n;
         let program = build_fib_program(n);
 
@@ -173,7 +172,7 @@ fn main() {
     {
         let log_n = 26u32;
         let n = 1usize << log_n;
-        let n_ped = 512; // EC trace is CPU-bound, cap for reasonable benchmark time
+        let n_ped = 16384; // GPU EC trace — can handle large counts now
         let program = build_defi_program(n);
 
         let ped_a: Vec<Fp> = (0..n_ped).map(|i|
@@ -184,8 +183,7 @@ fn main() {
         ).collect();
 
         println!("  Config: log_n={log_n}, {n} DeFi steps + {n_ped} EC-constrained Pedersen");
-        println!("  Note: GPU Pedersen hash runs at 43.9M/sec independently");
-        println!("  EC trace generation is CPU-bound (next target: GPU EC trace kernel)");
+        println!("  EC trace: GPU-generated (was CPU-bound, now GPU kernel)");
 
         let t_total = Instant::now();
 

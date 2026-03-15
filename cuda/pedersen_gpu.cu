@@ -288,6 +288,128 @@ __device__ ProjPoint pedersen_hash_proj(Fp252 a, Fp252 b) {
     return result;
 }
 
+// =====================================================================
+// EC Trace generation kernel: outputs intermediate Jacobian points
+// at each doubling/addition step for constraint verification.
+// Each thread processes one hash and writes 622 rows to the trace.
+// =====================================================================
+
+#define ROWS_PER_HASH 622
+#define EC_TRACE_VALS_PER_ROW 13  // X(4) + Y(4) + Z(4) + op_type(1)
+#define OP_INIT 2
+#define OP_DOUBLE_TRACE 0
+#define OP_ADD_TRACE 1
+
+__device__ void write_ec_row(
+    uint64_t* trace,       // [n_hashes * ROWS_PER_HASH * 12] — X,Y,Z per step
+    uint32_t* ops,         // [n_hashes * ROWS_PER_HASH] — op type
+    uint32_t row,
+    ProjPoint pt,
+    uint32_t op
+) {
+    // Write from_mont coordinates
+    Fp252 x = from_mont(pt.x);
+    Fp252 y = from_mont(pt.y);
+    Fp252 z = from_mont(pt.z);
+    uint32_t base = row * 12;
+    for (int j = 0; j < 4; j++) {
+        trace[base + j] = x.v[j];
+        trace[base + 4 + j] = y.v[j];
+        trace[base + 8 + j] = z.v[j];
+    }
+    ops[row] = op;
+}
+
+__device__ uint32_t extract_nibble(Fp252 scalar, int w) {
+    int bit_offset = w * 4;
+    int limb_idx = bit_offset / 64;
+    int bit_in_limb = bit_offset % 64;
+    uint32_t nibble = 0;
+    if (limb_idx < 4) {
+        nibble = (uint32_t)((scalar.v[limb_idx] >> bit_in_limb) & 0xF);
+        if (bit_in_limb > 60 && limb_idx + 1 < 4) {
+            nibble |= (uint32_t)((scalar.v[limb_idx + 1] << (64 - bit_in_limb)) & 0xF);
+        }
+    }
+    return nibble;
+}
+
+__global__ void pedersen_ec_trace_kernel(
+    const uint64_t* __restrict__ inputs_a,
+    const uint64_t* __restrict__ inputs_b,
+    uint64_t* __restrict__ ec_trace,  // [n * ROWS_PER_HASH * 12] — X,Y,Z per step
+    uint32_t* __restrict__ ec_ops,    // [n * ROWS_PER_HASH] — op type
+    uint32_t n
+) {
+    uint32_t hash_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (hash_idx >= n) return;
+
+    Fp252 a, b;
+    a.v[0] = inputs_a[hash_idx*4+0]; a.v[1] = inputs_a[hash_idx*4+1];
+    a.v[2] = inputs_a[hash_idx*4+2]; a.v[3] = inputs_a[hash_idx*4+3];
+    b.v[0] = inputs_b[hash_idx*4+0]; b.v[1] = inputs_b[hash_idx*4+1];
+    b.v[2] = inputs_b[hash_idx*4+2]; b.v[3] = inputs_b[hash_idx*4+3];
+
+    Fp252 a_low  = fp_mask(a, 248);
+    Fp252 a_high = fp_shr(a, 248);
+    Fp252 b_low  = fp_mask(b, 248);
+    Fp252 b_high = fp_shr(b, 248);
+
+    uint32_t row = hash_idx * ROWS_PER_HASH;
+
+    // Start with P0
+    ProjPoint result;
+    result.x = G_P0_MONT_X;
+    result.y = G_P0_MONT_Y;
+    result.z = G_P0_MONT_Z;
+    write_ec_row(ec_trace, ec_ops, row++, result, OP_INIT);
+
+    // Process 2 big scalars (a_low*P1, b_low*P3)
+    Fp252 big_scalars[2] = {a_low, b_low};
+    int big_point_idx[2] = {0, 2};  // P1, P3
+
+    for (int si = 0; si < 2; si++) {
+        Fp252 scalar = big_scalars[si];
+        int pi = big_point_idx[si];
+
+        for (int w = 61; w >= 0; w--) {
+            // 4 doublings
+            for (int d = 0; d < 4; d++) {
+                write_ec_row(ec_trace, ec_ops, row++, result, OP_DOUBLE_TRACE);
+                result = mont_double(result);
+            }
+            // Table add
+            uint32_t nibble = extract_nibble(scalar, w);
+            write_ec_row(ec_trace, ec_ops, row, result, OP_ADD_TRACE);
+            if (nibble != 0) {
+                ProjPoint tp;
+                tp.x = G_WTABLE_X[pi][nibble];
+                tp.y = G_WTABLE_Y[pi][nibble];
+                tp.z = G_WTABLE_Z[pi][nibble];
+                result = mont_add_mixed(result, tp);
+            }
+            row++;
+        }
+    }
+
+    // 2 small scalars (a_high*P2, b_high*P4)
+    uint32_t small_nibbles[2] = {(uint32_t)(a_high.v[0] & 0xF), (uint32_t)(b_high.v[0] & 0xF)};
+    int small_point_idx[2] = {1, 3};
+
+    for (int si = 0; si < 2; si++) {
+        uint32_t nibble = small_nibbles[si];
+        write_ec_row(ec_trace, ec_ops, row, result, OP_ADD_TRACE);
+        if (nibble != 0) {
+            ProjPoint tp;
+            tp.x = G_WTABLE_X[small_point_idx[si]][nibble];
+            tp.y = G_WTABLE_Y[small_point_idx[si]][nibble];
+            tp.z = G_WTABLE_Z[small_point_idx[si]][nibble];
+            result = mont_add_mixed(result, tp);
+        }
+        row++;
+    }
+}
+
 // Each thread computes one Pedersen hash and converts to affine x on-GPU.
 // Inline Fermat inverse eliminates CPU batch inverse (was 81.6% of pipeline).
 // Outputs affine x directly — no Z^2 transfer, no CPU post-processing.
@@ -421,6 +543,91 @@ void cuda_pedersen_decompose(
     uint32_t blocks = (n + threads - 1) / threads;
     fp252_decompose_kernel<<<blocks, threads, 0, stream>>>(
         vals_a, vals_b, vals_out, trace_cols, n);
+}
+
+// Launch EC trace generation kernel.
+void cuda_pedersen_ec_trace(
+    const uint64_t* inputs_a, const uint64_t* inputs_b,
+    uint64_t* ec_trace, uint32_t* ec_ops,
+    uint32_t n, cudaStream_t stream
+) {
+    cudaDeviceSetLimit(cudaLimitStackSize, 65536);
+    uint32_t threads = 32; // fewer threads — each writes 622 rows
+    uint32_t blocks = (n + threads - 1) / threads;
+    pedersen_ec_trace_kernel<<<blocks, threads, 0, stream>>>(
+        inputs_a, inputs_b, ec_trace, ec_ops, n);
+}
+
+// Decompose raw Jacobian trace (u64) into M31 SoA columns.
+// Input: ec_trace[n_rows * 12] (X,Y,Z as 4×u64 each), ec_ops[n_rows]
+// Output: 28 trace columns in SoA format (9 limbs for X, 9 for Y, 9 for Z, 1 op_type)
+__global__ void ec_trace_decompose_kernel(
+    const uint64_t* __restrict__ ec_trace,
+    const uint32_t* __restrict__ ec_ops,
+    uint32_t** __restrict__ trace_cols,  // [28] column pointers
+    uint32_t n_rows
+) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_rows) return;
+
+    // Read X, Y, Z (standard form, 4×u64 each)
+    Fp252 x, y, z;
+    uint32_t base = i * 12;
+    for (int j = 0; j < 4; j++) {
+        x.v[j] = ec_trace[base + j];
+        y.v[j] = ec_trace[base + 4 + j];
+        z.v[j] = ec_trace[base + 8 + j];
+    }
+
+    // Decompose each Fp252 into 9 M31 limbs (same as fp252_to_m31_columns)
+    // X limbs → cols 0..8
+    uint32_t lx[9], ly[9], lz[9];
+    lx[0] = (uint32_t)(x.v[0] & 0x7FFFFFFFULL);
+    lx[1] = (uint32_t)((x.v[0] >> 31) & 0x7FFFFFFFULL);
+    lx[2] = (uint32_t)(((x.v[0] >> 62) | (x.v[1] << 2)) & 0x7FFFFFFFULL);
+    lx[3] = (uint32_t)((x.v[1] >> 29) & 0x7FFFFFFFULL);
+    lx[4] = (uint32_t)(((x.v[1] >> 60) | (x.v[2] << 4)) & 0x7FFFFFFFULL);
+    lx[5] = (uint32_t)((x.v[2] >> 27) & 0x7FFFFFFFULL);
+    lx[6] = (uint32_t)(((x.v[2] >> 58) | (x.v[3] << 6)) & 0x7FFFFFFFULL);
+    lx[7] = (uint32_t)((x.v[3] >> 25) & 0x7FFFFFFFULL);
+    lx[8] = (uint32_t)((x.v[3] >> 56) & 0xFULL);
+
+    ly[0] = (uint32_t)(y.v[0] & 0x7FFFFFFFULL);
+    ly[1] = (uint32_t)((y.v[0] >> 31) & 0x7FFFFFFFULL);
+    ly[2] = (uint32_t)(((y.v[0] >> 62) | (y.v[1] << 2)) & 0x7FFFFFFFULL);
+    ly[3] = (uint32_t)((y.v[1] >> 29) & 0x7FFFFFFFULL);
+    ly[4] = (uint32_t)(((y.v[1] >> 60) | (y.v[2] << 4)) & 0x7FFFFFFFULL);
+    ly[5] = (uint32_t)((y.v[2] >> 27) & 0x7FFFFFFFULL);
+    ly[6] = (uint32_t)(((y.v[2] >> 58) | (y.v[3] << 6)) & 0x7FFFFFFFULL);
+    ly[7] = (uint32_t)((y.v[3] >> 25) & 0x7FFFFFFFULL);
+    ly[8] = (uint32_t)((y.v[3] >> 56) & 0xFULL);
+
+    lz[0] = (uint32_t)(z.v[0] & 0x7FFFFFFFULL);
+    lz[1] = (uint32_t)((z.v[0] >> 31) & 0x7FFFFFFFULL);
+    lz[2] = (uint32_t)(((z.v[0] >> 62) | (z.v[1] << 2)) & 0x7FFFFFFFULL);
+    lz[3] = (uint32_t)((z.v[1] >> 29) & 0x7FFFFFFFULL);
+    lz[4] = (uint32_t)(((z.v[1] >> 60) | (z.v[2] << 4)) & 0x7FFFFFFFULL);
+    lz[5] = (uint32_t)((z.v[2] >> 27) & 0x7FFFFFFFULL);
+    lz[6] = (uint32_t)(((z.v[2] >> 58) | (z.v[3] << 6)) & 0x7FFFFFFFULL);
+    lz[7] = (uint32_t)((z.v[3] >> 25) & 0x7FFFFFFFULL);
+    lz[8] = (uint32_t)((z.v[3] >> 56) & 0xFULL);
+
+    for (int j = 0; j < 9; j++) {
+        trace_cols[j][i] = lx[j];      // X limbs: cols 0..8
+        trace_cols[9+j][i] = ly[j];     // Y limbs: cols 9..17
+        trace_cols[18+j][i] = lz[j];    // Z limbs: cols 18..26
+    }
+    trace_cols[27][i] = ec_ops[i];       // op_type: col 27
+}
+
+void cuda_ec_trace_decompose(
+    const uint64_t* ec_trace, const uint32_t* ec_ops,
+    uint32_t** trace_cols, uint32_t n_rows, cudaStream_t stream
+) {
+    uint32_t threads = 256;
+    uint32_t blocks = (n_rows + threads - 1) / threads;
+    ec_trace_decompose_kernel<<<blocks, threads, 0, stream>>>(
+        ec_trace, ec_ops, trace_cols, n_rows);
 }
 
 // Launch fused Pedersen hash + trace generation on a stream.
