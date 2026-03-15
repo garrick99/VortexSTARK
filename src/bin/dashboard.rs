@@ -77,6 +77,8 @@ fn gpu_worker(mut rx: mpsc::Receiver<GpuJob>) {
                 let _ = resp.send(());
             }
         }
+        // Release VRAM back to OS after each job (keep 256 MB for fast reuse)
+        ffi::vram_release(256 * 1024 * 1024);
     }
 }
 

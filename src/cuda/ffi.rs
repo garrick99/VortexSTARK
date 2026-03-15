@@ -17,6 +17,7 @@ unsafe extern "C" {
     pub fn cudaFreeHost(ptr: *mut c_void) -> i32;
     pub fn cudaDeviceGetDefaultMemPool(pool: *mut *mut c_void, device: i32) -> i32;
     pub fn cudaMemPoolSetAttribute(pool: *mut c_void, attr: i32, value: *const c_void) -> i32;
+    pub fn cudaMemPoolTrimTo(pool: *mut c_void, min_bytes_to_keep: usize) -> i32;
 }
 
 // CUDA streams
@@ -92,6 +93,19 @@ pub fn vram_preflight_check() {
         eprintln!("[VRAM] Another GPU workload may be running (PrimePulse, training, etc).");
         eprintln!("[VRAM] VortexSTARK needs up to 28 GB for large proofs (log_n>=27).");
         eprintln!("[VRAM] Proceeding, but large proofs may OOM. Kill other GPU processes first.");
+    }
+}
+
+/// Flush the CUDA memory pool back to the OS. Call after each job completes
+/// to release VRAM that's no longer needed. Keeps `keep_bytes` in the pool
+/// for fast reuse on the next job (0 = release everything).
+pub fn vram_release(keep_bytes: usize) {
+    unsafe {
+        cudaDeviceSynchronize();
+        let mut pool: *mut std::ffi::c_void = std::ptr::null_mut();
+        let err = cudaDeviceGetDefaultMemPool(&mut pool, 0);
+        if err != 0 { return; }
+        cudaMemPoolTrimTo(pool, keep_bytes);
     }
 }
 
