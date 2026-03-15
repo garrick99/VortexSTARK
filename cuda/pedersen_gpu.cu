@@ -122,4 +122,41 @@ void cuda_pedersen_hash_batch(
     pedersen_batch_kernel<<<blocks, threads>>>(inputs_a, inputs_b, out_x, out_zz, n);
 }
 
+// Debug kernel: test EC point doubling of a known affine point
+void cuda_pedersen_test_double(
+    const uint64_t* px, const uint64_t* py, // one affine point (4 u64 each)
+    uint64_t* out_x, uint64_t* out_y, uint64_t* out_z // projective result
+);
+
+__global__ void pedersen_test_double_kernel(
+    const uint64_t* px, const uint64_t* py,
+    uint64_t* out_x, uint64_t* out_y, uint64_t* out_z
+) {
+    Fp252 x = {{px[0], px[1], px[2], px[3]}};
+    Fp252 y = {{py[0], py[1], py[2], py[3]}};
+
+    // Manual doubling with intermediate output for debugging
+    // For Z=1 input: xx=x^2, yy=y^2, s=4*x*yy, m=3*xx+1
+    Fp252 xx = fp_mul(x, x);
+    Fp252 yy = fp_mul(y, y);
+
+    // Store xx in out_z for debugging (we'll check against CPU x^2)
+    out_z[0] = xx.v[0]; out_z[1] = xx.v[1]; out_z[2] = xx.v[2]; out_z[3] = xx.v[3];
+
+    // Full doubling
+    ProjPoint p = proj_from_affine(x, y);
+    ProjPoint d = proj_double(p);
+
+    out_x[0] = d.x.v[0]; out_x[1] = d.x.v[1]; out_x[2] = d.x.v[2]; out_x[3] = d.x.v[3];
+    out_y[0] = d.y.v[0]; out_y[1] = d.y.v[1]; out_y[2] = d.y.v[2]; out_y[3] = d.y.v[3];
+    // out_z now holds xx (x squared) for debugging
+}
+
+void cuda_pedersen_test_double(
+    const uint64_t* px, const uint64_t* py,
+    uint64_t* out_x, uint64_t* out_y, uint64_t* out_z
+) {
+    pedersen_test_double_kernel<<<1, 1>>>(px, py, out_x, out_y, out_z);
+}
+
 } // extern "C"

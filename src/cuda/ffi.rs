@@ -302,6 +302,11 @@ unsafe extern "C" {
     pub fn cuda_fp252_test(results: *mut u64);
 
     // Pedersen GPU
+    pub fn cuda_pedersen_test_double(
+        px: *const u64, py: *const u64,
+        out_x: *mut u64, out_y: *mut u64, out_z: *mut u64,
+    );
+
     pub fn cuda_pedersen_upload_points(px: *const u64, py: *const u64);
     pub fn cuda_pedersen_hash_batch(
         inputs_a: *const u64, inputs_b: *const u64,

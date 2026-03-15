@@ -78,13 +78,86 @@ fn test_gpu_fp252() {
     println!("  ALL: {}\n", if all_ok { "PASS" } else { "FAIL" });
 }
 
+fn test_gpu_ec_double() {
+    use kraken_stark::device::DeviceBuffer;
+    use kraken_stark::cairo_air::stark252_field::{Fp, CurvePoint, pedersen_points};
+
+    println!("--- GPU EC Point Doubling Test ---");
+
+    let points = pedersen_points();
+    let (px, py) = match points[0] {
+        CurvePoint::Affine(x, y) => (x, y),
+        _ => panic!("P₀ is infinity"),
+    };
+
+    // GPU doubling
+    let d_px = DeviceBuffer::from_host(&px.v);
+    let d_py = DeviceBuffer::from_host(&py.v);
+    let mut d_ox = DeviceBuffer::<u64>::alloc(4);
+    let mut d_oy = DeviceBuffer::<u64>::alloc(4);
+    let mut d_oz = DeviceBuffer::<u64>::alloc(4);
+
+    unsafe {
+        ffi::cuda_pedersen_test_double(
+            d_px.as_ptr(), d_py.as_ptr(),
+            d_ox.as_mut_ptr(), d_oy.as_mut_ptr(), d_oz.as_mut_ptr(),
+        );
+        ffi::cuda_device_sync();
+    }
+
+    let gpu_x = d_ox.to_host();
+    let gpu_y = d_oy.to_host();
+    let gpu_z = d_oz.to_host();
+
+    // Convert GPU projective to affine: x_affine = X / Z²
+    let gx = Fp { v: [gpu_x[0], gpu_x[1], gpu_x[2], gpu_x[3]] };
+    let gy = Fp { v: [gpu_y[0], gpu_y[1], gpu_y[2], gpu_y[3]] };
+    let gz = Fp { v: [gpu_z[0], gpu_z[1], gpu_z[2], gpu_z[3]] };
+    let gz2 = gz * gz;
+    let gz2_inv = gz2.inverse();
+    let gpu_affine_x = gx * gz2_inv;
+    let gz3 = gz2 * gz;
+    let gz3_inv = gz3.inverse();
+    let gpu_affine_y = gy * gz3_inv;
+
+    // CPU doubling
+    let cpu_doubled = points[0].add(points[0]);
+    let (cpu_x, cpu_y) = match cpu_doubled {
+        CurvePoint::Affine(x, y) => (x, y),
+        _ => panic!("doubled is infinity"),
+    };
+
+    let x_ok = gpu_affine_x == cpu_x;
+    let y_ok = gpu_affine_y == cpu_y;
+
+    // gz now holds xx (P₀.x squared) from the debug kernel
+    let gpu_xx = gz; // repurposed
+    let cpu_xx = px * px; // CPU x^2
+    let xx_ok = gpu_xx == cpu_xx;
+    println!("  P₀.x² (intermediate):");
+    println!("    GPU: [{:016x}, {:016x}, {:016x}, {:016x}] {}",
+        gpu_xx.v[0], gpu_xx.v[1], gpu_xx.v[2], gpu_xx.v[3], if xx_ok {"✓"} else {"✗"});
+    println!("    CPU: [{:016x}, {:016x}, {:016x}, {:016x}]",
+        cpu_xx.v[0], cpu_xx.v[1], cpu_xx.v[2], cpu_xx.v[3]);
+
+    println!("  P₀ doubled:");
+    println!("    GPU affine x: [{:016x}, {:016x}, {:016x}, {:016x}] {}",
+        gpu_affine_x.v[0], gpu_affine_x.v[1], gpu_affine_x.v[2], gpu_affine_x.v[3],
+        if x_ok { "✓" } else { "✗" });
+    println!("    CPU affine x: [{:016x}, {:016x}, {:016x}, {:016x}]",
+        cpu_x.v[0], cpu_x.v[1], cpu_x.v[2], cpu_x.v[3]);
+    println!("    x match: {} | y match: {}", if x_ok {"✓"} else {"✗"}, if y_ok {"✓"} else {"✗"});
+    println!();
+}
+
 fn main() {
     println!("Pedersen Hash Benchmark: CPU vs GPU");
     println!("====================================\n");
 
     ffi::init_memory_pool();
-    pedersen::gpu_init(); // upload constant points before test
+    pedersen::gpu_init();
     test_gpu_fp252();
+    test_gpu_ec_double();
 
     // === CPU benchmark ===
     println!("--- CPU (projective coordinates) ---");

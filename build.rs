@@ -31,8 +31,6 @@ fn main() {
             .args([
                 "-c",
                 "-O3",
-                // Multi-arch: native code for 4090 (sm_89) and 5090 (sm_120),
-                // plus PTX fallback for forward compatibility with future GPUs.
                 "-gencode", "arch=compute_89,code=sm_89",
                 "-gencode", "arch=compute_120,code=sm_120",
                 "-gencode", "arch=compute_89,code=compute_89",

@@ -499,8 +499,11 @@ impl ProjectivePoint {
         if self.z.is_zero() {
             CurvePoint::Infinity
         } else {
+            // Jacobian: x_affine = X/Z², y_affine = Y/Z³
             let z_inv = self.z.inverse();
-            CurvePoint::Affine(self.x * z_inv, self.y * z_inv)
+            let z2_inv = z_inv * z_inv;
+            let z3_inv = z2_inv * z_inv;
+            CurvePoint::Affine(self.x * z2_inv, self.y * z3_inv)
         }
     }
 
