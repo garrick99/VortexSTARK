@@ -5,11 +5,11 @@
 ///   stark_cli verify <proof.bin>
 ///   stark_cli bench <log_n>
 
-use vortex_stark::cuda::ffi;
-use vortex_stark::field::M31;
-use vortex_stark::prover::{self, StarkProof, QueryDecommitment};
-use vortex_stark::verifier;
-use vortex_stark::field::QM31;
+use vortexstark::cuda::ffi;
+use vortexstark::field::M31;
+use vortexstark::prover::{self, StarkProof, QueryDecommitment};
+use vortexstark::verifier;
+use vortexstark::field::QM31;
 use std::io::{Read, Write, BufWriter, BufReader};
 use std::time::Instant;
 

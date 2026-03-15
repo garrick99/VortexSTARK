@@ -1,21 +1,21 @@
 /// Cairo VM + Poseidon builtin end-to-end test.
 /// Proves a Cairo program that invokes Poseidon hashing,
 /// with both VM constraints and Poseidon round constraints verified.
-use vortex_stark::cairo_air::{
+use vortexstark::cairo_air::{
     decode::Instruction,
     vm::{Memory, execute_to_columns},
     trace::{self, N_COLS},
     builtins::{PoseidonBuiltin, POSEIDON_BUILTIN_BASE, vm_poseidon_invoke},
 };
-use vortex_stark::poseidon::STATE_WIDTH;
-use vortex_stark::circle::Coset;
-use vortex_stark::cuda::ffi;
-use vortex_stark::device::DeviceBuffer;
-use vortex_stark::field::{M31, QM31};
-use vortex_stark::fri::{self, SecureColumn};
-use vortex_stark::merkle::MerkleTree;
-use vortex_stark::ntt::{self, ForwardTwiddleCache, InverseTwiddleCache};
-use vortex_stark::channel::Channel;
+use vortexstark::poseidon::STATE_WIDTH;
+use vortexstark::circle::Coset;
+use vortexstark::cuda::ffi;
+use vortexstark::device::DeviceBuffer;
+use vortexstark::field::{M31, QM31};
+use vortexstark::fri::{self, SecureColumn};
+use vortexstark::merkle::MerkleTree;
+use vortexstark::ntt::{self, ForwardTwiddleCache, InverseTwiddleCache};
+use vortexstark::channel::Channel;
 use std::time::Instant;
 
 fn main() {
@@ -157,7 +157,7 @@ fn main() {
         let poseidon_alpha_coeffs: Vec<QM31> = (0..STATE_WIDTH).map(|_| channel.draw_felt()).collect();
         let poseidon_alpha_flat: Vec<u32> = poseidon_alpha_coeffs.iter().flat_map(|a| a.to_u32_array()).collect();
 
-        let rc_flat = vortex_stark::poseidon::round_constants_flat();
+        let rc_flat = vortexstark::poseidon::round_constants_flat();
         let d_rc = DeviceBuffer::from_host(&rc_flat);
         let d_poseidon_alpha = DeviceBuffer::from_host(&poseidon_alpha_flat);
 

@@ -1,11 +1,11 @@
 /// Pedersen hash benchmark: CPU vs GPU throughput.
-use vortex_stark::cairo_air::pedersen;
-use vortex_stark::cairo_air::stark252_field::{Fp, pedersen_hash};
-use vortex_stark::cuda::ffi;
+use vortexstark::cairo_air::pedersen;
+use vortexstark::cairo_air::stark252_field::{Fp, pedersen_hash};
+use vortexstark::cuda::ffi;
 use std::time::Instant;
 
 fn test_gpu_fp252() {
-    use vortex_stark::device::DeviceBuffer;
+    use vortexstark::device::DeviceBuffer;
     println!("--- GPU Fp252 Arithmetic Test ---");
 
     let mut d_results = DeviceBuffer::<u64>::alloc(32);
@@ -65,9 +65,9 @@ fn test_gpu_fp252() {
 
     // Check P₀ constant loaded on GPU
     let gpu_p0x = Fp { v: [r[28], r[29], r[30], r[31]] };
-    let cpu_points = vortex_stark::cairo_air::stark252_field::pedersen_points();
+    let cpu_points = vortexstark::cairo_air::stark252_field::pedersen_points();
     let cpu_p0x = match cpu_points[0] {
-        vortex_stark::cairo_air::stark252_field::CurvePoint::Affine(x, _) => x,
+        vortexstark::cairo_air::stark252_field::CurvePoint::Affine(x, _) => x,
         _ => Fp::ZERO,
     };
     let ok_ec = gpu_p0x == cpu_p0x;
@@ -79,8 +79,8 @@ fn test_gpu_fp252() {
 }
 
 fn test_gpu_ec_double() {
-    use vortex_stark::device::DeviceBuffer;
-    use vortex_stark::cairo_air::stark252_field::{Fp, CurvePoint, pedersen_points};
+    use vortexstark::device::DeviceBuffer;
+    use vortexstark::cairo_air::stark252_field::{Fp, CurvePoint, pedersen_points};
 
     println!("--- GPU EC Point Doubling Test ---");
 

@@ -1,14 +1,14 @@
 /// Poseidon hash chain STARK prover test.
 /// Proves knowledge of a Poseidon hash chain with 8 state columns.
-use vortex_stark::poseidon::{self, STATE_WIDTH, NUM_ROUNDS};
-use vortex_stark::circle::Coset;
-use vortex_stark::cuda::ffi;
-use vortex_stark::device::DeviceBuffer;
-use vortex_stark::field::QM31;
-use vortex_stark::fri::{self, SecureColumn};
-use vortex_stark::merkle::MerkleTree;
-use vortex_stark::ntt::{self, ForwardTwiddleCache, InverseTwiddleCache};
-use vortex_stark::channel::Channel;
+use vortexstark::poseidon::{self, STATE_WIDTH, NUM_ROUNDS};
+use vortexstark::circle::Coset;
+use vortexstark::cuda::ffi;
+use vortexstark::device::DeviceBuffer;
+use vortexstark::field::QM31;
+use vortexstark::fri::{self, SecureColumn};
+use vortexstark::merkle::MerkleTree;
+use vortexstark::ntt::{self, ForwardTwiddleCache, InverseTwiddleCache};
+use vortexstark::channel::Channel;
 use std::time::Instant;
 
 fn main() {

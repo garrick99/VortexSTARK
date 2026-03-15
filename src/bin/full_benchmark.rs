@@ -1,8 +1,8 @@
 /// Full system benchmark: all verified VortexSTARK components.
-use vortex_stark::cuda::ffi;
-use vortex_stark::field::M31;
-use vortex_stark::poseidon;
-use vortex_stark::cairo_air::{decode::Instruction, vm::{Memory, execute_to_columns}, trace};
+use vortexstark::cuda::ffi;
+use vortexstark::field::M31;
+use vortexstark::poseidon;
+use vortexstark::cairo_air::{decode::Instruction, vm::{Memory, execute_to_columns}, trace};
 use std::time::Instant;
 
 fn main() {
@@ -14,7 +14,7 @@ fn main() {
     ffi::init_memory_pool();
 
     // Warmup
-    let _ = vortex_stark::prover::prove(M31(1), M31(1), 8);
+    let _ = vortexstark::prover::prove(M31(1), M31(1), 8);
 
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  FIBONACCI STARK (1 column, degree-1 constraint)");
@@ -22,10 +22,10 @@ fn main() {
     for log_n in [20, 24, 28, 29, 30] {
         let n: u64 = 1 << log_n;
         let t = Instant::now();
-        let proof = vortex_stark::prover::prove_lean(M31(1), M31(1), log_n);
+        let proof = vortexstark::prover::prove_lean(M31(1), M31(1), log_n);
         let ms = t.elapsed().as_secs_f64() * 1000.0;
         let t2 = Instant::now();
-        let ok = vortex_stark::verifier::verify(&proof).is_ok();
+        let ok = vortexstark::verifier::verify(&proof).is_ok();
         let verify_ms = t2.elapsed().as_secs_f64() * 1000.0;
         println!("  log_n={log_n:>2} | {n:>12} elements | prove: {ms:>8.1}ms | verify: {verify_ms:.1}ms | {}", if ok {"✓"} else {"✗"});
     }
@@ -43,19 +43,19 @@ fn main() {
 
         let eval_size = 2 * n;
         let log_eval = log_n + 1;
-        let trace_domain = vortex_stark::circle::Coset::half_coset(log_n);
-        let eval_domain = vortex_stark::circle::Coset::half_coset(log_eval);
-        let inv = vortex_stark::ntt::InverseTwiddleCache::new(&trace_domain);
-        let fwd = vortex_stark::ntt::ForwardTwiddleCache::new(&eval_domain);
+        let trace_domain = vortexstark::circle::Coset::half_coset(log_n);
+        let eval_domain = vortexstark::circle::Coset::half_coset(log_eval);
+        let inv = vortexstark::ntt::InverseTwiddleCache::new(&trace_domain);
+        let fwd = vortexstark::ntt::ForwardTwiddleCache::new(&eval_domain);
 
         let t2 = Instant::now();
         let mut d_eval_cols = Vec::new();
         for mut col in d_cols {
-            vortex_stark::ntt::interpolate(&mut col, &inv);
-            let mut d_eval = vortex_stark::device::DeviceBuffer::<u32>::alloc(eval_size);
+            vortexstark::ntt::interpolate(&mut col, &inv);
+            let mut d_eval = vortexstark::device::DeviceBuffer::<u32>::alloc(eval_size);
             unsafe { ffi::cuda_zero_pad(col.as_ptr(), d_eval.as_mut_ptr(), n as u32, eval_size as u32); }
             drop(col);
-            vortex_stark::ntt::evaluate(&mut d_eval, &fwd);
+            vortexstark::ntt::evaluate(&mut d_eval, &fwd);
             d_eval_cols.push(d_eval);
         }
         let gpu_ms = t2.elapsed().as_secs_f64() * 1000.0;
@@ -87,33 +87,33 @@ fn main() {
 
         let eval_size = 2 * n;
         let log_eval = log_n + 1;
-        let trace_domain = vortex_stark::circle::Coset::half_coset(log_n);
-        let eval_domain = vortex_stark::circle::Coset::half_coset(log_eval);
-        let inv = vortex_stark::ntt::InverseTwiddleCache::new(&trace_domain);
-        let fwd = vortex_stark::ntt::ForwardTwiddleCache::new(&eval_domain);
+        let trace_domain = vortexstark::circle::Coset::half_coset(log_n);
+        let eval_domain = vortexstark::circle::Coset::half_coset(log_eval);
+        let inv = vortexstark::ntt::InverseTwiddleCache::new(&trace_domain);
+        let fwd = vortexstark::ntt::ForwardTwiddleCache::new(&eval_domain);
 
         let t2 = Instant::now();
         let mut d_eval = Vec::new();
         for c in 0..trace::N_COLS {
-            let mut d_col = vortex_stark::device::DeviceBuffer::from_host(&cols[c]);
-            vortex_stark::ntt::interpolate(&mut d_col, &inv);
-            let mut d_e = vortex_stark::device::DeviceBuffer::<u32>::alloc(eval_size);
+            let mut d_col = vortexstark::device::DeviceBuffer::from_host(&cols[c]);
+            vortexstark::ntt::interpolate(&mut d_col, &inv);
+            let mut d_e = vortexstark::device::DeviceBuffer::<u32>::alloc(eval_size);
             unsafe { ffi::cuda_zero_pad(d_col.as_ptr(), d_e.as_mut_ptr(), n as u32, eval_size as u32); }
             drop(d_col);
-            vortex_stark::ntt::evaluate(&mut d_e, &fwd);
+            vortexstark::ntt::evaluate(&mut d_e, &fwd);
             d_eval.push(d_e);
         }
 
-        let alpha: Vec<vortex_stark::field::QM31> = (0..trace::N_CONSTRAINTS).map(|i| vortex_stark::field::QM31::from_u32_array([(i+1) as u32, 0, 0, 0])).collect();
+        let alpha: Vec<vortexstark::field::QM31> = (0..trace::N_CONSTRAINTS).map(|i| vortexstark::field::QM31::from_u32_array([(i+1) as u32, 0, 0, 0])).collect();
         let alpha_flat: Vec<u32> = alpha.iter().flat_map(|a| a.to_u32_array()).collect();
         let col_ptrs: Vec<*const u32> = d_eval.iter().map(|c| c.as_ptr()).collect();
-        let d_col_ptrs = vortex_stark::device::DeviceBuffer::from_host(&col_ptrs);
-        let d_alpha = vortex_stark::device::DeviceBuffer::from_host(&alpha_flat);
+        let d_col_ptrs = vortexstark::device::DeviceBuffer::from_host(&col_ptrs);
+        let d_alpha = vortexstark::device::DeviceBuffer::from_host(&alpha_flat);
 
-        let mut q0 = vortex_stark::device::DeviceBuffer::<u32>::alloc(eval_size);
-        let mut q1 = vortex_stark::device::DeviceBuffer::<u32>::alloc(eval_size);
-        let mut q2 = vortex_stark::device::DeviceBuffer::<u32>::alloc(eval_size);
-        let mut q3 = vortex_stark::device::DeviceBuffer::<u32>::alloc(eval_size);
+        let mut q0 = vortexstark::device::DeviceBuffer::<u32>::alloc(eval_size);
+        let mut q1 = vortexstark::device::DeviceBuffer::<u32>::alloc(eval_size);
+        let mut q2 = vortexstark::device::DeviceBuffer::<u32>::alloc(eval_size);
+        let mut q3 = vortexstark::device::DeviceBuffer::<u32>::alloc(eval_size);
 
         unsafe {
             ffi::cuda_cairo_quotient(
@@ -137,9 +137,9 @@ fn main() {
     let t = Instant::now();
     let n_ped = 100;
     for i in 0..n_ped {
-        let _ = vortex_stark::cairo_air::stark252_field::pedersen_hash(
-            vortex_stark::cairo_air::stark252_field::Fp::from_u64(i + 1),
-            vortex_stark::cairo_air::stark252_field::Fp::from_u64(i + 100),
+        let _ = vortexstark::cairo_air::stark252_field::pedersen_hash(
+            vortexstark::cairo_air::stark252_field::Fp::from_u64(i + 1),
+            vortexstark::cairo_air::stark252_field::Fp::from_u64(i + 100),
         );
     }
     let ped_ms = t.elapsed().as_secs_f64() * 1000.0;
@@ -155,6 +155,6 @@ fn main() {
     println!("  Builtins:   Poseidon (GPU), Pedersen (CPU), Bitwise");
     println!("  Features:   LogUp memory consistency, range checks, 2-phase commitment");
     println!("  CLI:        stark_cli prove/verify (binary proof serialization)");
-    println!("  Gitea:      https://github.com/garrick99/vortex-stark");
+    println!("  Gitea:      https://github.com/garrick99/VortexSTARK");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 }

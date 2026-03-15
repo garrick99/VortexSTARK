@@ -7,13 +7,13 @@
 ///
 /// Each workload: prove + verify end-to-end with full constraint checking.
 
-use vortex_stark::cairo_air::{
+use vortexstark::cairo_air::{
     decode::Instruction,
     prover::{cairo_prove_cached, cairo_verify, CairoProverCache},
     pedersen::gpu_init,
     stark252_field::Fp,
 };
-use vortex_stark::cuda::ffi;
+use vortexstark::cuda::ffi;
 use std::time::Instant;
 
 /// Build a Fibonacci program (arithmetic-heavy baseline)
