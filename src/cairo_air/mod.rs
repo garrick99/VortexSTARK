@@ -20,3 +20,4 @@ pub mod pedersen;
 pub mod bitwise;
 pub mod stark252_field;
 pub mod prover;
+pub mod ec_constraint;
