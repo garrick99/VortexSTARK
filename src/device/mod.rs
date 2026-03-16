@@ -1,3 +1,3 @@
-mod buffer;
+pub mod buffer;
 
 pub use buffer::{DeviceBuffer, PinnedBuffer};

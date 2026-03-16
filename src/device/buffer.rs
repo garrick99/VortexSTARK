@@ -17,9 +17,36 @@ unsafe impl<T: Send> Send for DeviceBuffer<T> {}
 // CUDA API calls are serialized by the driver when accessing the same stream.
 unsafe impl<T: Send> Sync for DeviceBuffer<T> {}
 
+/// Whether to use synchronous CUDA malloc (needed for WSL2 compatibility).
+/// cudaMallocAsync relies on the CUDA memory pool API which has issues
+/// with WSL2's GPU-PV driver translation layer.
+static USE_SYNC_MALLOC: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Force synchronous cudaMalloc/cudaFree instead of async pool-based allocation.
+/// Call this before any GPU allocation if running under WSL2.
+pub fn force_sync_malloc() {
+    USE_SYNC_MALLOC.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Auto-detect WSL2 and enable sync malloc if needed.
+pub fn detect_wsl2_and_configure() {
+    if std::path::Path::new("/proc/sys/fs/binfmt_misc/WSLInterop").exists()
+        || std::env::var("WSL_DISTRO_NAME").is_ok()
+    {
+        eprintln!("[CUDA] WSL2 detected — using synchronous cudaMalloc (pool API not supported)");
+        force_sync_malloc();
+    }
+}
+
+pub fn use_sync() -> bool {
+    USE_SYNC_MALLOC.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl<T> DeviceBuffer<T> {
     /// Allocate `len` elements on the GPU (uninitialized).
-    /// Uses cudaMallocAsync for pool-based allocation (near-zero overhead).
+    /// Uses cudaMallocAsync for pool-based allocation on native systems,
+    /// falls back to cudaMalloc on WSL2.
     pub fn alloc(len: usize) -> Self {
         if len == 0 {
             return Self {
@@ -30,8 +57,17 @@ impl<T> DeviceBuffer<T> {
         }
         let bytes = len * std::mem::size_of::<T>();
         let mut ptr: *mut c_void = std::ptr::null_mut();
-        let err = unsafe { ffi::cudaMallocAsync(&mut ptr, bytes, std::ptr::null_mut()) };
-        assert!(err == 0, "cudaMallocAsync failed: error {err}");
+        let err = if use_sync() {
+            unsafe { ffi::cudaMalloc(&mut ptr, bytes) }
+        } else {
+            unsafe { ffi::cudaMallocAsync(&mut ptr, bytes, std::ptr::null_mut()) }
+        };
+        if err != 0 {
+            panic!(
+                "cudaMalloc failed: error {err} (bytes={bytes}, {:.1}MB requested, sync={})",
+                bytes as f64 / 1e6, use_sync()
+            );
+        }
         Self {
             ptr: ptr as *mut T,
             len,
@@ -312,7 +348,11 @@ impl<T> AsRef<DeviceBuffer<T>> for DeviceBuffer<T> {
 impl<T> Drop for DeviceBuffer<T> {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            unsafe { ffi::cudaFreeAsync(self.ptr as *mut c_void, std::ptr::null_mut()) };
+            if use_sync() {
+                unsafe { ffi::cudaFree(self.ptr as *mut c_void) };
+            } else {
+                unsafe { ffi::cudaFreeAsync(self.ptr as *mut c_void, std::ptr::null_mut()) };
+            }
         }
     }
 }

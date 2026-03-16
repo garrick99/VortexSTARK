@@ -100,6 +100,11 @@ pub fn vram_preflight_check() {
 /// to release VRAM that's no longer needed. Keeps `keep_bytes` in the pool
 /// for fast reuse on the next job (0 = release everything).
 pub fn vram_release(keep_bytes: usize) {
+    if crate::device::buffer::use_sync() {
+        // Sync mode: no pool to trim, just sync the device
+        unsafe { cudaDeviceSynchronize(); }
+        return;
+    }
     unsafe {
         cudaDeviceSynchronize();
         let mut pool: *mut std::ffi::c_void = std::ptr::null_mut();
@@ -116,7 +121,31 @@ pub fn vram_release(keep_bytes: usize) {
 /// up to that limit for fast reuse, but anything beyond 2 GB is returned
 /// to the OS between jobs so other processes can share the GPU.
 pub fn init_memory_pool() {
+    // Detect WSL2 and switch to sync malloc if needed
+    crate::device::buffer::detect_wsl2_and_configure();
+
+    // Sanity check: verify GPU is accessible with a tiny allocation
+    unsafe {
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let err = cudaMalloc(&mut ptr, 64);
+        if err != 0 {
+            panic!("[CUDA] GPU sanity check failed: cudaMalloc(64) returned error {err}. \
+                    Is the CUDA driver working? Try: nvidia-smi");
+        }
+        cudaFree(ptr);
+        let err = cudaDeviceSynchronize();
+        if err != 0 {
+            panic!("[CUDA] GPU sync failed after sanity check: error {err}");
+        }
+        eprintln!("[CUDA] GPU sanity check passed");
+    }
+
     vram_preflight_check();
+
+    // Skip pool configuration on WSL2 (not using async alloc)
+    if crate::device::buffer::use_sync() {
+        return;
+    }
 
     unsafe {
         let mut pool: *mut std::ffi::c_void = std::ptr::null_mut();
@@ -136,7 +165,12 @@ pub fn init_memory_pool() {
 /// Initialize with greedy pool (never releases memory). Use only for
 /// back-to-back benchmarks where you know nothing else needs the GPU.
 pub fn init_memory_pool_greedy() {
+    crate::device::buffer::detect_wsl2_and_configure();
     vram_preflight_check();
+
+    if crate::device::buffer::use_sync() {
+        return;
+    }
 
     unsafe {
         let mut pool: *mut std::ffi::c_void = std::ptr::null_mut();
