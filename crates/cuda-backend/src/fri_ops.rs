@@ -1,7 +1,9 @@
-//! FriOps: FRI folding.
+//! FriOps: FRI folding — CPU fallback.
 //!
-//! TEMPORARY: CPU fallback while investigating stale GPU pointer bug in FRI commit.
-//! TODO: Restore GPU path after fixing the DeviceBuffer lifetime issue.
+//! GPU FRI kernels cause error 700 on WSL2 during FRI commit phase.
+//! Using CPU fallback with correct per-domain twiddles until the
+//! GPU kernel issue is resolved.
+//! TODO: Debug cuda_fold_line_soa / cuda_fold_circle_into_line_soa on WSL2.
 
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
@@ -20,12 +22,11 @@ impl FriOps for CudaBackend {
     fn fold_line(
         eval: &LineEvaluation<Self>,
         alpha: SecureField,
-        twiddles: &TwiddleTree<Self>,
+        _twiddles: &TwiddleTree<Self>,
         fold_step: u32,
     ) -> LineEvaluation<Self> {
-        // CPU fallback: download, fold on CPU, upload
         let cpu_eval = line_eval_to_cpu(eval);
-        let cpu_twiddles = twiddles_to_cpu(twiddles);
+        let cpu_twiddles = CpuBackend::precompute_twiddles(eval.domain().coset());
         let cpu_result = CpuBackend::fold_line(&cpu_eval, alpha, &cpu_twiddles, fold_step);
         line_eval_from_cpu(&cpu_result)
     }
@@ -34,11 +35,11 @@ impl FriOps for CudaBackend {
         dst: &mut LineEvaluation<Self>,
         src: &SecureEvaluation<Self, BitReversedOrder>,
         alpha: SecureField,
-        twiddles: &TwiddleTree<Self>,
+        _twiddles: &TwiddleTree<Self>,
     ) {
         let mut cpu_dst = line_eval_to_cpu(dst);
         let cpu_src = secure_eval_to_cpu(src);
-        let cpu_twiddles = twiddles_to_cpu(twiddles);
+        let cpu_twiddles = CpuBackend::precompute_twiddles(src.domain.half_coset);
         CpuBackend::fold_circle_into_line(&mut cpu_dst, &cpu_src, alpha, &cpu_twiddles);
         *dst = line_eval_from_cpu(&cpu_dst);
     }
@@ -52,23 +53,10 @@ impl FriOps for CudaBackend {
     }
 }
 
-// ---- Conversion helpers: CudaBackend ↔ CpuBackend ----
-
 fn line_eval_to_cpu(eval: &LineEvaluation<CudaBackend>) -> LineEvaluation<CpuBackend> {
-    let n = eval.values.columns[0].len();
-    eprintln!("[FRI] line_eval_to_cpu: n={n}, domain={:?}", eval.domain());
     let cpu_coords = SecureColumnByCoords {
-        columns: std::array::from_fn(|i| {
-            let col = eval.values.columns[i].to_cpu();
-            assert_eq!(col.len(), n, "column {i} length mismatch");
-            col
-        }),
+        columns: std::array::from_fn(|i| eval.values.columns[i].to_cpu()),
     };
-    // Verify a few values roundtrip
-    if n > 0 {
-        let v = cpu_coords.at(0);
-        eprintln!("[FRI]   first value: {:?}", v.to_m31_array().map(|m| m.0));
-    }
     LineEvaluation::new(eval.domain(), cpu_coords)
 }
 
@@ -91,9 +79,4 @@ fn secure_eval_from_cpu(eval: &SecureEvaluation<CpuBackend, BitReversedOrder>) -
         columns: std::array::from_fn(|i| eval.values.columns[i].iter().copied().collect()),
     };
     SecureEvaluation::new(eval.domain, gpu_coords)
-}
-
-fn twiddles_to_cpu(twiddles: &TwiddleTree<CudaBackend>) -> TwiddleTree<CpuBackend> {
-    // CPU twiddles are precomputed from the coset
-    CpuBackend::precompute_twiddles(twiddles.root_coset)
 }
