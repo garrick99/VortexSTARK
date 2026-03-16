@@ -5,11 +5,11 @@
 //! and interpolation flows through the GPU NTT.
 
 use num_traits::Zero;
-use stwo_prover::core::backend::{Col, Column, ColumnOps};
+use stwo_prover::core::backend::{Column, ColumnOps};
 use stwo_prover::core::circle::{CirclePoint, Coset as StwoCoset};
 use stwo_prover::core::fields::m31::{BaseField, M31};
 use stwo_prover::core::fields::qm31::SecureField;
-use stwo_prover::core::fields::{ExtensionOf, FieldExpOps};
+use stwo_prover::core::fields::FieldExpOps;
 use stwo_prover::core::poly::circle::{
     CanonicCoset, CircleDomain, CircleEvaluation, CirclePoly, PolyOps,
 };

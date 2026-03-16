@@ -6,7 +6,6 @@
 use stwo_prover::core::backend::{Column, ColumnOps};
 use stwo_prover::core::fields::m31::BaseField;
 use stwo_prover::core::fields::qm31::SecureField;
-use stwo_prover::core::fields::Field;
 use vortexstark::cuda::ffi;
 use vortexstark::device::DeviceBuffer;
 use std::ffi::c_void;
@@ -199,7 +198,7 @@ impl ColumnOps<SecureField> for CudaBackend {
         // The buffer is interleaved (4 u32s per element), so we need a
         // stride-aware bit-reverse. For now, download, bit-reverse on CPU,
         // re-upload. TODO: GPU kernel for strided bit-reverse.
-        let mut host = column.buf.to_host();
+        let host = column.buf.to_host();
         let mut tmp = vec![0u32; n * 4];
         for i in 0..n {
             let j = bit_reverse(i, log_n as usize);
@@ -294,7 +293,7 @@ impl ColumnOps<Blake2sHash> for CudaBackend {
         let n = column.len;
         assert!(n.is_power_of_two());
         let log_n = n.trailing_zeros();
-        let mut host = column.buf.to_host();
+        let host = column.buf.to_host();
         let mut tmp = vec![0u32; n * 8];
         for i in 0..n {
             let j = bit_reverse(i, log_n as usize);
