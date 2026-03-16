@@ -13,3 +13,12 @@ impl Backend for CudaBackend {}
 impl stwo::prover::backend::BackendForChannel<
     stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel
 > for CudaBackend {}
+
+impl stwo::prover::backend::BackendForChannel<
+    stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel
+> for CudaBackend {}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl stwo::prover::backend::BackendForChannel<
+    stwo::core::vcs_lifted::poseidon252_merkle::Poseidon252MerkleChannel
+> for CudaBackend {}

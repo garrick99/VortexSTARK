@@ -336,6 +336,124 @@ impl ColumnOps<Blake2sHash> for CudaBackend {
     }
 }
 
+// ---- Column<FieldElement252> for Poseidon252 Merkle tree ----
+
+#[cfg(not(target_arch = "wasm32"))]
+mod poseidon_column {
+    use starknet_ff::FieldElement as FieldElement252;
+    use stwo::prover::backend::{Column, ColumnOps};
+    use vortexstark::device::DeviceBuffer;
+    use vortexstark::cuda::ffi;
+    use std::ffi::c_void;
+
+    use super::{CudaBackend, CudaColumn, bit_reverse};
+
+    impl Column<FieldElement252> for CudaColumn<FieldElement252> {
+        fn zeros(len: usize) -> Self {
+            // FieldElement252 is 32 bytes = 8 u32s
+            let mut buf = DeviceBuffer::<u32>::alloc(len * 8);
+            buf.zero();
+            Self { buf, len, _marker: std::marker::PhantomData }
+        }
+
+        unsafe fn uninitialized(len: usize) -> Self {
+            let buf = DeviceBuffer::<u32>::alloc(len * 8);
+            Self { buf, len, _marker: std::marker::PhantomData }
+        }
+
+        fn to_cpu(&self) -> Vec<FieldElement252> {
+            let host = self.buf.to_host();
+            host.chunks_exact(8).map(|c| {
+                let mut bytes = [0u8; 32];
+                for (i, &word) in c.iter().enumerate() {
+                    bytes[i*4..i*4+4].copy_from_slice(&word.to_le_bytes());
+                }
+                FieldElement252::from_bytes_be(&bytes).unwrap()
+            }).collect()
+        }
+
+        fn len(&self) -> usize { self.len }
+
+        fn at(&self, index: usize) -> FieldElement252 {
+            assert!(index < self.len);
+            let mut val = [0u32; 8];
+            unsafe {
+                ffi::cudaMemcpy(
+                    val.as_mut_ptr() as *mut c_void,
+                    (self.buf.as_ptr() as *const u8).add(index * 32) as *const c_void,
+                    32, ffi::MEMCPY_D2H,
+                );
+            }
+            let mut bytes = [0u8; 32];
+            for (i, &w) in val.iter().enumerate() {
+                bytes[i*4..i*4+4].copy_from_slice(&w.to_le_bytes());
+            }
+            FieldElement252::from_bytes_be(&bytes).unwrap()
+        }
+
+        fn set(&mut self, index: usize, value: FieldElement252) {
+            assert!(index < self.len);
+            let bytes = value.to_bytes_be();
+            let mut words = [0u32; 8];
+            for i in 0..8 {
+                words[i] = u32::from_le_bytes([
+                    bytes[i*4], bytes[i*4+1], bytes[i*4+2], bytes[i*4+3]
+                ]);
+            }
+            unsafe {
+                ffi::cudaMemcpy(
+                    (self.buf.as_mut_ptr() as *mut u8).add(index * 32) as *mut c_void,
+                    words.as_ptr() as *const c_void,
+                    32, ffi::MEMCPY_H2D,
+                );
+            }
+        }
+
+        fn split_at_mid(self) -> (Self, Self) {
+            let half = self.len / 2;
+            let cpu = self.buf.to_host();
+            let left = DeviceBuffer::from_host(&cpu[..half * 8]);
+            let right = DeviceBuffer::from_host(&cpu[half * 8..]);
+            (
+                Self { buf: left, len: half, _marker: std::marker::PhantomData },
+                Self { buf: right, len: self.len - half, _marker: std::marker::PhantomData },
+            )
+        }
+    }
+
+    impl FromIterator<FieldElement252> for CudaColumn<FieldElement252> {
+        fn from_iter<I: IntoIterator<Item = FieldElement252>>(iter: I) -> Self {
+            let elems: Vec<FieldElement252> = iter.into_iter().collect();
+            let len = elems.len();
+            let host: Vec<u32> = elems.iter().flat_map(|e| {
+                let bytes = e.to_bytes_be();
+                (0..8).map(move |i| u32::from_le_bytes([
+                    bytes[i*4], bytes[i*4+1], bytes[i*4+2], bytes[i*4+3]
+                ]))
+            }).collect();
+            let buf = DeviceBuffer::from_host(&host);
+            Self { buf, len, _marker: std::marker::PhantomData }
+        }
+    }
+
+    impl ColumnOps<FieldElement252> for CudaBackend {
+        type Column = CudaColumn<FieldElement252>;
+
+        fn bit_reverse_column(column: &mut Self::Column) {
+            let n = column.len;
+            assert!(n.is_power_of_two());
+            let log_n = n.trailing_zeros();
+            let host = column.buf.to_host();
+            let mut tmp = vec![0u32; n * 8];
+            for i in 0..n {
+                let j = bit_reverse(i, log_n as usize);
+                tmp[j * 8..j * 8 + 8].copy_from_slice(&host[i * 8..i * 8 + 8]);
+            }
+            column.buf = DeviceBuffer::from_host(&tmp);
+        }
+    }
+}
+
 fn bit_reverse(x: usize, n_bits: usize) -> usize {
     let mut result = 0;
     let mut val = x;

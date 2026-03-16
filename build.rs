@@ -57,8 +57,11 @@ fn main() {
 
         // GPU architectures
         cmd.args(["-gencode", "arch=compute_89,code=sm_89"]);
-        // sm_120 (Blackwell) requires CUDA 13+; skip on older toolkits
-        if cuda_dir.to_str().unwrap_or("").contains("13") {
+        // sm_120 (Blackwell) requires CUDA 13+; detect via nvcc version
+        let nvcc_version = Command::new(&nvcc).arg("--version").output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        if nvcc_version.contains("cuda_13") || nvcc_version.contains("cuda_14") {
             cmd.args(["-gencode", "arch=compute_120,code=sm_120"]);
         }
         cmd.args(["-gencode", "arch=compute_89,code=compute_89"]);

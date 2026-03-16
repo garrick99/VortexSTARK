@@ -10,7 +10,7 @@ use stwo::prover::backend::{Col, Column};
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SECURE_EXTENSION_DEGREE;
 use stwo::core::vcs::blake2_hash::Blake2sHash;
-use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasher;
+use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasherGeneric;
 use stwo::core::vcs_lifted::verifier::PACKED_LEAF_SIZE;
 use stwo::prover::vcs_lifted::ops::{MerkleOpsLifted, PackLeavesOps};
 
@@ -20,7 +20,7 @@ use vortexstark::device::DeviceBuffer;
 use super::CudaBackend;
 use super::column::CudaColumn;
 
-impl MerkleOpsLifted<Blake2sMerkleHasher> for CudaBackend {
+impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M31_OUTPUT>> for CudaBackend {
     fn build_leaves(
         columns: &[&Col<Self, BaseField>],
         lifting_log_size: u32,
@@ -28,7 +28,7 @@ impl MerkleOpsLifted<Blake2sMerkleHasher> for CudaBackend {
         // CPU fallback: download, compute, upload.
         let cpu_columns: Vec<Vec<BaseField>> = columns.iter().map(|c| c.to_cpu()).collect();
         let cpu_col_refs: Vec<&Vec<BaseField>> = cpu_columns.iter().collect();
-        let cpu_result = <stwo::prover::backend::CpuBackend as MerkleOpsLifted<Blake2sMerkleHasher>>::build_leaves(
+        let cpu_result = <stwo::prover::backend::CpuBackend as MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M31_OUTPUT>>>::build_leaves(
             &cpu_col_refs, lifting_log_size,
         );
         cpu_result.into_iter().collect()
@@ -67,36 +67,44 @@ impl PackLeavesOps for CudaBackend {
     }
 }
 
-// Also keep the legacy MerkleOps for the non-lifted VCS path, which may still be
-// referenced by some code paths.
-use stwo::core::vcs::blake2_merkle::Blake2sMerkleHasherGeneric;
-use stwo::core::vcs::MerkleHasher;
-use stwo::prover::vcs::ops::MerkleOps;
+// Poseidon252 MerkleOpsLifted: CPU fallback (Poseidon is not GPU-accelerated yet).
+#[cfg(not(target_arch = "wasm32"))]
+mod poseidon_merkle {
+    use stwo::prover::backend::{Col, Column};
+    use stwo::core::fields::m31::BaseField;
+    use stwo::core::vcs_lifted::poseidon252_merkle::Poseidon252MerkleHasher;
+    use stwo::prover::vcs_lifted::ops::MerkleOpsLifted;
+    use starknet_ff::FieldElement as FieldElement252;
 
-impl<const IS_M31_OUTPUT: bool> MerkleOps<Blake2sMerkleHasherGeneric<IS_M31_OUTPUT>> for CudaBackend {
-    fn commit_on_layer(
-        log_size: u32,
-        prev_layer: Option<&Col<Self, Blake2sHash>>,
-        columns: &[&Col<Self, BaseField>],
-    ) -> Col<Self, Blake2sHash> {
-        let n = 1usize << log_size;
+    use super::CudaBackend;
+    use super::CudaColumn;
 
-        if prev_layer.is_none() && !columns.is_empty() {
-            // Leaf layer — GPU path
-            return commit_leaves_gpu(n, columns);
+    impl MerkleOpsLifted<Poseidon252MerkleHasher> for CudaBackend {
+        fn build_leaves(
+            columns: &[&Col<Self, BaseField>],
+            lifting_log_size: u32,
+        ) -> Col<Self, FieldElement252> {
+            // CPU fallback: download, compute, upload.
+            let cpu_columns: Vec<Vec<BaseField>> = columns.iter().map(|c| c.to_cpu()).collect();
+            let cpu_col_refs: Vec<&Vec<BaseField>> = cpu_columns.iter().collect();
+            let cpu_result = <stwo::prover::backend::CpuBackend as MerkleOpsLifted<Poseidon252MerkleHasher>>::build_leaves(
+                &cpu_col_refs, lifting_log_size,
+            );
+            cpu_result.into_iter().collect()
         }
 
-        if let Some(prev) = prev_layer {
-            if columns.is_empty() {
-                // Pure merge layer (no column data) — GPU path
-                return commit_merge_gpu(n, prev);
-            }
+        fn build_next_layer(prev_layer: &Col<Self, FieldElement252>) -> Col<Self, FieldElement252> {
+            // CPU fallback: download, compute, upload.
+            let cpu_data: Vec<FieldElement252> = prev_layer.to_cpu();
+            let cpu_col: Vec<FieldElement252> = cpu_data;
+            let cpu_result = <stwo::prover::backend::CpuBackend as MerkleOpsLifted<Poseidon252MerkleHasher>>::build_next_layer(&cpu_col);
+            cpu_result.into_iter().collect()
         }
-
-        // General case: children + columns — CPU fallback
-        commit_cpu::<IS_M31_OUTPUT>(n, prev_layer, columns)
     }
 }
+
+// Legacy MerkleOps removed — using MerkleOpsLifted exclusively.
+// The old non-lifted VCS path is not used by stwo-cairo.
 
 /// GPU leaf hashing: hash column values into leaf nodes.
 fn commit_leaves_gpu(
@@ -144,23 +152,4 @@ fn commit_merge_gpu(
     CudaColumn::from_device_buffer(d_parents, n)
 }
 
-/// CPU fallback for internal layers with both children and column data.
-fn commit_cpu<const IS_M31_OUTPUT: bool>(
-    n: usize,
-    prev_layer: Option<&CudaColumn<Blake2sHash>>,
-    columns: &[&CudaColumn<BaseField>],
-) -> CudaColumn<Blake2sHash> {
-    // Download everything to CPU
-    let prev_cpu: Option<Vec<Blake2sHash>> = prev_layer.map(|p| p.to_cpu());
-    let cols_cpu: Vec<Vec<BaseField>> = columns.iter().map(|c| c.to_cpu()).collect();
-
-    let hashes: Vec<Blake2sHash> = (0..n)
-        .map(|i| {
-            let children = prev_cpu.as_ref().map(|p| (p[2 * i], p[2 * i + 1]));
-            let col_vals: Vec<BaseField> = cols_cpu.iter().map(|c| c[i]).collect();
-            Blake2sMerkleHasherGeneric::<IS_M31_OUTPUT>::hash_node(children, &col_vals)
-        })
-        .collect();
-
-    hashes.into_iter().collect()
-}
+// Legacy commit_cpu removed — MerkleOpsLifted handles all cases via build_leaves/build_next_layer.

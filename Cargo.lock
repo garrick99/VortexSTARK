@@ -1112,7 +1112,7 @@ dependencies = [
 [[package]]
 name = "stwo"
 version = "2.1.0"
-source = "git+https://github.com/starkware-libs/stwo?rev=e584a309#e584a30985ddb5565735b87a1801b03721712939"
+source = "git+http://github.com/garrick/stwo-fork.git?branch=cuda-backend#77dbd213c636dd982ebc1eae0cb037fccf5126ee"
 dependencies = [
  "blake2",
  "blake3",
@@ -1139,7 +1139,7 @@ dependencies = [
 [[package]]
 name = "stwo-constraint-framework"
 version = "2.1.0"
-source = "git+https://github.com/starkware-libs/stwo?rev=e584a309#e584a30985ddb5565735b87a1801b03721712939"
+source = "git+http://github.com/garrick/stwo-fork.git?branch=cuda-backend#77dbd213c636dd982ebc1eae0cb037fccf5126ee"
 dependencies = [
  "hashbrown 0.16.1",
  "itertools 0.12.1",
@@ -1368,6 +1368,7 @@ dependencies = [
  "num-traits",
  "rand 0.8.5",
  "serde",
+ "starknet-ff",
  "stwo",
  "stwo-constraint-framework",
  "tracing",
