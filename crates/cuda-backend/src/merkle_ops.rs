@@ -44,22 +44,11 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
             return CudaColumn::from_device_buffer(DeviceBuffer::<u32>::alloc(0), 0);
         }
 
-        // Try GPU merge path for pure hash pairing
-        let mut d_parents = DeviceBuffer::<u32>::alloc(n * 8);
-        unsafe {
-            ffi::cuda_merkle_hash_nodes(
-                prev_layer.buf.as_ptr(),
-                d_parents.as_mut_ptr(),
-                n as u32,
-            );
-            let err = ffi::cudaDeviceSynchronize();
-            if err != 0 {
-                let last = ffi::cudaGetLastError();
-                panic!("[CUDA] cuda_merkle_hash_nodes failed: err={err}, last={last}, n={n}");
-            }
-        }
+        // CPU fallback for Merkle node hashing (GPU kernel under investigation)
+        let cpu_prev = prev_layer.to_cpu();
+        let cpu_result = <stwo::prover::backend::CpuBackend as MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M31_OUTPUT>>>::build_next_layer(&cpu_prev);
+        cpu_result.into_iter().collect()
 
-        CudaColumn::from_device_buffer(d_parents, n)
     }
 }
 
