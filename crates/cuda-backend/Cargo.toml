@@ -9,8 +9,8 @@ name = "bench-stwo"
 path = "src/bin/bench_stwo.rs"
 
 [dependencies]
-stwo = { git = "https://github.com/garrick99/stwo-fork.git", branch = "cuda-backend", features = ["prover"] }
-stwo-constraint-framework = { git = "https://github.com/garrick99/stwo-fork.git", branch = "cuda-backend", features = ["prover"] }
+stwo = { git = "http://github.com/garrick/stwo-fork.git", branch = "cuda-backend", features = ["prover"] }
+stwo-constraint-framework = { git = "http://github.com/garrick/stwo-fork.git", branch = "cuda-backend", features = ["prover"] }
 vortexstark = { path = "../.." }
 serde = { version = "1.0", features = ["derive"] }
 itertools = "0.12.0"

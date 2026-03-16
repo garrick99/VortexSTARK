@@ -6,7 +6,7 @@ use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo::prover::backend::{Column, CpuBackend};
 use stwo::prover::secure_column::SecureColumnByCoords;
-use stwo::prover::poly::circle::SecureEvaluation;
+use stwo::prover::poly::circle::{CircleEvaluation, SecureEvaluation};
 use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::{AccumulatedNumerators, ColumnSampleBatch, QuotientOps};
 
@@ -15,20 +15,17 @@ use super::column::CudaColumn;
 
 impl QuotientOps for CudaBackend {
     fn accumulate_numerators(
-        columns: &[&SecureEvaluation<Self, BitReversedOrder>],
+        columns: &[&CircleEvaluation<Self, BaseField, BitReversedOrder>],
         sample_batches: &[ColumnSampleBatch],
         accumulated_numerators_vec: &mut Vec<AccumulatedNumerators<Self>>,
     ) {
-        // Download columns to CPU
-        let cpu_columns: Vec<SecureEvaluation<CpuBackend, BitReversedOrder>> = columns.iter()
-            .map(|col| {
-                let cpu_coords = SecureColumnByCoords {
-                    columns: std::array::from_fn(|i| col.values.columns[i].to_cpu()),
-                };
-                SecureEvaluation::new(col.domain, cpu_coords)
-            })
-            .collect();
-        let cpu_col_refs: Vec<&SecureEvaluation<CpuBackend, BitReversedOrder>> =
+        // Download BaseField columns to CPU
+        let cpu_columns: Vec<CircleEvaluation<CpuBackend, BaseField, BitReversedOrder>> =
+            columns.iter().map(|col| {
+                let cpu_vals = col.values.to_cpu();
+                CircleEvaluation::new(col.domain, cpu_vals)
+            }).collect();
+        let cpu_col_refs: Vec<&CircleEvaluation<CpuBackend, BaseField, BitReversedOrder>> =
             cpu_columns.iter().collect();
 
         let mut cpu_accs = Vec::new();
