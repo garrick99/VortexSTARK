@@ -29,7 +29,7 @@ pub struct CudaTwiddles {
 }
 
 /// Convert stwo Coset → VortexSTARK Coset for twiddle computation.
-fn convert_coset(coset: &StwoCoset) -> VortexCoset {
+pub fn convert_coset(coset: &StwoCoset) -> VortexCoset {
     VortexCoset {
         initial: vortexstark::circle::CirclePoint {
             x: vortexstark::field::M31(coset.initial.x.0),
