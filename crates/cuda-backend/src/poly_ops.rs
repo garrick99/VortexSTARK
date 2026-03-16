@@ -49,22 +49,16 @@ impl PolyOps for CudaBackend {
         eval: CircleEvaluation<Self, BaseField, BitReversedOrder>,
         twiddles: &TwiddleTree<Self>,
     ) -> CircleCoefficients<Self> {
-        let mut values = eval.values;
-        let data_log_n = values.len.trailing_zeros();
-
-        if data_log_n == twiddles.itwiddles.cache.log_n {
-            // Data size matches twiddle cache — use directly
-            vortexstark::ntt::interpolate(&mut values.buf, &twiddles.itwiddles.cache);
-        } else {
-            // Data is smaller than twiddle cache — build a temporary cache
-            // at the correct size. This is O(n) and only happens for small columns.
-            let domain = eval.domain;
-            let vortex_coset = convert_coset(&domain.half_coset);
-            let temp_cache = vortexstark::ntt::TwiddleCache::new(&vortex_coset);
-            vortexstark::ntt::interpolate(&mut values.buf, &temp_cache);
-        }
-
-        CircleCoefficients::new(values)
+        // CPU fallback: download, interpolate on CPU, upload.
+        // TODO: restore GPU NTT after fixing the twiddle/domain compatibility issue.
+        let cpu_vals = eval.values.to_cpu();
+        let cpu_eval = stwo::prover::poly::circle::CircleEvaluation::<
+            stwo::prover::backend::CpuBackend, BaseField, BitReversedOrder
+        >::new(eval.domain, cpu_vals);
+        let cpu_twiddles = stwo::prover::backend::CpuBackend::precompute_twiddles(eval.domain.half_coset);
+        let cpu_poly = stwo::prover::backend::CpuBackend::interpolate(cpu_eval, &cpu_twiddles);
+        let gpu_coeffs: CudaColumn<BaseField> = cpu_poly.coeffs.into_iter().collect();
+        CircleCoefficients::new(gpu_coeffs)
     }
 
     fn eval_at_point(poly: &CircleCoefficients<Self>, point: CirclePoint<SecureField>) -> SecureField {
@@ -152,18 +146,15 @@ impl PolyOps for CudaBackend {
         domain: CircleDomain,
         twiddles: &TwiddleTree<Self>,
     ) -> CircleEvaluation<Self, BaseField, BitReversedOrder> {
-        let mut values = Self::extend(poly, domain.log_size()).coeffs;
-        let data_log_n = values.len.trailing_zeros();
-
-        if data_log_n == twiddles.twiddles.cache.log_n {
-            vortexstark::ntt::evaluate(&mut values.buf, &twiddles.twiddles.cache);
-        } else {
-            let vortex_coset = convert_coset(&domain.half_coset);
-            let temp_cache = vortexstark::ntt::TwiddleCache::new(&vortex_coset);
-            vortexstark::ntt::evaluate(&mut values.buf, &temp_cache);
-        }
-
-        CircleEvaluation::new(domain, values)
+        // CPU fallback: download, evaluate on CPU, upload.
+        let cpu_coeffs = poly.coeffs.to_cpu();
+        let cpu_poly = stwo::prover::poly::circle::CircleCoefficients::<
+            stwo::prover::backend::CpuBackend
+        >::new(cpu_coeffs);
+        let cpu_twiddles = stwo::prover::backend::CpuBackend::precompute_twiddles(domain.half_coset);
+        let cpu_eval = stwo::prover::backend::CpuBackend::evaluate(&cpu_poly, domain, &cpu_twiddles);
+        let gpu_vals: CudaColumn<BaseField> = cpu_eval.values.into_iter().collect();
+        CircleEvaluation::new(domain, gpu_vals)
     }
 
     fn evaluate_into(
@@ -192,17 +183,18 @@ impl PolyOps for CudaBackend {
             }
         }
 
-        // GPU forward NTT (in-place)
-        let data_log_n = values.len.trailing_zeros();
-        if data_log_n == twiddles.twiddles.cache.log_n {
-            vortexstark::ntt::evaluate(&mut values.buf, &twiddles.twiddles.cache);
-        } else {
-            let vortex_coset = convert_coset(&domain.half_coset);
-            let temp_cache = vortexstark::ntt::TwiddleCache::new(&vortex_coset);
-            vortexstark::ntt::evaluate(&mut values.buf, &temp_cache);
-        }
-
-        CircleEvaluation::new(domain, values)
+        // CPU fallback for evaluate_into
+        let cpu_coeffs = values.to_cpu();
+        let n = 1usize << domain.log_size();
+        let mut padded = cpu_coeffs;
+        padded.resize(n, BaseField::from(0u32));
+        let cpu_poly = stwo::prover::poly::circle::CircleCoefficients::<
+            stwo::prover::backend::CpuBackend
+        >::new(padded);
+        let cpu_twiddles = stwo::prover::backend::CpuBackend::precompute_twiddles(domain.half_coset);
+        let cpu_eval = stwo::prover::backend::CpuBackend::evaluate(&cpu_poly, domain, &cpu_twiddles);
+        let gpu_vals: CudaColumn<BaseField> = cpu_eval.values.into_iter().collect();
+        CircleEvaluation::new(domain, gpu_vals)
     }
 
     fn precompute_twiddles(coset: StwoCoset) -> TwiddleTree<Self> {
