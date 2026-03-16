@@ -13,6 +13,9 @@ pub struct DeviceBuffer<T> {
 }
 
 unsafe impl<T: Send> Send for DeviceBuffer<T> {}
+// SAFETY: GPU memory is globally visible to all host threads.
+// CUDA API calls are serialized by the driver when accessing the same stream.
+unsafe impl<T: Send> Sync for DeviceBuffer<T> {}
 
 impl<T> DeviceBuffer<T> {
     /// Allocate `len` elements on the GPU (uninitialized).

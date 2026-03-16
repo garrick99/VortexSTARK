@@ -6,12 +6,12 @@
 //!
 //! TODO: GPU kernels for gen_eq_evals and next_layer when profiling shows need.
 
-use stwo_prover::core::backend::{Column, CpuBackend};
-use stwo_prover::core::fields::m31::BaseField;
-use stwo_prover::core::fields::qm31::SecureField;
-use stwo_prover::core::lookups::gkr_prover::{GkrMultivariatePolyOracle, GkrOps, Layer};
-use stwo_prover::core::lookups::mle::{Mle, MleOps};
-use stwo_prover::core::lookups::utils::UnivariatePoly;
+use stwo::prover::backend::{Column, CpuBackend};
+use stwo::core::fields::m31::BaseField;
+use stwo::core::fields::qm31::SecureField;
+use stwo::prover::lookups::gkr_prover::{GkrMultivariatePolyOracle, GkrOps, Layer};
+use stwo::prover::lookups::mle::{Mle, MleOps};
+use stwo::prover::lookups::utils::UnivariatePoly;
 
 use super::CudaBackend;
 
@@ -50,7 +50,7 @@ impl GkrOps for CudaBackend {
         Mle::new(data.into_iter().collect())
     }
 
-    fn next_layer(layer: &Layer<Self>) -> Layer<Self> {
+    fn next_layer(_layer: &Layer<Self>) -> Layer<Self> {
         // Convert GPU layer → CPU layer, compute, convert back
         // This requires downloading MLE data and re-uploading.
         // For now, use todo!() — this needs per-variant conversion logic.
@@ -58,8 +58,8 @@ impl GkrOps for CudaBackend {
     }
 
     fn sum_as_poly_in_first_variable(
-        h: &GkrMultivariatePolyOracle<'_, Self>,
-        claim: SecureField,
+        _h: &GkrMultivariatePolyOracle<'_, Self>,
+        _claim: SecureField,
     ) -> UnivariatePoly<SecureField> {
         // This operates on GkrMultivariatePolyOracle which references Layer<CudaBackend>.
         // Converting the oracle to CPU form requires deep access to its internals.

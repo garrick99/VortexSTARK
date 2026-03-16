@@ -1,7 +1,7 @@
 //! The CudaBackend marker type and Backend trait impl.
 
 use serde::{Serialize, Deserialize};
-use stwo_prover::core::backend::Backend;
+use stwo::prover::backend::Backend;
 
 /// GPU-accelerated backend for stwo Circle STARK proving.
 /// All heavy operations (NTT, FRI, Merkle, field ops) run on NVIDIA CUDA.
@@ -10,6 +10,6 @@ pub struct CudaBackend;
 
 impl Backend for CudaBackend {}
 
-impl stwo_prover::core::backend::BackendForChannel<
-    stwo_prover::core::vcs::blake2_merkle::Blake2sMerkleChannel
+impl stwo::prover::backend::BackendForChannel<
+    stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel
 > for CudaBackend {}

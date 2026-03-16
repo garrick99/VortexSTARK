@@ -8,8 +8,8 @@
 //! testing a nonce range, with Blake2s computed entirely on device.
 //! The 5090's 21,504 cores would make this near-instant even at high pow_bits.
 
-use stwo_prover::core::channel::{Blake2sChannel, Channel};
-use stwo_prover::core::proof_of_work::GrindOps;
+use stwo::core::channel::{Blake2sChannel, Channel};
+use stwo::core::proof_of_work::GrindOps;
 
 use super::CudaBackend;
 
@@ -33,9 +33,7 @@ impl GrindOps<Blake2sChannel> for CudaBackend {
                         if found.load(std::sync::atomic::Ordering::Relaxed) != u64::MAX {
                             return;
                         }
-                        let mut ch = channel.clone();
-                        ch.mix_u64(nonce);
-                        if ch.trailing_zeros() >= pow_bits {
+                        if channel.verify_pow_nonce(pow_bits, nonce) {
                             found.store(nonce, std::sync::atomic::Ordering::Relaxed);
                             return;
                         }

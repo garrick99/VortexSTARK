@@ -3,9 +3,9 @@
 //! Wraps VortexSTARK's DeviceBuffer with the interface stwo expects.
 //! Data lives on GPU; `to_cpu()` downloads on demand.
 
-use stwo_prover::core::backend::{Column, ColumnOps};
-use stwo_prover::core::fields::m31::BaseField;
-use stwo_prover::core::fields::qm31::SecureField;
+use stwo::prover::backend::{Column, ColumnOps};
+use stwo::core::fields::m31::BaseField;
+use stwo::core::fields::qm31::SecureField;
 use vortexstark::cuda::ffi;
 use vortexstark::device::DeviceBuffer;
 use std::ffi::c_void;
@@ -87,6 +87,17 @@ impl Column<BaseField> for CudaColumn<BaseField> {
             );
         }
     }
+
+    fn split_at_mid(self) -> (Self, Self) {
+        let half = self.len / 2;
+        let cpu = self.buf.to_host();
+        let left = DeviceBuffer::from_host(&cpu[..half]);
+        let right = DeviceBuffer::from_host(&cpu[half..]);
+        (
+            Self { buf: left, len: half, _marker: std::marker::PhantomData },
+            Self { buf: right, len: self.len - half, _marker: std::marker::PhantomData },
+        )
+    }
 }
 
 impl FromIterator<BaseField> for CudaColumn<BaseField> {
@@ -157,6 +168,17 @@ impl Column<SecureField> for CudaColumn<SecureField> {
             );
         }
     }
+
+    fn split_at_mid(self) -> (Self, Self) {
+        let half = self.len / 2;
+        let cpu = self.buf.to_host();
+        let left = DeviceBuffer::from_host(&cpu[..half * 4]);
+        let right = DeviceBuffer::from_host(&cpu[half * 4..]);
+        (
+            Self { buf: left, len: half, _marker: std::marker::PhantomData },
+            Self { buf: right, len: self.len - half, _marker: std::marker::PhantomData },
+        )
+    }
 }
 
 impl FromIterator<SecureField> for CudaColumn<SecureField> {
@@ -210,7 +232,7 @@ impl ColumnOps<SecureField> for CudaBackend {
 
 // ---- Column<Blake2sHash> for Merkle tree ----
 
-use stwo_prover::core::vcs::blake2_hash::Blake2sHash;
+use stwo::core::vcs::blake2_hash::Blake2sHash;
 
 impl Column<Blake2sHash> for CudaColumn<Blake2sHash> {
     fn zeros(len: usize) -> Self {
@@ -269,6 +291,17 @@ impl Column<Blake2sHash> for CudaColumn<Blake2sHash> {
                 32, ffi::MEMCPY_H2D,
             );
         }
+    }
+
+    fn split_at_mid(self) -> (Self, Self) {
+        let half = self.len / 2;
+        let cpu = self.buf.to_host();
+        let left = DeviceBuffer::from_host(&cpu[..half * 8]);
+        let right = DeviceBuffer::from_host(&cpu[half * 8..]);
+        (
+            Self { buf: left, len: half, _marker: std::marker::PhantomData },
+            Self { buf: right, len: self.len - half, _marker: std::marker::PhantomData },
+        )
     }
 }
 

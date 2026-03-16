@@ -9,7 +9,7 @@ name = "bench-stwo"
 path = "src/bin/bench_stwo.rs"
 
 [dependencies]
-stwo-prover = { git = "https://github.com/starkware-libs/stwo", branch = "main" }
+stwo = { git = "https://github.com/starkware-libs/stwo", rev = "e584a309", features = ["prover"] }
 vortexstark = { path = "../.." }
 serde = { version = "1.0", features = ["derive"] }
 itertools = "0.12.0"

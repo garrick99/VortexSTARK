@@ -3,12 +3,13 @@
 
 #[cfg(test)]
 mod tests {
-    use stwo_prover::core::backend::{Column, ColumnOps, CpuBackend};
-    use stwo_prover::core::fields::m31::{BaseField, M31};
-    use stwo_prover::core::fields::qm31::SecureField;
-    use stwo_prover::core::fields::{FieldExpOps, FieldOps};
-    use stwo_prover::core::poly::circle::{CanonicCoset, CirclePoly, PolyOps};
-    use stwo_prover::core::poly::twiddles::TwiddleTree;
+    use stwo::prover::backend::{Column, ColumnOps, CpuBackend};
+    use stwo::core::fields::m31::{BaseField, M31};
+    use stwo::core::fields::qm31::SecureField;
+    use stwo::core::fields::FieldExpOps;
+    use stwo::core::poly::circle::CanonicCoset;
+    use stwo::prover::poly::circle::{CircleCoefficients, PolyOps};
+    use stwo::prover::poly::twiddles::TwiddleTree;
     use num_traits::{One, Zero};
     use std::time::Instant;
 
@@ -57,6 +58,18 @@ mod tests {
         assert_eq!(col.at(0), M31::zero());
     }
 
+    #[test]
+    fn test_column_split_at_mid_base() {
+        init_gpu();
+        let values: Vec<BaseField> = (0..8).map(|i| M31::from(i as u32)).collect();
+        let col: CudaColumn<BaseField> = values.iter().copied().collect();
+        let (left, right) = col.split_at_mid();
+        let left_cpu = left.to_cpu();
+        let right_cpu = right.to_cpu();
+        assert_eq!(left_cpu, &values[..4]);
+        assert_eq!(right_cpu, &values[4..]);
+    }
+
     // ---- Bit-reverse tests ----
 
     #[test]
@@ -71,27 +84,6 @@ mod tests {
         CpuBackend::bit_reverse_column(&mut cpu_col);
 
         assert_eq!(gpu_result, cpu_col, "GPU bit-reverse must match CPU");
-    }
-
-    // ---- Batch inverse tests ----
-
-    #[test]
-    fn test_batch_inverse_base() {
-        init_gpu();
-        let n = 1024;
-        let values: Vec<BaseField> = (1..=n).map(|i| M31::from(i as u32)).collect();
-
-        // CPU reference
-        let mut cpu_dst = vec![M31::zero(); n];
-        BaseField::batch_inverse(&values, &mut cpu_dst);
-
-        // GPU
-        let gpu_col: CudaColumn<BaseField> = values.iter().copied().collect();
-        let mut gpu_dst = CudaColumn::<BaseField>::zeros(n);
-        <CudaBackend as FieldOps<BaseField>>::batch_inverse(&gpu_col, &mut gpu_dst);
-        let gpu_result = gpu_dst.to_cpu();
-
-        assert_eq!(gpu_result, cpu_dst, "GPU batch_inverse must match CPU");
     }
 
     // ---- NTT evaluate + interpolate roundtrip ----
@@ -120,7 +112,7 @@ mod tests {
 
         // Build polynomial on GPU
         let gpu_col: CudaColumn<BaseField> = coeffs.iter().copied().collect();
-        let poly = CirclePoly::<CudaBackend>::new(gpu_col);
+        let poly = CircleCoefficients::<CudaBackend>::new(gpu_col);
 
         // Evaluate on a domain
         let domain = CanonicCoset::new(log_size + 1).circle_domain();
@@ -152,13 +144,13 @@ mod tests {
         // Polynomial 1 + 2y + 3x + 4xy
         let coeffs = [1, 3, 2, 4].map(|v| M31::from(v as u32));
         let gpu_col: CudaColumn<BaseField> = coeffs.iter().copied().collect();
-        let poly = CirclePoly::<CudaBackend>::new(gpu_col);
+        let poly = CircleCoefficients::<CudaBackend>::new(gpu_col);
 
-        let cpu_poly = stwo_prover::core::backend::cpu::CpuCirclePoly::new(coeffs.to_vec());
+        let cpu_poly = stwo::prover::backend::cpu::CpuCirclePoly::new(coeffs.to_vec());
 
         let x: SecureField = M31::from(5).into();
         let y: SecureField = M31::from(8).into();
-        let point = stwo_prover::core::circle::CirclePoint { x, y };
+        let point = stwo::core::circle::CirclePoint { x, y };
 
         let gpu_eval = CudaBackend::eval_at_point(&poly, point);
         let cpu_eval = CpuBackend::eval_at_point(&cpu_poly, point);
