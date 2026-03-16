@@ -1,19 +1,17 @@
-//! FriOps: FRI folding on GPU.
+//! FriOps: FRI folding.
 //!
-//! Stwo's SecureColumnByCoords already stores QM31 in SoA layout
-//! (4 separate BaseField columns), which matches our CUDA kernel layout exactly.
+//! TEMPORARY: CPU fallback while investigating stale GPU pointer bug in FRI commit.
+//! TODO: Restore GPU path after fixing the DeviceBuffer lifetime issue.
 
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo::prover::secure_column::SecureColumnByCoords;
+use stwo::prover::backend::{Column, CpuBackend};
 use stwo::prover::fri::FriOps;
-use stwo::prover::poly::circle::SecureEvaluation;
+use stwo::prover::poly::circle::{SecureEvaluation, PolyOps};
 use stwo::prover::line::LineEvaluation;
 use stwo::prover::poly::twiddles::TwiddleTree;
 use stwo::prover::poly::BitReversedOrder;
-
-use vortexstark::cuda::ffi;
-use vortexstark::device::DeviceBuffer;
 
 use super::CudaBackend;
 use super::column::CudaColumn;
@@ -22,147 +20,80 @@ impl FriOps for CudaBackend {
     fn fold_line(
         eval: &LineEvaluation<Self>,
         alpha: SecureField,
-        _twiddles: &TwiddleTree<Self>,
+        twiddles: &TwiddleTree<Self>,
         fold_step: u32,
     ) -> LineEvaluation<Self> {
-        // For fold_step > 1, we fold repeatedly.
-        // First fold: use the provided eval.
-        let mut current = fold_line_once(eval, alpha);
-
-        let mut folding_alpha = alpha;
-        for _ in 0..fold_step - 1 {
-            folding_alpha = folding_alpha * folding_alpha;
-            current = fold_line_once(&current, folding_alpha);
-        }
-        current
+        // CPU fallback: download, fold on CPU, upload
+        let cpu_eval = line_eval_to_cpu(eval);
+        let cpu_twiddles = twiddles_to_cpu(twiddles);
+        let cpu_result = CpuBackend::fold_line(&cpu_eval, alpha, &cpu_twiddles, fold_step);
+        line_eval_from_cpu(&cpu_result)
     }
 
     fn fold_circle_into_line(
         dst: &mut LineEvaluation<Self>,
         src: &SecureEvaluation<Self, BitReversedOrder>,
         alpha: SecureField,
-        _twiddles: &TwiddleTree<Self>,
+        twiddles: &TwiddleTree<Self>,
     ) {
-        let n = src.len();
-        let half_n = n / 2;
-
-        let src_cols = &src.values.columns;
-        let dst_cols = &mut dst.values.columns;
-
-        let domain = src.domain;
-        let vortex_coset = super::poly_ops::convert_coset(&domain.half_coset);
-        let d_twiddles = vortexstark::fri::compute_fold_twiddles_on_demand(
-            &vortex_coset, true,
-        );
-
-        let alpha_arr = qm31_to_arr(alpha);
-        let alpha_sq = alpha * alpha;
-        let alpha_sq_arr = qm31_to_arr(alpha_sq);
-
-        unsafe {
-            ffi::cuda_fold_circle_into_line_soa(
-                dst_cols[0].buf.as_mut_ptr(), dst_cols[1].buf.as_mut_ptr(),
-                dst_cols[2].buf.as_mut_ptr(), dst_cols[3].buf.as_mut_ptr(),
-                src_cols[0].buf.as_ptr(), src_cols[1].buf.as_ptr(),
-                src_cols[2].buf.as_ptr(), src_cols[3].buf.as_ptr(),
-                d_twiddles.as_ptr(),
-                alpha_arr.as_ptr(),
-                alpha_sq_arr.as_ptr(),
-                half_n as u32,
-            );
-        }
+        let mut cpu_dst = line_eval_to_cpu(dst);
+        let cpu_src = secure_eval_to_cpu(src);
+        let cpu_twiddles = twiddles_to_cpu(twiddles);
+        CpuBackend::fold_circle_into_line(&mut cpu_dst, &cpu_src, alpha, &cpu_twiddles);
+        *dst = line_eval_from_cpu(&cpu_dst);
     }
 
     fn decompose(
         eval: &SecureEvaluation<Self, BitReversedOrder>,
     ) -> (SecureEvaluation<Self, BitReversedOrder>, SecureField) {
-        // Decompose: f(P) = g(P) + lambda * alternating(P)
-        // Small enough for CPU fallback.
-        let n = eval.len();
-
-        // Sum all values to get lambda = sum / n
-        let mut sum = SecureField::from(BaseField::from(0u32));
-        for i in 0..n {
-            sum = sum + eval.values.at(i);
-        }
-        let n_inv: SecureField = BaseField::from(n as u32).inverse().into();
-        let lambda = sum * n_inv;
-
-        // g(P) = f(P) - lambda * alternating(P)
-        let mut new_cols: [CudaColumn<BaseField>; 4] = std::array::from_fn(|_| {
-            CudaColumn::from_device_buffer(DeviceBuffer::<u32>::alloc(0), 0)
-        });
-
-        // Download each coordinate column, subtract lambda contribution, re-upload
-        for c in 0..4 {
-            let mut host = eval.values.columns[c].buf.to_host();
-            let lambda_arr = lambda.to_m31_array();
-            let lc = lambda_arr[c].0;
-            let p = vortexstark::field::m31::P;
-            for i in 0..n {
-                let sign: u32 = if i % 2 == 0 { lc } else { p - lc };
-                let v = host[i] as u64;
-                let s = sign as u64;
-                host[i] = ((v + p as u64 - s) % p as u64) as u32;
-            }
-            new_cols[c] = CudaColumn::from_device_buffer(DeviceBuffer::from_host(&host), n);
-        }
-
-        let result = SecureColumnByCoords { columns: new_cols };
-        (SecureEvaluation::new(eval.domain, result), lambda)
+        let cpu_eval = secure_eval_to_cpu(eval);
+        let (cpu_result, lambda) = CpuBackend::decompose(&cpu_eval);
+        (secure_eval_from_cpu(&cpu_result), lambda)
     }
 }
 
-/// Single fold step for line evaluation.
-fn fold_line_once(
-    eval: &LineEvaluation<CudaBackend>,
-    alpha: SecureField,
-) -> LineEvaluation<CudaBackend> {
-    let n = eval.len();
-    assert!(n >= 2);
-    let half_n = n / 2;
+// ---- Conversion helpers: CudaBackend ↔ CpuBackend ----
 
-    // SecureColumnByCoords already has 4 separate BaseField columns = SoA
-    let cols = &eval.values.columns;
-
-    // Compute fold twiddles
-    let domain = eval.domain();
-    let vortex_coset = super::poly_ops::convert_coset(&domain.coset());
-    let d_twiddles = vortexstark::fri::compute_fold_twiddles_on_demand(
-        &vortex_coset, false,
-    );
-
-    let alpha_arr = qm31_to_arr(alpha);
-
-    let mut o0 = DeviceBuffer::<u32>::alloc(half_n);
-    let mut o1 = DeviceBuffer::<u32>::alloc(half_n);
-    let mut o2 = DeviceBuffer::<u32>::alloc(half_n);
-    let mut o3 = DeviceBuffer::<u32>::alloc(half_n);
-
-    unsafe {
-        ffi::cuda_fold_line_soa(
-            cols[0].buf.as_ptr(), cols[1].buf.as_ptr(),
-            cols[2].buf.as_ptr(), cols[3].buf.as_ptr(),
-            d_twiddles.as_ptr(),
-            o0.as_mut_ptr(), o1.as_mut_ptr(), o2.as_mut_ptr(), o3.as_mut_ptr(),
-            alpha_arr.as_ptr(),
-            half_n as u32,
-        );
-    }
-
-    let result = SecureColumnByCoords {
-        columns: [
-            CudaColumn::from_device_buffer(o0, half_n),
-            CudaColumn::from_device_buffer(o1, half_n),
-            CudaColumn::from_device_buffer(o2, half_n),
-            CudaColumn::from_device_buffer(o3, half_n),
-        ],
+fn line_eval_to_cpu(eval: &LineEvaluation<CudaBackend>) -> LineEvaluation<CpuBackend> {
+    let n = eval.values.columns[0].len();
+    eprintln!("[FRI] line_eval_to_cpu: n={n}, domain={:?}", eval.domain());
+    let cpu_coords = SecureColumnByCoords {
+        columns: std::array::from_fn(|i| {
+            let col = eval.values.columns[i].to_cpu();
+            assert_eq!(col.len(), n, "column {i} length mismatch");
+            col
+        }),
     };
-    let result_domain = domain.double();
-    LineEvaluation::new(result_domain, result)
+    // Verify a few values roundtrip
+    if n > 0 {
+        let v = cpu_coords.at(0);
+        eprintln!("[FRI]   first value: {:?}", v.to_m31_array().map(|m| m.0));
+    }
+    LineEvaluation::new(eval.domain(), cpu_coords)
 }
 
-fn qm31_to_arr(v: SecureField) -> [u32; 4] {
-    let arr = v.to_m31_array();
-    [arr[0].0, arr[1].0, arr[2].0, arr[3].0]
+fn line_eval_from_cpu(eval: &LineEvaluation<CpuBackend>) -> LineEvaluation<CudaBackend> {
+    let gpu_coords = SecureColumnByCoords {
+        columns: std::array::from_fn(|i| eval.values.columns[i].iter().copied().collect()),
+    };
+    LineEvaluation::new(eval.domain(), gpu_coords)
+}
+
+fn secure_eval_to_cpu(eval: &SecureEvaluation<CudaBackend, BitReversedOrder>) -> SecureEvaluation<CpuBackend, BitReversedOrder> {
+    let cpu_coords = SecureColumnByCoords {
+        columns: std::array::from_fn(|i| eval.values.columns[i].to_cpu()),
+    };
+    SecureEvaluation::new(eval.domain, cpu_coords)
+}
+
+fn secure_eval_from_cpu(eval: &SecureEvaluation<CpuBackend, BitReversedOrder>) -> SecureEvaluation<CudaBackend, BitReversedOrder> {
+    let gpu_coords = SecureColumnByCoords {
+        columns: std::array::from_fn(|i| eval.values.columns[i].iter().copied().collect()),
+    };
+    SecureEvaluation::new(eval.domain, gpu_coords)
+}
+
+fn twiddles_to_cpu(twiddles: &TwiddleTree<CudaBackend>) -> TwiddleTree<CpuBackend> {
+    // CPU twiddles are precomputed from the coset
+    CpuBackend::precompute_twiddles(twiddles.root_coset)
 }
