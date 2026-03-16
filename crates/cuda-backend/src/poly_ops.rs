@@ -50,9 +50,19 @@ impl PolyOps for CudaBackend {
         twiddles: &TwiddleTree<Self>,
     ) -> CircleCoefficients<Self> {
         let mut values = eval.values;
+        let data_log_n = values.len.trailing_zeros();
 
-        // GPU inverse NTT (in-place) — includes 1/n normalization
-        vortexstark::ntt::interpolate(&mut values.buf, &twiddles.itwiddles.cache);
+        if data_log_n == twiddles.itwiddles.cache.log_n {
+            // Data size matches twiddle cache — use directly
+            vortexstark::ntt::interpolate(&mut values.buf, &twiddles.itwiddles.cache);
+        } else {
+            // Data is smaller than twiddle cache — build a temporary cache
+            // at the correct size. This is O(n) and only happens for small columns.
+            let domain = eval.domain;
+            let vortex_coset = convert_coset(&domain.half_coset);
+            let temp_cache = vortexstark::ntt::TwiddleCache::new(&vortex_coset);
+            vortexstark::ntt::interpolate(&mut values.buf, &temp_cache);
+        }
 
         CircleCoefficients::new(values)
     }
@@ -143,9 +153,15 @@ impl PolyOps for CudaBackend {
         twiddles: &TwiddleTree<Self>,
     ) -> CircleEvaluation<Self, BaseField, BitReversedOrder> {
         let mut values = Self::extend(poly, domain.log_size()).coeffs;
+        let data_log_n = values.len.trailing_zeros();
 
-        // GPU forward NTT (in-place)
-        vortexstark::ntt::evaluate(&mut values.buf, &twiddles.twiddles.cache);
+        if data_log_n == twiddles.twiddles.cache.log_n {
+            vortexstark::ntt::evaluate(&mut values.buf, &twiddles.twiddles.cache);
+        } else {
+            let vortex_coset = convert_coset(&domain.half_coset);
+            let temp_cache = vortexstark::ntt::TwiddleCache::new(&vortex_coset);
+            vortexstark::ntt::evaluate(&mut values.buf, &temp_cache);
+        }
 
         CircleEvaluation::new(domain, values)
     }
@@ -177,7 +193,14 @@ impl PolyOps for CudaBackend {
         }
 
         // GPU forward NTT (in-place)
-        vortexstark::ntt::evaluate(&mut values.buf, &twiddles.twiddles.cache);
+        let data_log_n = values.len.trailing_zeros();
+        if data_log_n == twiddles.twiddles.cache.log_n {
+            vortexstark::ntt::evaluate(&mut values.buf, &twiddles.twiddles.cache);
+        } else {
+            let vortex_coset = convert_coset(&domain.half_coset);
+            let temp_cache = vortexstark::ntt::TwiddleCache::new(&vortex_coset);
+            vortexstark::ntt::evaluate(&mut values.buf, &temp_cache);
+        }
 
         CircleEvaluation::new(domain, values)
     }

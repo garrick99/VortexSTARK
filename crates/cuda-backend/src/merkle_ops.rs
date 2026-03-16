@@ -26,12 +26,16 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
         lifting_log_size: u32,
     ) -> Col<Self, Blake2sHash> {
         // CPU fallback: download, compute, upload.
+        eprintln!("[CUDA] build_leaves: {} columns, lifting_log_size={lifting_log_size}", columns.len());
         let cpu_columns: Vec<Vec<BaseField>> = columns.iter().map(|c| c.to_cpu()).collect();
         let cpu_col_refs: Vec<&Vec<BaseField>> = cpu_columns.iter().collect();
         let cpu_result = <stwo::prover::backend::CpuBackend as MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M31_OUTPUT>>>::build_leaves(
             &cpu_col_refs, lifting_log_size,
         );
-        cpu_result.into_iter().collect()
+        eprintln!("[CUDA] build_leaves done: {} hashes, uploading to GPU...", cpu_result.len());
+        let result: CudaColumn<Blake2sHash> = cpu_result.into_iter().collect();
+        eprintln!("[CUDA] build_leaves upload done");
+        result
     }
 
     fn build_next_layer(prev_layer: &Col<Self, Blake2sHash>) -> Col<Self, Blake2sHash> {
@@ -48,7 +52,11 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
                 d_parents.as_mut_ptr(),
                 n as u32,
             );
-            ffi::cuda_device_sync();
+            let err = ffi::cudaDeviceSynchronize();
+            if err != 0 {
+                let last = ffi::cudaGetLastError();
+                panic!("[CUDA] cuda_merkle_hash_nodes failed: err={err}, last={last}, n={n}");
+            }
         }
 
         CudaColumn::from_device_buffer(d_parents, n)
