@@ -20,4 +20,10 @@ mod tests;
 
 pub use backend::CudaBackend;
 pub use column::CudaColumn;
-pub use component_prover::CudaFrameworkComponent;
+pub use component_prover::{CudaFrameworkComponent, CudaFrameworkComponentRef};
+
+/// Re-export CUDA FFI initialization functions from vortexstark.
+pub mod ffi {
+    pub use vortexstark::cuda::ffi::init_memory_pool;
+    pub use vortexstark::cuda::ffi::init_memory_pool_greedy;
+}

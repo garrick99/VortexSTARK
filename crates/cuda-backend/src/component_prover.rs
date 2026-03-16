@@ -44,11 +44,26 @@ use super::CudaBackend;
 /// ```
 pub struct CudaFrameworkComponent<E: FrameworkEval>(pub FrameworkComponent<E>);
 
+/// A borrowing wrapper around `&FrameworkComponent<E>` that implements
+/// `ComponentProver<CudaBackend>`.
+///
+/// Use this when you have a reference to a `FrameworkComponent` (e.g. borrowed
+/// from a larger struct) and need to pass it as a `&dyn ComponentProver<CudaBackend>`.
+pub struct CudaFrameworkComponentRef<'a, E: FrameworkEval>(pub &'a FrameworkComponent<E>);
+
 impl<E: FrameworkEval> Deref for CudaFrameworkComponent<E> {
     type Target = FrameworkComponent<E>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+impl<'a, E: FrameworkEval> Deref for CudaFrameworkComponentRef<'a, E> {
+    type Target = FrameworkComponent<E>;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
     }
 }
 
@@ -90,6 +105,124 @@ impl<E: FrameworkEval> Component for CudaFrameworkComponent<E> {
             evaluation_accumulator,
             max_log_degree_bound,
         );
+    }
+}
+
+impl<'a, E: FrameworkEval> Component for CudaFrameworkComponentRef<'a, E> {
+    fn n_constraints(&self) -> usize {
+        self.0.n_constraints()
+    }
+
+    fn max_constraint_log_degree_bound(&self) -> u32 {
+        self.0.max_constraint_log_degree_bound()
+    }
+
+    fn trace_log_degree_bounds(&self) -> TreeVec<ColumnVec<u32>> {
+        self.0.trace_log_degree_bounds()
+    }
+
+    fn mask_points(
+        &self,
+        point: CirclePoint<SecureField>,
+        max_log_degree_bound: u32,
+    ) -> TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>> {
+        self.0.mask_points(point, max_log_degree_bound)
+    }
+
+    fn preprocessed_column_indices(&self) -> ColumnVec<usize> {
+        self.0.preprocessed_column_indices().to_vec()
+    }
+
+    fn evaluate_constraint_quotients_at_point(
+        &self,
+        point: CirclePoint<SecureField>,
+        mask: &TreeVec<ColumnVec<Vec<SecureField>>>,
+        evaluation_accumulator: &mut PointEvaluationAccumulator,
+        max_log_degree_bound: u32,
+    ) {
+        self.0.evaluate_constraint_quotients_at_point(
+            point,
+            mask,
+            evaluation_accumulator,
+            max_log_degree_bound,
+        );
+    }
+}
+
+impl<'a, E: FrameworkEval + Sync> ComponentProver<CudaBackend> for CudaFrameworkComponentRef<'a, E> {
+    fn evaluate_constraint_quotients_on_domain(
+        &self,
+        trace: &Trace<'_, CudaBackend>,
+        evaluation_accumulator: &mut DomainEvaluationAccumulator<CudaBackend>,
+    ) {
+        let n_constraints = self.n_constraints();
+        if n_constraints == 0 {
+            return;
+        }
+
+        if self.is_disabled() {
+            evaluation_accumulator.skip_coeffs(n_constraints);
+            return;
+        }
+
+        let eval_domain =
+            CanonicCoset::new(self.max_constraint_log_degree_bound()).circle_domain();
+        let trace_domain = CanonicCoset::new(self.log_size());
+
+        let mut component_polys = trace.polys.sub_tree(self.trace_locations());
+        component_polys[PREPROCESSED_TRACE_IDX] = self
+            .preprocessed_column_indices()
+            .iter()
+            .map(|idx| &trace.polys[PREPROCESSED_TRACE_IDX][*idx])
+            .collect();
+
+        let gpu_trace_evals = get_constraint_quotients_inputs_cuda(
+            eval_domain,
+            component_polys,
+            evaluation_accumulator.evaluation_mode(),
+        );
+
+        let cpu_trace_evals: TreeVec<Vec<CircleEvaluation<CpuBackend, BaseField, BitReversedOrder>>> =
+            gpu_trace_evals.map_cols(|gpu_eval| {
+                let cpu_values = gpu_eval.values.to_cpu();
+                CircleEvaluation::new(gpu_eval.domain, cpu_values)
+            });
+        let cpu_trace_refs = cpu_trace_evals.as_cols_ref();
+
+        let log_expand = eval_domain.log_size() - trace_domain.log_size();
+        let mut denom_inv = (0..1 << log_expand)
+            .map(|i| coset_vanishing(trace_domain.coset(), eval_domain.at(i)).inverse())
+            .collect_vec();
+        bit_reverse(&mut denom_inv);
+
+        let [mut accum] =
+            evaluation_accumulator.columns([(eval_domain.log_size(), n_constraints)]);
+        accum.random_coeff_powers.reverse();
+
+        let _span = span!(
+            Level::INFO,
+            "CUDA Constraint point-wise eval (CPU fallback)",
+            class = "ConstraintEval"
+        )
+        .entered();
+
+        let cpu_accum = accum.col.to_cpu();
+
+        let cpu_result = accumulate_pointwise_cpu(
+            self.0,
+            cpu_trace_refs,
+            eval_domain.log_size(),
+            trace_domain.log_size(),
+            denom_inv,
+            &accum.random_coeff_powers,
+            &cpu_accum,
+        );
+
+        *accum.col = SecureColumnByCoords {
+            columns: std::array::from_fn(|i| {
+                cpu_result.columns[i].iter().copied().collect()
+            }),
+        };
     }
 }
 
