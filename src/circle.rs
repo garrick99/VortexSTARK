@@ -248,7 +248,12 @@ pub fn compute_both_twiddles_gpu(
             d_x.as_mut_ptr(), d_y.as_mut_ptr(),
             n as u32,
         );
-        ffi::cuda_device_sync();
+        let sync_err = ffi::cudaDeviceSynchronize();
+        let last_err = ffi::cudaGetLastError();
+        eprintln!("[CUDA] compute_coset_points: n={n}, log_n={log_n}, sync={sync_err}, last={last_err}");
+        if sync_err != 0 || last_err != 0 {
+            panic!("[CUDA] compute_coset_points kernel failed!");
+        }
     }
 
     // Circle twiddles: y-coordinates of first half (stay on device)
@@ -274,7 +279,7 @@ pub fn compute_both_twiddles_gpu(
     let mut current_n = n;
     let mut write_offset = 0usize;
 
-    for _layer in 0..n_line_layers as usize {
+    for layer in 0..n_line_layers as usize {
         let layer_size = current_n / 2;
         layer_offsets.push(write_offset as u32);
         layer_sizes.push(layer_size as u32);
@@ -287,25 +292,35 @@ pub fn compute_both_twiddles_gpu(
                 d_squashed.as_mut_ptr(),
                 layer_size as u32,
             );
+            let err = ffi::cudaDeviceSynchronize();
+            if err != 0 {
+                let last = ffi::cudaGetLastError();
+                panic!("[CUDA] extract_and_squash failed at layer {layer}: \
+                        sync={err}, last={last}, layer_size={layer_size}, \
+                        write_offset={write_offset}, current_n={current_n}");
+            }
         }
 
         write_offset += layer_size;
         d_current = d_squashed;
         current_n = layer_size;
     }
-    unsafe { ffi::cuda_device_sync(); }
 
     // Inverse twiddles via GPU batch inverse (device → device)
+    eprintln!("[CUDA] batch_inverse: total_twiddles={total_twiddles}, half_n={half_n}");
     let mut d_iline_twiddles = DeviceBuffer::<u32>::alloc(total_twiddles);
     let mut d_icircle_twids = DeviceBuffer::<u32>::alloc(half_n);
     unsafe {
         ffi::cuda_batch_inverse_m31(
             d_line_twiddles.as_ptr(), d_iline_twiddles.as_mut_ptr(), total_twiddles as u32,
         );
+        let err = ffi::cudaDeviceSynchronize();
+        eprintln!("[CUDA] batch_inverse line: err={err}");
         ffi::cuda_batch_inverse_m31(
             d_circle_twids.as_ptr(), d_icircle_twids.as_mut_ptr(), half_n as u32,
         );
-        ffi::cuda_device_sync();
+        let err = ffi::cudaDeviceSynchronize();
+        eprintln!("[CUDA] batch_inverse circle: err={err}");
     }
 
     // Returns: (fwd_line, fwd_circle, inv_line, inv_circle, offsets, sizes)
@@ -352,7 +367,7 @@ pub fn compute_forward_twiddles_gpu(
     let mut current_n = n;
     let mut write_offset = 0usize;
 
-    for _layer in 0..n_line_layers as usize {
+    for layer in 0..n_line_layers as usize {
         let layer_size = current_n / 2;
         layer_offsets.push(write_offset as u32);
         layer_sizes.push(layer_size as u32);
@@ -365,13 +380,19 @@ pub fn compute_forward_twiddles_gpu(
                 d_squashed.as_mut_ptr(),
                 layer_size as u32,
             );
+            let err = ffi::cudaDeviceSynchronize();
+            if err != 0 {
+                let last = ffi::cudaGetLastError();
+                panic!("[CUDA] extract_and_squash failed at layer {layer}: \
+                        sync={err}, last={last}, layer_size={layer_size}, \
+                        write_offset={write_offset}, current_n={current_n}");
+            }
         }
 
         write_offset += layer_size;
         d_current = d_squashed;
         current_n = layer_size;
     }
-    unsafe { ffi::cuda_device_sync(); }
 
     (d_line_twiddles, d_circle_twids, layer_offsets, layer_sizes)
 }
