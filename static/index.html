@@ -54,7 +54,7 @@ td.mono { font-size:13px; }
 .compare-bar .bar.gpu { background:var(--green); }
 .compare-bar .rate { font-size:12px; color:var(--text); min-width:100px; }
 .speedup-num { font-size:28px; font-weight:700; color:var(--green); text-align:center; margin:12px 0; }
-.log { background:var(--bg); border:1px solid var(--border); border-radius:4px; padding:10px; font-size:12px; color:var(--dim); max-height:120px; overflow-y:auto; margin-top:12px; white-space:pre; }
+.log { background:var(--bg); border:1px solid var(--border); border-radius:4px; padding:10px; font-size:11px; color:var(--dim); max-height:150px; overflow-y:auto; margin-top:12px; white-space:pre; line-height:1.6; }
 .bottom-row { grid-column:1/-1; display:grid; grid-template-columns:1fr 1fr; gap:16px; }
 @media(max-width:900px) { .bottom-row { grid-template-columns:1fr; } }
 .fade-in { animation: fadeIn .3s ease; }
@@ -159,10 +159,13 @@ td.mono { font-size:13px; }
 let ws = null;
 let maxPhaseMs = 0;
 
-function log(msg) {
+function log(msg, cls) {
   const el = document.getElementById('event-log');
-  const ts = new Date().toLocaleTimeString();
-  el.textContent += `[${ts}] ${msg}\n`;
+  const ts = new Date().toLocaleTimeString('en-US', {hour12:false, hour:'2-digit', minute:'2-digit', second:'2-digit'});
+  const span = document.createElement('span');
+  if (cls) span.style.color = `var(--${cls})`;
+  span.textContent = `${ts}  ${msg}\n`;
+  el.appendChild(span);
   el.scrollTop = el.scrollHeight;
 }
 
@@ -172,7 +175,7 @@ function connect() {
   ws.onopen = () => {
     document.getElementById('ws-status').textContent = 'connected';
     document.getElementById('ws-status').style.color = 'var(--green)';
-    log('WebSocket connected');
+    log('connected', 'green');
   };
   ws.onclose = () => {
     document.getElementById('ws-status').textContent = 'disconnected';
@@ -191,11 +194,11 @@ function handleMessage(msg) {
     case 'proof_started':
       document.getElementById('prove-status').innerHTML = '<span class="status running">PROVING...</span>';
       document.getElementById('prove-result').innerHTML = '';
-      log(`Started ${msg.proof_type} proof, log_n=${msg.log_n}`);
+      const elems = msg.log_n <= 30 ? fmtNum(1 << msg.log_n) : '2^'+msg.log_n;
+      log(`${msg.proof_type.toUpperCase()} log_n=${msg.log_n} (${elems} elements)`, 'accent');
       break;
     case 'phase':
       addPhase(msg.name, msg.ms);
-      log(`  ${msg.name}: ${msg.ms.toFixed(1)}ms`);
       break;
     case 'proof_done':
       document.getElementById('prove-status').innerHTML = '';
@@ -204,7 +207,7 @@ function handleMessage(msg) {
       document.getElementById('prove-result').innerHTML =
         `<span class="status ${cls}">${sym}</span> &nbsp; `+
         `Prove: <b>${fmtMs(msg.prove_ms)}</b> &nbsp; Verify: <b>${fmtMs(msg.verify_ms)}</b>`;
-      log(`Done: prove=${fmtMs(msg.prove_ms)}, verify=${fmtMs(msg.verify_ms)}, ${sym}`);
+      log(`${sym}  prove ${fmtMs(msg.prove_ms)}  verify ${fmtMs(msg.verify_ms)}`, msg.verified ? 'green' : 'red');
       addBenchRow(msg);
       document.getElementById('btn-prove').disabled = false;
       break;
@@ -213,7 +216,7 @@ function handleMessage(msg) {
       document.getElementById('btn-ped').disabled = false;
       break;
     case 'error':
-      log(`ERROR: ${msg.message}`);
+      log(`ERROR  ${msg.message}`, 'red');
       document.getElementById('prove-status').innerHTML = `<span class="status fail">ERROR</span>`;
       document.getElementById('btn-prove').disabled = false;
       document.getElementById('btn-ped').disabled = false;

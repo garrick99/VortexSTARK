@@ -285,6 +285,21 @@ impl<T> Drop for PinnedBuffer<T> {
     }
 }
 
+impl<T> Clone for DeviceBuffer<T> {
+    fn clone(&self) -> Self {
+        self.clone_device()
+    }
+}
+
+impl<T> std::fmt::Debug for DeviceBuffer<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceBuffer")
+            .field("len", &self.len)
+            .field("ptr", &self.ptr)
+            .finish()
+    }
+}
+
 impl<T> AsRef<DeviceBuffer<T>> for DeviceBuffer<T> {
     fn as_ref(&self) -> &DeviceBuffer<T> {
         self

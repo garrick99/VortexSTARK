@@ -1,0 +1,16 @@
+[package]
+name = "vortex-cuda-backend"
+version = "0.1.0"
+edition = "2021"
+description = "CUDA GPU backend for stwo Circle STARK prover"
+
+[dependencies]
+stwo-prover = { git = "https://github.com/starkware-libs/stwo", branch = "main" }
+vortexstark = { path = "../.." }
+serde = { version = "1.0", features = ["derive"] }
+itertools = "0.12.0"
+num-traits = "0.2.17"
+tracing = "0.1.40"
+
+[dev-dependencies]
+rand = "0.8.5"
