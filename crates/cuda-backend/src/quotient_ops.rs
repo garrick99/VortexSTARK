@@ -1,84 +1,76 @@
 //! QuotientOps: DEEP quotient accumulation.
 //!
-//! CPU fallback implementation — downloads column data to CPU, runs CPU
-//! quotient logic, uploads results back to GPU.
-//!
-//! TODO: GPU kernel for row-parallel quotient accumulation.
+//! CPU fallback — delegates to CpuBackend after downloading columns.
 
-use stwo::prover::backend::Column;
 use stwo::core::fields::m31::BaseField;
+use stwo::core::fields::qm31::SecureField;
+use stwo::prover::backend::{Column, CpuBackend};
 use stwo::prover::secure_column::SecureColumnByCoords;
-use stwo::prover::poly::circle::{CircleEvaluation, SecureEvaluation};
+use stwo::prover::poly::circle::SecureEvaluation;
 use stwo::prover::poly::BitReversedOrder;
-use stwo::core::pcs::quotients::ColumnSampleBatch;
+use stwo::prover::{AccumulatedNumerators, ColumnSampleBatch, QuotientOps};
 
 use super::CudaBackend;
+use super::column::CudaColumn;
 
-// Note: QuotientOps is re-exported from stwo::prover::QuotientOps.
-// AccumulatedNumerators is in the same module but not re-exported.
-// We implement the trait by delegating to CpuBackend.
-impl stwo::prover::QuotientOps for CudaBackend {
+impl QuotientOps for CudaBackend {
     fn accumulate_numerators(
-        columns: &[&CircleEvaluation<Self, BaseField, BitReversedOrder>],
+        columns: &[&SecureEvaluation<Self, BitReversedOrder>],
         sample_batches: &[ColumnSampleBatch],
-        accumulated_numerators_vec: &mut Vec<stwo::prover::AccumulatedNumerators<Self>>,
+        accumulated_numerators_vec: &mut Vec<AccumulatedNumerators<Self>>,
     ) {
-        // CPU fallback: download columns, run CPU logic, upload results.
-        let cpu_columns: Vec<Vec<BaseField>> = columns.iter()
-            .map(|col| col.values.to_cpu())
-            .collect();
-        let cpu_evals: Vec<CircleEvaluation<
-            stwo::prover::backend::CpuBackend, BaseField, BitReversedOrder
-        >> = columns.iter().zip(cpu_columns.iter())
-            .map(|(col, cpu_vals)| {
-                CircleEvaluation::new(col.domain, cpu_vals.clone())
+        // Download columns to CPU
+        let cpu_columns: Vec<SecureEvaluation<CpuBackend, BitReversedOrder>> = columns.iter()
+            .map(|col| {
+                let cpu_coords = SecureColumnByCoords {
+                    columns: std::array::from_fn(|i| col.values.columns[i].to_cpu()),
+                };
+                SecureEvaluation::new(col.domain, cpu_coords)
             })
             .collect();
-        let cpu_eval_refs: Vec<&CircleEvaluation<
-            stwo::prover::backend::CpuBackend, BaseField, BitReversedOrder
-        >> = cpu_evals.iter().collect();
+        let cpu_col_refs: Vec<&SecureEvaluation<CpuBackend, BitReversedOrder>> =
+            cpu_columns.iter().collect();
 
-        let mut cpu_acc_vec: Vec<stwo::prover::AccumulatedNumerators<
-            stwo::prover::backend::CpuBackend
-        >> = Vec::new();
-        <stwo::prover::backend::CpuBackend as stwo::prover::QuotientOps>::accumulate_numerators(
-            &cpu_eval_refs, sample_batches, &mut cpu_acc_vec,
-        );
+        let mut cpu_accs = Vec::new();
+        CpuBackend::accumulate_numerators(&cpu_col_refs, sample_batches, &mut cpu_accs);
 
-        // Convert CPU results to GPU
-        for cpu_acc in cpu_acc_vec {
-            let gpu_cols = SecureColumnByCoords {
+        // Upload results to GPU
+        for acc in cpu_accs {
+            let gpu_coords = SecureColumnByCoords {
                 columns: std::array::from_fn(|i| {
-                    cpu_acc.partial_numerators_acc.columns[i].iter().copied().collect()
+                    acc.partial_numerators_acc.columns[i].iter().copied().collect()
                 }),
             };
-            accumulated_numerators_vec.push(stwo::prover::AccumulatedNumerators {
-                sample_point: cpu_acc.sample_point,
-                partial_numerators_acc: gpu_cols,
-                first_linear_term_acc: cpu_acc.first_linear_term_acc,
+            accumulated_numerators_vec.push(AccumulatedNumerators {
+                sample_point: acc.sample_point,
+                partial_numerators_acc: gpu_coords,
+                first_linear_term_acc: acc.first_linear_term_acc,
             });
         }
     }
 
     fn compute_quotients_and_combine(
-        accumulations: Vec<stwo::prover::AccumulatedNumerators<Self>>,
+        accs: Vec<AccumulatedNumerators<Self>>,
         lifting_log_size: u32,
     ) -> SecureEvaluation<Self, BitReversedOrder> {
-        // CPU fallback: convert GPU data to CPU, compute, upload back.
-        let cpu_accs: Vec<stwo::prover::AccumulatedNumerators<
-            stwo::prover::backend::CpuBackend
-        >> = accumulations
+        // Download to CPU
+        let cpu_accs: Vec<AccumulatedNumerators<CpuBackend>> = accs
             .into_iter()
-            .map(|acc| stwo::prover::AccumulatedNumerators {
-                sample_point: acc.sample_point,
-                partial_numerators_acc: acc.partial_numerators_acc.to_cpu(),
-                first_linear_term_acc: acc.first_linear_term_acc,
+            .map(|acc| {
+                let cpu_coords = SecureColumnByCoords {
+                    columns: std::array::from_fn(|i| {
+                        acc.partial_numerators_acc.columns[i].to_cpu()
+                    }),
+                };
+                AccumulatedNumerators {
+                    sample_point: acc.sample_point,
+                    partial_numerators_acc: cpu_coords,
+                    first_linear_term_acc: acc.first_linear_term_acc,
+                }
             })
             .collect();
 
-        let cpu_result = <stwo::prover::backend::CpuBackend as stwo::prover::QuotientOps>::compute_quotients_and_combine(
-            cpu_accs, lifting_log_size,
-        );
+        let cpu_result = CpuBackend::compute_quotients_and_combine(cpu_accs, lifting_log_size);
 
         // Upload to GPU
         let gpu_cols = SecureColumnByCoords {
