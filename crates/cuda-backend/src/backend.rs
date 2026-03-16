@@ -9,3 +9,7 @@ use stwo_prover::core::backend::Backend;
 pub struct CudaBackend;
 
 impl Backend for CudaBackend {}
+
+impl stwo_prover::core::backend::BackendForChannel<
+    stwo_prover::core::vcs::blake2_merkle::Blake2sMerkleChannel
+> for CudaBackend {}

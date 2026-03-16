@@ -13,6 +13,7 @@ mod quotient_ops;
 mod accumulation_ops;
 mod gkr_ops;
 mod merkle_ops;
+mod grind_ops;
 
 pub use backend::CudaBackend;
 pub use column::CudaColumn;
