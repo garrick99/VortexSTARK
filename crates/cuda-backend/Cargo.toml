@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "CUDA GPU backend for stwo Circle STARK prover"
 
+[[bin]]
+name = "bench-stwo"
+path = "src/bin/bench_stwo.rs"
+
 [dependencies]
 stwo-prover = { git = "https://github.com/starkware-libs/stwo", branch = "main" }
 vortexstark = { path = "../.." }

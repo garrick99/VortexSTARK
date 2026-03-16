@@ -14,6 +14,8 @@ mod accumulation_ops;
 mod gkr_ops;
 mod merkle_ops;
 mod grind_ops;
+#[cfg(test)]
+mod tests;
 
 pub use backend::CudaBackend;
 pub use column::CudaColumn;

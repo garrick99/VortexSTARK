@@ -69,19 +69,8 @@ impl PolyOps for CudaBackend {
         let log_n = eval.domain.log_size();
         let n = values.len();
 
-        // GPU inverse NTT (in-place)
+        // GPU inverse NTT (in-place) — includes 1/n normalization
         ntt::interpolate(&mut values.buf, &twiddles.itwiddles.cache);
-
-        // Divide all values by n (the IFFT normalization)
-        // TODO: fuse this into the kernel
-        let inv = M31::from(n as u32).inverse();
-        let mut host = values.buf.to_host();
-        let inv_val = inv.0;
-        let p = vortexstark::field::m31::P;
-        for v in &mut host {
-            *v = ((*v as u64 * inv_val as u64) % p as u64) as u32;
-        }
-        values.buf = DeviceBuffer::from_host(&host);
 
         CirclePoly::new(values)
     }
