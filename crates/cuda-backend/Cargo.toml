@@ -10,6 +10,7 @@ path = "src/bin/bench_stwo.rs"
 
 [dependencies]
 stwo = { git = "https://github.com/starkware-libs/stwo", rev = "e584a309", features = ["prover"] }
+stwo-constraint-framework = { git = "https://github.com/starkware-libs/stwo", rev = "e584a309", features = ["prover"] }
 vortexstark = { path = "../.." }
 serde = { version = "1.0", features = ["derive"] }
 itertools = "0.12.0"

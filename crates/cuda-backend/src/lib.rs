@@ -14,8 +14,10 @@ mod accumulation_ops;
 mod gkr_ops;
 mod merkle_ops;
 mod grind_ops;
+mod component_prover;
 #[cfg(test)]
 mod tests;
 
 pub use backend::CudaBackend;
 pub use column::CudaColumn;
+pub use component_prover::CudaFrameworkComponent;

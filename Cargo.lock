@@ -1137,6 +1137,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "stwo-constraint-framework"
+version = "2.1.0"
+source = "git+https://github.com/starkware-libs/stwo?rev=e584a309#e584a30985ddb5565735b87a1801b03721712939"
+dependencies = [
+ "hashbrown 0.16.1",
+ "itertools 0.12.1",
+ "num-traits",
+ "rand 0.8.5",
+ "stwo",
+ "stwo-std-shims",
+ "tracing",
+]
+
+[[package]]
 name = "stwo-std-shims"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1355,6 +1369,7 @@ dependencies = [
  "rand 0.8.5",
  "serde",
  "stwo",
+ "stwo-constraint-framework",
  "tracing",
  "vortexstark",
 ]
