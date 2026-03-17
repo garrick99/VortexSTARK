@@ -211,8 +211,10 @@ fn evaluate_constraint_quotients_impl<E: FrameworkEval + Sync>(
         evaluation_accumulator.columns([(eval_domain.log_size(), n_constraints)]);
     accum.random_coeff_powers.reverse();
 
-    // Try GPU bytecode evaluation.
-    let gpu_success = try_gpu_bytecode_eval(
+    // TODO: GPU bytecode constraint eval disabled until kernel correctness is verified.
+    // Stack-balanced programs still produce wrong results — likely a bytecode interpreter
+    // bug in the CUDA kernel (operator semantics, stack ordering, or accumulation logic).
+    let gpu_success = false && try_gpu_bytecode_eval(
         component,
         &gpu_trace_evals,
         eval_domain.log_size(),
@@ -320,6 +322,18 @@ fn try_gpu_bytecode_eval<E: FrameworkEval>(
         return true;
     }
 
+    // Verify stack balance before running on GPU.
+    // Clone-induced stack imbalance (values consumed multiple times without
+    // corresponding pushes) produces programs that underflow the stack.
+    if !program.verify_stack_balance() {
+        tracing::warn!(
+            "Bytecode stack imbalance detected ({} ops, {} constraints) — \
+             Clone-based value reuse not yet supported in GPU interpreter",
+            program.ops.len(), program.n_constraints
+        );
+        return false;
+    }
+
     let _span = span!(
         Level::INFO,
         "GPU bytecode constraint eval",
@@ -414,17 +428,38 @@ fn try_gpu_bytecode_eval<E: FrameworkEval>(
     let trace_n_rows = 1u32 << trace_log_size;
 
     // Validate all flat column indices are in bounds.
-    for (i, word) in encoded.iter().enumerate() {
-        let opcode = word >> 24;
-        if opcode == 0x03 { // OP_PUSH_TRACE_VAL
-            let operand = word & 0xFFFFFF;
-            let flat_col = (operand >> 10) & 0x3FFF;
-            if flat_col as usize >= total_cols {
-                tracing::error!(
-                    "Bytecode word[{i}]: flat_col={flat_col} >= total_cols={total_cols} \
-                     (operand=0x{operand:06x})"
-                );
-                return false;
+    // Walk the instruction stream properly (multi-word ops have data words that
+    // could be mistaken for PushTraceVal if scanned naively).
+    {
+        let mut vpc = 0;
+        for op in &program.ops {
+            match op {
+                BytecodeOp::PushTraceVal { .. } => {
+                    let word = encoded[vpc];
+                    let operand = word & 0xFFFFFF;
+                    let flat_col = (operand >> 10) & 0x3FFF;
+                    if flat_col as usize >= total_cols {
+                        tracing::error!(
+                            "Bytecode word[{vpc}]: flat_col={flat_col} >= total_cols={total_cols} \
+                             (operand=0x{operand:06x})"
+                        );
+                        return false;
+                    }
+                    vpc += 1;
+                }
+                BytecodeOp::PushBaseField(v) | BytecodeOp::AddConst(v) | BytecodeOp::MulConst(v) => {
+                    vpc += if *v >= (1 << 24) { 2 } else { 1 };
+                }
+                BytecodeOp::PushSecureField(_)
+                | BytecodeOp::WideAddConst(_)
+                | BytecodeOp::WideMulConst(_)
+                | BytecodeOp::BaseAddSecureConst(_)
+                | BytecodeOp::BaseMulSecureConst(_) => {
+                    vpc += 5;
+                }
+                _ => {
+                    vpc += 1;
+                }
             }
         }
     }

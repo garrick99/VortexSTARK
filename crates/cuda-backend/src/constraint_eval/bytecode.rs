@@ -201,6 +201,61 @@ impl BytecodeProgram {
         words
     }
 
+    /// Verify the program's stack balance by simulating execution.
+    /// Returns `true` if the stack never goes negative (i.e., the program is valid
+    /// for a stack-based interpreter). Returns `false` if Clone-induced stack
+    /// imbalance is detected.
+    pub fn verify_stack_balance(&self) -> bool {
+        let mut sp: i32 = 0;
+        for op in &self.ops {
+            match op {
+                BytecodeOp::PushBaseField(_)
+                | BytecodeOp::PushSecureField(_)
+                | BytecodeOp::PushTraceVal { .. } => {
+                    sp += 1;
+                }
+                BytecodeOp::Add | BytecodeOp::Sub | BytecodeOp::Mul => {
+                    sp -= 2;
+                    if sp < 0 { return false; }
+                    sp += 1;
+                }
+                BytecodeOp::Neg | BytecodeOp::AddConst(_) | BytecodeOp::MulConst(_) => {
+                    if sp < 1 { return false; }
+                    // pops 1, pushes 1 = net 0
+                }
+                BytecodeOp::WideAdd | BytecodeOp::WideSub | BytecodeOp::WideMul => {
+                    sp -= 2;
+                    if sp < 0 { return false; }
+                    sp += 1;
+                }
+                BytecodeOp::WideNeg | BytecodeOp::WideAddConst(_) | BytecodeOp::WideMulConst(_) => {
+                    if sp < 1 { return false; }
+                }
+                BytecodeOp::WideAddBase | BytecodeOp::WideMulBase => {
+                    sp -= 2;
+                    if sp < 0 { return false; }
+                    sp += 1;
+                }
+                BytecodeOp::BaseAddSecureConst(_) | BytecodeOp::BaseMulSecureConst(_) => {
+                    if sp < 1 { return false; }
+                }
+                BytecodeOp::Widen => {
+                    if sp < 1 { return false; }
+                }
+                BytecodeOp::CombineEF => {
+                    sp -= 4;
+                    if sp < 0 { return false; }
+                    sp += 1;
+                }
+                BytecodeOp::AddConstraint => {
+                    sp -= 1;
+                    if sp < 0 { return false; }
+                }
+            }
+        }
+        true
+    }
+
     /// Pretty-print the bytecode as a numbered instruction listing.
     pub fn dump(&self) -> String {
         let mut out = String::new();

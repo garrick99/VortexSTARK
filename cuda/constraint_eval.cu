@@ -43,8 +43,10 @@
 // Extended operand flag: bit 23 set in the operand field means next word has full value
 #define EXTENDED_FLAG           (1u << 23)
 
-// Maximum stack depth (generous — real programs use ~20)
-#define MAX_STACK_DEPTH 64
+// Maximum stack depth. Logup-heavy components with many fraction
+// cross-multiplications can reach deep stacks. 256 covers the
+// largest stwo-cairo components.
+#define MAX_STACK_DEPTH 256
 
 // ─── Kernel ─────────────────────────────────────────────────────────────
 
@@ -80,6 +82,9 @@ __global__ void bytecode_constraint_eval_kernel(
         uint32_t opcode = word >> 24;
         uint32_t operand = word & 0xFFFFFF;
 
+        // Stack overflow/underflow protection
+        if (sp >= MAX_STACK_DEPTH - 4 || sp < 0) return;
+
         switch (opcode) {
 
         // ── Stack loads ──────────────────────────────────────────────
@@ -112,6 +117,11 @@ __global__ void bytecode_constraint_eval_kernel(
             uint32_t abs_offset = operand & 0x1FF;
             int32_t offset = sign ? -(int32_t)abs_offset : (int32_t)abs_offset;
 
+            if (flat_col >= n_trace_cols) {
+                // Bounds error — return to prevent crash.
+                return;
+            }
+
             uint32_t effective_row;
             if (offset == 0) {
                 effective_row = row;
@@ -121,7 +131,12 @@ __global__ void bytecode_constraint_eval_kernel(
                 effective_row = (uint32_t)(r & (int32_t)(n_rows - 1));
             }
 
-            uint32_t val = trace_cols[flat_col][effective_row];
+            const uint32_t* col_ptr = trace_cols[flat_col];
+            if (col_ptr == nullptr) {
+                stack[sp++] = {{0, 0, 0, 0}};
+                break;
+            }
+            uint32_t val = col_ptr[effective_row];
             stack[sp++] = {{val, 0, 0, 0}};
             break;
         }
@@ -276,6 +291,7 @@ __global__ void bytecode_constraint_eval_kernel(
         // ── Constraint accumulation ──────────────────────────────────
 
         case OP_ADD_CONSTRAINT: {
+            if (sp <= 0) return;
             QM31 val = stack[--sp];
             QM31 coeff = {{
                 random_coeff_powers[constraint_idx * 4 + 0],

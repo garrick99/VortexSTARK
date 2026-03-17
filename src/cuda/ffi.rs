@@ -631,4 +631,66 @@ unsafe extern "C" {
         accum2: *mut u32,
         accum3: *mut u32,
     );
+
+    // ── FRI Quotient kernels ────────────────────────────────────────────
+
+    /// Accumulate partial numerators for a single sample batch.
+    ///
+    /// For each row: result = sum_i (c_i * col[col_idx_i][row] - b_i)
+    /// where (b_i, c_i) are QM31 line coefficients.
+    ///
+    /// - `col_ptrs`: device array of pointers to M31 column data
+    /// - `col_indices`: device array of column indices to use [n_batch_cols]
+    /// - `b_coeffs`: device array of QM31 b-coefficients [n_batch_cols * 4] M31 limbs
+    /// - `c_coeffs`: device array of QM31 c-coefficients [n_batch_cols * 4] M31 limbs
+    /// - `n_batch_cols`: number of columns in this batch
+    /// - `n_rows`: number of rows
+    /// - `out0..3`: output SoA QM31 accumulator [n_rows] each
+    pub fn cuda_accumulate_numerators(
+        col_ptrs: *const *const u32,
+        col_indices: *const u32,
+        b_coeffs: *const u32,
+        c_coeffs: *const u32,
+        n_batch_cols: u32,
+        n_rows: u32,
+        out0: *mut u32,
+        out1: *mut u32,
+        out2: *mut u32,
+        out3: *mut u32,
+    );
+
+    /// Compute FRI quotients and combine across sample points.
+    ///
+    /// For each row:
+    ///   domain_point = (domain_xs[row], domain_ys[row])
+    ///   quotient[row] = sum_j (numer_j[lifted_idx] - a_acc_j * y) * den_inv_j
+    ///
+    /// - `sample_points_x/y`: device arrays of QM31 sample point coords [n_accs * 4]
+    /// - `first_linear_acc`: device array of QM31 a-coefficients [n_accs * 4]
+    /// - `numer_ptrs0..3`: device arrays of pointers to partial numerator SoA columns
+    /// - `acc_log_sizes`: device array of log2(size) per accumulation [n_accs]
+    /// - `n_accs`: number of accumulations
+    /// - `domain_xs/ys`: device arrays of M31 domain point coords [n_rows]
+    /// - `lifting_log_size`: log2 of the lifting domain size
+    /// - `n_rows`: number of output rows
+    /// - `out0..3`: output SoA QM31 [n_rows] each
+    pub fn cuda_compute_quotients_combine(
+        sample_points_x: *const u32,
+        sample_points_y: *const u32,
+        first_linear_acc: *const u32,
+        numer_ptrs0: *const *const u32,
+        numer_ptrs1: *const *const u32,
+        numer_ptrs2: *const *const u32,
+        numer_ptrs3: *const *const u32,
+        acc_log_sizes: *const u32,
+        n_accs: u32,
+        domain_xs: *const u32,
+        domain_ys: *const u32,
+        lifting_log_size: u32,
+        n_rows: u32,
+        out0: *mut u32,
+        out1: *mut u32,
+        out2: *mut u32,
+        out3: *mut u32,
+    );
 }
