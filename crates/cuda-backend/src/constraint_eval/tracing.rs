@@ -775,30 +775,17 @@ impl EvalAtRow for TracingEvalAtRow {
         })
     }
 
-    fn add_constraint<G>(&mut self, _constraint: G)
+    fn add_constraint<G>(&mut self, constraint: G)
     where
         Self::EF: Mul<G, Output = Self::EF> + From<G>,
     {
-        // The constraint value should already be in a register on our recorder.
-        // We need to figure out which register it's in.
-        // Unfortunately, the constraint parameter is consumed by type constraint,
-        // not by the actual value. We need to convert it first.
-        //
-        // Actually, looking at how FrameworkEval works: add_constraint is called
-        // with the actual traced value. The generic G could be TracedBaseField or
-        // TracedSecureField. We need to get the register from it.
-        //
-        // The issue is we can't easily extract the register from a generic G.
-        // But we know that the last register allocated on our recorder is the
-        // result of the constraint expression. We can use that.
-        //
-        // Actually, the constraint value lands on our recorder because all ops
-        // merge into the main recorder. The last operation's dst register is
-        // the constraint value.
-        //
-        // We'll use the convention: the constraint value is in register (next_reg - 1).
+        // Convert constraint to TracedSecureField to get its register index.
+        // G implements Into<TracedSecureField> (via From<G> for Self::EF).
+        let traced: TracedSecureField = constraint.into();
+        // Merge the constraint's recorder into ours if from a detached source
+        merge_recorders(&self.rec, &traced.rec);
+        let src = traced.reg;
         let mut inner = self.rec.borrow_mut();
-        let src = if inner.next_reg > 0 { inner.next_reg - 1 } else { 0 };
         inner.emit(BytecodeOp::AddConstraint { src });
         inner.n_constraints += 1;
     }

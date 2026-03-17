@@ -516,6 +516,71 @@ fn try_gpu_bytecode_eval<E: FrameworkEval>(
         }
     }
 
+    // VALIDATION: Compare GPU result with CPU for the first small component.
+    static VALIDATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !VALIDATED.swap(true, std::sync::atomic::Ordering::Relaxed) && n_rows <= 256 {
+        // Download GPU result
+        let gpu_c0 = accum_col.columns[0].to_cpu();
+        let gpu_c1 = accum_col.columns[1].to_cpu();
+        let gpu_c2 = accum_col.columns[2].to_cpu();
+        let gpu_c3 = accum_col.columns[3].to_cpu();
+
+        // Zero the accum and run CPU path
+        for i in 0..4 { accum_col.columns[i].buf.zero(); }
+
+        // CPU evaluation
+        let cpu_trace_evals: TreeVec<Vec<CircleEvaluation<CpuBackend, BaseField, BitReversedOrder>>> =
+            gpu_trace_evals.as_ref().map(|tree| {
+                tree.iter().map(|eval| {
+                    CircleEvaluation::new(eval.domain, eval.values.to_cpu())
+                }).collect()
+            });
+        let cpu_trace_refs = cpu_trace_evals.as_ref().map(|tree| {
+            tree.iter().map(|e| e).collect::<Vec<_>>()
+        });
+        let cpu_result = accumulate_pointwise_cpu(
+            component, cpu_trace_refs,
+            eval_log_size, trace_log_size,
+            denom_inv.to_vec(), random_coeff_powers,
+            &SecureColumnByCoords::<CpuBackend> {
+                columns: std::array::from_fn(|_| vec![BaseField::from(0u32); n_rows as usize]),
+            },
+        );
+
+        let mut mismatches = 0;
+        for row in 0..n_rows as usize {
+            let g0 = gpu_c0[row].0;
+            let c0 = cpu_result.columns[0][row].0;
+            if g0 != c0 {
+                if mismatches < 5 {
+                    eprintln!("[VALIDATE] row {row}: GPU=({},{},{},{}) CPU=({},{},{},{})",
+                        g0, gpu_c1[row].0, gpu_c2[row].0, gpu_c3[row].0,
+                        c0, cpu_result.columns[1][row].0, cpu_result.columns[2][row].0, cpu_result.columns[3][row].0);
+                }
+                mismatches += 1;
+            }
+        }
+        if mismatches > 0 {
+            eprintln!("[VALIDATE] {mismatches}/{n_rows} mismatches! GPU constraint eval is wrong.");
+            // Restore CPU result to accum
+            *accum_col = SecureColumnByCoords {
+                columns: std::array::from_fn(|i| cpu_result.columns[i].iter().copied().collect()),
+            };
+            return true; // "succeeded" but with CPU data
+        } else {
+            eprintln!("[VALIDATE] GPU matches CPU perfectly for {n_rows} rows!");
+            // Restore GPU result
+            *accum_col = SecureColumnByCoords {
+                columns: [
+                    gpu_c0.into_iter().collect(),
+                    gpu_c1.into_iter().collect(),
+                    gpu_c2.into_iter().collect(),
+                    gpu_c3.into_iter().collect(),
+                ],
+            };
+        }
+    }
+
     // Check for CUDA errors.
     let err = unsafe { ffi::cudaGetLastError() };
     if err != 0 {
