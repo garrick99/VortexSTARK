@@ -180,9 +180,15 @@ impl PolyOps for CudaBackend {
     }
 
     fn eval_at_point(poly: &CircleCoefficients<Self>, point: CirclePoint<SecureField>) -> SecureField {
-        let coeffs = poly.coeffs.to_cpu();
-        if coeffs.is_empty() { return SecureField::zero(); }
-        if coeffs.len() == 1 { return coeffs[0].into(); }
+        use stwo::core::fields::m31::M31;
+
+        let n = poly.coeffs.len();
+        if n == 0 { return SecureField::zero(); }
+        if n == 1 {
+            return poly.coeffs.at(0).into();
+        }
+
+        // Compute folding factors: [y, x, double_x(x), ...] reversed
         let mut mappings = vec![point.y];
         let mut x = point.x;
         for _ in 1..poly.log_size() {
@@ -190,7 +196,34 @@ impl PolyOps for CudaBackend {
             x = CirclePoint::double_x(x);
         }
         mappings.reverse();
-        stwo::core::poly::utils::fold(&coeffs, &mappings)
+
+        // Upload folding factors to GPU as QM31 (4 u32s each)
+        let mut factors_flat: Vec<u32> = Vec::with_capacity(mappings.len() * 4);
+        for m in &mappings {
+            let arr = m.to_m31_array();
+            factors_flat.extend_from_slice(&[arr[0].0, arr[1].0, arr[2].0, arr[3].0]);
+        }
+        let d_factors = DeviceBuffer::from_host(&factors_flat);
+
+        // Scratch buffers for GPU fold (QM31 = 4 u32s per element)
+        let half_n = n / 2;
+        let d_scratch1 = DeviceBuffer::<u32>::alloc(half_n * 4);
+        let d_scratch2 = DeviceBuffer::<u32>::alloc(half_n * 4);
+
+        // GPU fold: reduces n M31 coefficients to 1 QM31 result
+        let mut result = [0u32; 4];
+        unsafe {
+            vortexstark::cuda::ffi::cuda_eval_at_point(
+                poly.coeffs.buf.as_ptr(),
+                d_factors.as_ptr(),
+                result.as_mut_ptr(),
+                n as u32,
+                d_scratch1.as_ptr() as *mut u32,
+                d_scratch2.as_ptr() as *mut u32,
+            );
+        }
+
+        SecureField::from_m31_array(std::array::from_fn(|i| M31::from_u32_unchecked(result[i])))
     }
 
     fn barycentric_weights(coset: CanonicCoset, p: CirclePoint<SecureField>) -> CudaColumn<SecureField> {
@@ -201,6 +234,8 @@ impl PolyOps for CudaBackend {
         evals: &CircleEvaluation<Self, BaseField, BitReversedOrder>,
         weights: &CudaColumn<SecureField>,
     ) -> SecureField {
+        // CPU fallback — barycentric eval is a weighted dot product, small
+        // TODO: GPU dot product kernel
         let cpu_evals = CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(
             evals.domain, evals.values.to_cpu(),
         );
@@ -213,6 +248,10 @@ impl PolyOps for CudaBackend {
         point: CirclePoint<SecureField>,
         _twiddles: &TwiddleTree<Self>,
     ) -> SecureField {
+        // CPU path — the GPU IFFT + fold per-polynomial has too much per-call overhead
+        // for the hundreds of small polynomials in OODS evaluation.
+        // The real fix is batching all OODS evaluations into one kernel launch.
+        // TODO: GPU batch OODS evaluation.
         let cpu_evals = CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(
             evals.domain, evals.values.to_cpu(),
         );
