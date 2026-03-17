@@ -595,3 +595,40 @@ unsafe extern "C" {
         n_leaves: u32,
     );
 }
+
+// Bytecode constraint evaluation kernel
+unsafe extern "C" {
+    /// Execute a bytecode constraint evaluation program on the GPU.
+    ///
+    /// Each GPU thread interprets the same bytecode program for one row,
+    /// evaluating all constraints and accumulating the results into the
+    /// output columns (SoA QM31 format).
+    ///
+    /// - `bytecode`: device pointer to encoded u32 instruction stream
+    /// - `n_words`: number of u32 words in the bytecode
+    /// - `trace_cols`: device pointer to array of device pointers (one per column)
+    /// - `trace_col_sizes`: device pointer to array of column sizes (unused, reserved)
+    /// - `n_trace_cols`: number of columns in trace_cols
+    /// - `n_rows`: number of rows in the evaluation domain
+    /// - `trace_n_rows`: number of rows in the trace domain (power of 2)
+    /// - `random_coeff_powers`: device pointer to [n_constraints * 4] QM31 values (reversed)
+    /// - `denom_inv`: device pointer to [1 << log_expand] M31 denominator inverses
+    /// - `log_expand`: eval_log_size - trace_log_size
+    /// - `accum0..3`: device pointers to output accumulator columns (SoA QM31)
+    pub fn cuda_bytecode_constraint_eval(
+        bytecode: *const u32,
+        n_words: u32,
+        trace_cols: *const *const u32,
+        trace_col_sizes: *const u32,
+        n_trace_cols: u32,
+        n_rows: u32,
+        trace_n_rows: u32,
+        random_coeff_powers: *const u32,
+        denom_inv: *const u32,
+        log_expand: u32,
+        accum0: *mut u32,
+        accum1: *mut u32,
+        accum2: *mut u32,
+        accum3: *mut u32,
+    );
+}

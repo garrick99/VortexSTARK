@@ -369,4 +369,287 @@ mod tests {
 
         assert_eq!(gpu_eval, cpu_eval, "eval_at_point must match CPU");
     }
+
+    // ---- GPU bytecode constraint evaluation kernel tests ----
+
+    /// Test the GPU bytecode constraint eval kernel directly with a hand-crafted
+    /// bytecode program and known trace data.
+    ///
+    /// Program: flag * (1 - flag) = 0
+    /// Bytecode:
+    ///   push_trace[col=0, offset=0]   -> stack: [flag]
+    ///   push_base(1)                  -> stack: [flag, 1]
+    ///   push_trace[col=0, offset=0]   -> stack: [flag, 1, flag]
+    ///   sub                           -> stack: [flag, (1-flag)]
+    ///   mul                           -> stack: [flag*(1-flag)]
+    ///   add_constraint                -> accumulate
+    ///
+    /// Trace: 4 rows with values [0, 1, 0, 1] (all valid flags).
+    /// Expected: all constraint values are 0, so accumulator stays zero.
+    #[test]
+    fn test_gpu_bytecode_kernel_zero_constraints() {
+        use vortexstark::device::DeviceBuffer;
+        use vortexstark::cuda::ffi;
+
+        init_gpu();
+
+        // Trace: single column, 4 rows, values [0, 1, 0, 1]
+        let trace_data: Vec<u32> = vec![0, 1, 0, 1];
+        let d_trace_col = DeviceBuffer::from_host(&trace_data);
+        let trace_col_ptr = d_trace_col.as_ptr();
+        let d_col_ptrs = DeviceBuffer::from_host(&[trace_col_ptr]);
+        let d_col_sizes = DeviceBuffer::from_host(&[4u32]);
+
+        // Bytecode: flag * (1 - flag), one constraint
+        // Using flat col index 0 for the trace column
+        let bytecode: Vec<u32> = vec![
+            // push_trace[flat_col=0, offset=0]
+            (0x03u32 << 24) | (0 << 10) | (0 << 9) | 0,
+            // push_base(1)
+            (0x01u32 << 24) | 1,
+            // push_trace[flat_col=0, offset=0]  (second copy for subtraction)
+            (0x03u32 << 24) | (0 << 10) | (0 << 9) | 0,
+            // sub: (1 - flag)
+            (0x11u32 << 24),
+            // mul: flag * (1 - flag)
+            (0x12u32 << 24),
+            // add_constraint
+            (0x40u32 << 24),
+        ];
+        let d_bytecode = DeviceBuffer::from_host(&bytecode);
+
+        // Random coeff powers: 1 constraint, so 4 u32s (one QM31)
+        // Use (1, 0, 0, 0) so result = constraint_value * 1
+        let coeff: Vec<u32> = vec![1, 0, 0, 0];
+        let d_coeff = DeviceBuffer::from_host(&coeff);
+
+        // Denom inv: for log_expand=0, just one value = 1
+        // Actually for eval domain = trace domain (no blowup), denom_inv = [1]
+        // With n_rows=4, trace_n_rows=4, log_expand=0
+        let denom_inv: Vec<u32> = vec![1];
+        let d_denom_inv = DeviceBuffer::from_host(&denom_inv);
+
+        // Output accumulators: 4 rows, initialized to zero
+        let mut d_accum0 = DeviceBuffer::<u32>::alloc(4);
+        let mut d_accum1 = DeviceBuffer::<u32>::alloc(4);
+        let mut d_accum2 = DeviceBuffer::<u32>::alloc(4);
+        let mut d_accum3 = DeviceBuffer::<u32>::alloc(4);
+        d_accum0.zero();
+        d_accum1.zero();
+        d_accum2.zero();
+        d_accum3.zero();
+
+        unsafe {
+            ffi::cuda_bytecode_constraint_eval(
+                d_bytecode.as_ptr(),
+                bytecode.len() as u32,
+                d_col_ptrs.as_ptr() as *const *const u32,
+                d_col_sizes.as_ptr(),
+                1, // n_trace_cols
+                4, // n_rows
+                4, // trace_n_rows
+                d_coeff.as_ptr(),
+                d_denom_inv.as_ptr(),
+                0, // log_expand
+                d_accum0.as_mut_ptr(),
+                d_accum1.as_mut_ptr(),
+                d_accum2.as_mut_ptr(),
+                d_accum3.as_mut_ptr(),
+            );
+            ffi::cuda_device_sync();
+        }
+
+        let err = unsafe { ffi::cudaGetLastError() };
+        assert_eq!(err, 0, "CUDA kernel error: {err}");
+
+        // Download results
+        let out0 = d_accum0.to_host();
+        let out1 = d_accum1.to_host();
+        let out2 = d_accum2.to_host();
+        let out3 = d_accum3.to_host();
+
+        // flag*(1-flag) = 0 for all rows (flag=0 or flag=1), so output should be all zeros
+        for row in 0..4 {
+            assert_eq!(out0[row], 0, "accum0[{row}] should be 0, got {}", out0[row]);
+            assert_eq!(out1[row], 0, "accum1[{row}] should be 0, got {}", out1[row]);
+            assert_eq!(out2[row], 0, "accum2[{row}] should be 0, got {}", out2[row]);
+            assert_eq!(out3[row], 0, "accum3[{row}] should be 0, got {}", out3[row]);
+        }
+    }
+
+    /// Test with a constraint that has non-zero output.
+    /// Program: x - 5 = 0 (constraint value = x - 5)
+    /// Trace: [3, 5, 7, 5] -> constraint values: [-2, 0, 2, 0] in M31
+    /// With random_coeff = (1,0,0,0) and denom_inv = 1:
+    ///   accum[i] = (x[i] - 5) * 1 * 1 = x[i] - 5
+    #[test]
+    fn test_gpu_bytecode_kernel_nonzero_constraints() {
+        use vortexstark::device::DeviceBuffer;
+        use vortexstark::cuda::ffi;
+
+        init_gpu();
+
+        let p = 0x7FFFFFFFu32; // M31 modulus
+
+        let trace_data: Vec<u32> = vec![3, 5, 7, 5];
+        let d_trace_col = DeviceBuffer::from_host(&trace_data);
+        let trace_col_ptr = d_trace_col.as_ptr();
+        let d_col_ptrs = DeviceBuffer::from_host(&[trace_col_ptr]);
+        let d_col_sizes = DeviceBuffer::from_host(&[4u32]);
+
+        // Bytecode: push_trace[0], add_const(-5 mod p), add_constraint
+        // -5 mod p = p - 5
+        let neg5 = p - 5;
+        let bytecode: Vec<u32> = vec![
+            // push_trace[flat_col=0, offset=0]
+            (0x03u32 << 24) | (0 << 10) | (0 << 9) | 0,
+            // add_const(neg5) -- need extended since neg5 > 2^24
+            (0x14u32 << 24) | (1 << 23), // extended flag
+            neg5,
+            // add_constraint
+            (0x40u32 << 24),
+        ];
+        let d_bytecode = DeviceBuffer::from_host(&bytecode);
+
+        let coeff: Vec<u32> = vec![1, 0, 0, 0];
+        let d_coeff = DeviceBuffer::from_host(&coeff);
+
+        let denom_inv: Vec<u32> = vec![1];
+        let d_denom_inv = DeviceBuffer::from_host(&denom_inv);
+
+        let mut d_accum0 = DeviceBuffer::<u32>::alloc(4);
+        let mut d_accum1 = DeviceBuffer::<u32>::alloc(4);
+        let mut d_accum2 = DeviceBuffer::<u32>::alloc(4);
+        let mut d_accum3 = DeviceBuffer::<u32>::alloc(4);
+        d_accum0.zero();
+        d_accum1.zero();
+        d_accum2.zero();
+        d_accum3.zero();
+
+        unsafe {
+            ffi::cuda_bytecode_constraint_eval(
+                d_bytecode.as_ptr(),
+                bytecode.len() as u32,
+                d_col_ptrs.as_ptr() as *const *const u32,
+                d_col_sizes.as_ptr(),
+                1, 4, 4,
+                d_coeff.as_ptr(),
+                d_denom_inv.as_ptr(),
+                0,
+                d_accum0.as_mut_ptr(),
+                d_accum1.as_mut_ptr(),
+                d_accum2.as_mut_ptr(),
+                d_accum3.as_mut_ptr(),
+            );
+            ffi::cuda_device_sync();
+        }
+
+        let err = unsafe { ffi::cudaGetLastError() };
+        assert_eq!(err, 0, "CUDA kernel error: {err}");
+
+        let out0 = d_accum0.to_host();
+
+        // Expected: (3-5) mod p = p-2, (5-5) = 0, (7-5) = 2, (5-5) = 0
+        assert_eq!(out0[0], p - 2, "row 0: 3-5 = -2 mod p");
+        assert_eq!(out0[1], 0,     "row 1: 5-5 = 0");
+        assert_eq!(out0[2], 2,     "row 2: 7-5 = 2");
+        assert_eq!(out0[3], 0,     "row 3: 5-5 = 0");
+    }
+
+    /// Test the full encode -> GPU path using the bytecode encoder.
+    #[test]
+    fn test_gpu_bytecode_via_encoder() {
+        use vortexstark::device::DeviceBuffer;
+        use vortexstark::cuda::ffi;
+        use crate::constraint_eval::bytecode::{BytecodeOp, BytecodeProgram};
+
+        init_gpu();
+
+        let p = 0x7FFFFFFFu32;
+
+        // Build a simple bytecode program: a + b - c = 0
+        let prog = BytecodeProgram {
+            ops: vec![
+                BytecodeOp::PushTraceVal { interaction: 0, col_idx: 0, offset: 0 },
+                BytecodeOp::PushTraceVal { interaction: 0, col_idx: 1, offset: 0 },
+                BytecodeOp::Add,
+                BytecodeOp::PushTraceVal { interaction: 0, col_idx: 2, offset: 0 },
+                BytecodeOp::Sub,
+                BytecodeOp::AddConstraint,
+            ],
+            n_constraints: 1,
+            n_trace_accesses: 3,
+            max_stack_depth: 3,
+        };
+
+        let mut encoded = prog.encode();
+
+        // Remap PushTraceVal: (interaction=0, col_idx=N) -> flat_col=N
+        // Since interaction 0 starts at offset 0, the mapping is identity.
+        // The encoding is already: (interaction:4 | col_idx:10 | sign:1 | abs_offset:9)
+        // We need to patch to: (flat_col:14 | sign:1 | abs_offset:9)
+        // For interaction=0, flat_col = col_idx, so (0 << 20 | col << 10 | ...) = (col << 10 | ...)
+        // That's the same as (flat_col << 10 | ...) since interaction=0. No patch needed!
+
+        // Trace: 3 columns, 4 rows
+        // a = [1, 2, 3, 4], b = [10, 20, 30, 40], c = [11, 22, 33, 44]
+        let col_a: Vec<u32> = vec![1, 2, 3, 4];
+        let col_b: Vec<u32> = vec![10, 20, 30, 40];
+        let col_c: Vec<u32> = vec![11, 22, 33, 44];
+
+        let d_col_a = DeviceBuffer::from_host(&col_a);
+        let d_col_b = DeviceBuffer::from_host(&col_b);
+        let d_col_c = DeviceBuffer::from_host(&col_c);
+
+        let col_ptrs: Vec<*const u32> = vec![
+            d_col_a.as_ptr(),
+            d_col_b.as_ptr(),
+            d_col_c.as_ptr(),
+        ];
+        let d_col_ptrs = DeviceBuffer::from_host(&col_ptrs);
+        let d_col_sizes = DeviceBuffer::from_host(&[4u32, 4, 4]);
+
+        let d_bytecode = DeviceBuffer::from_host(&encoded);
+        let coeff: Vec<u32> = vec![1, 0, 0, 0];
+        let d_coeff = DeviceBuffer::from_host(&coeff);
+        let denom_inv: Vec<u32> = vec![1];
+        let d_denom_inv = DeviceBuffer::from_host(&denom_inv);
+
+        let mut d_accum0 = DeviceBuffer::<u32>::alloc(4);
+        let mut d_accum1 = DeviceBuffer::<u32>::alloc(4);
+        let mut d_accum2 = DeviceBuffer::<u32>::alloc(4);
+        let mut d_accum3 = DeviceBuffer::<u32>::alloc(4);
+        d_accum0.zero();
+        d_accum1.zero();
+        d_accum2.zero();
+        d_accum3.zero();
+
+        unsafe {
+            ffi::cuda_bytecode_constraint_eval(
+                d_bytecode.as_ptr(),
+                encoded.len() as u32,
+                d_col_ptrs.as_ptr() as *const *const u32,
+                d_col_sizes.as_ptr(),
+                3, 4, 4,
+                d_coeff.as_ptr(),
+                d_denom_inv.as_ptr(),
+                0,
+                d_accum0.as_mut_ptr(),
+                d_accum1.as_mut_ptr(),
+                d_accum2.as_mut_ptr(),
+                d_accum3.as_mut_ptr(),
+            );
+            ffi::cuda_device_sync();
+        }
+
+        let err = unsafe { ffi::cudaGetLastError() };
+        assert_eq!(err, 0, "CUDA kernel error: {err}");
+
+        let out0 = d_accum0.to_host();
+
+        // Expected: a + b - c = [1+10-11, 2+20-22, 3+30-33, 4+40-44] = [0, 0, 0, 0]
+        for row in 0..4 {
+            assert_eq!(out0[row], 0, "row {row}: a+b-c should be 0, got {}", out0[row]);
+        }
+    }
 }

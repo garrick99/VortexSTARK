@@ -107,6 +107,100 @@ pub struct BytecodeProgram {
 }
 
 impl BytecodeProgram {
+    /// Encode the bytecode program as a flat `Vec<u32>` for GPU consumption.
+    ///
+    /// Encoding scheme per instruction:
+    ///   - **Header word**: `opcode << 24 | operand_24bit`
+    ///   - **Extended words**: for values that don't fit in 24 bits
+    ///
+    /// Single-word ops (operand fits in 24 bits):
+    ///   `[opcode:8 | operand:24]`
+    ///
+    /// `PushBaseField(v)`: If v < 2^24, single word. Otherwise header has bit 23
+    /// set as an "extended" flag, followed by the full u32 value.
+    ///
+    /// `PushSecureField([a,b,c,d])`: header + 4 data words.
+    /// `PushTraceVal{interaction, col_idx, offset}`: single word with packed operand.
+    /// `WideAddConst`, `WideMulConst`, etc.: header + 4 data words.
+    /// `AddConst(v)`, `MulConst(v)`: same as PushBaseField encoding.
+    /// `BaseAddSecureConst`, `BaseMulSecureConst`: header + 4 data words.
+    ///
+    /// Returns the encoded words and a mapping from instruction index to word offset
+    /// (useful for debugging).
+    pub fn encode(&self) -> Vec<u32> {
+        let mut words = Vec::with_capacity(self.ops.len() * 2);
+
+        for op in &self.ops {
+            let opcode = op.opcode_id() as u32;
+
+            match op {
+                BytecodeOp::PushBaseField(v) => {
+                    if *v < (1 << 24) {
+                        words.push((opcode << 24) | *v);
+                    } else {
+                        // Extended: set bit 23 in operand field as flag
+                        words.push((opcode << 24) | (1 << 23));
+                        words.push(*v);
+                    }
+                }
+                BytecodeOp::PushSecureField(limbs) => {
+                    words.push(opcode << 24);
+                    words.extend_from_slice(limbs);
+                }
+                BytecodeOp::PushTraceVal {
+                    interaction,
+                    col_idx,
+                    offset,
+                } => {
+                    // Pack: [interaction:4 | col_idx:10 | offset_sign:1 | offset_abs:9]
+                    // This supports interaction 0..15, col_idx 0..1023, offset -511..511
+                    let inter = (*interaction as u32) & 0xF;
+                    let col = (*col_idx as u32) & 0x3FF;
+                    let (sign, abs_off) = if *offset < 0 {
+                        (1u32, (-*offset) as u32)
+                    } else {
+                        (0u32, *offset as u32)
+                    };
+                    let operand = (inter << 20) | (col << 10) | (sign << 9) | (abs_off & 0x1FF);
+                    words.push((opcode << 24) | operand);
+                }
+                // Simple no-operand ops
+                BytecodeOp::Add
+                | BytecodeOp::Sub
+                | BytecodeOp::Mul
+                | BytecodeOp::Neg
+                | BytecodeOp::WideAdd
+                | BytecodeOp::WideSub
+                | BytecodeOp::WideMul
+                | BytecodeOp::WideNeg
+                | BytecodeOp::WideAddBase
+                | BytecodeOp::WideMulBase
+                | BytecodeOp::Widen
+                | BytecodeOp::CombineEF
+                | BytecodeOp::AddConstraint => {
+                    words.push(opcode << 24);
+                }
+                BytecodeOp::AddConst(v) | BytecodeOp::MulConst(v) => {
+                    if *v < (1 << 24) {
+                        words.push((opcode << 24) | *v);
+                    } else {
+                        words.push((opcode << 24) | (1 << 23));
+                        words.push(*v);
+                    }
+                }
+                BytecodeOp::WideAddConst(limbs)
+                | BytecodeOp::WideMulConst(limbs)
+                | BytecodeOp::BaseAddSecureConst(limbs)
+                | BytecodeOp::BaseMulSecureConst(limbs) => {
+                    words.push(opcode << 24);
+                    words.extend_from_slice(limbs);
+                }
+            }
+        }
+
+        words
+    }
+
     /// Pretty-print the bytecode as a numbered instruction listing.
     pub fn dump(&self) -> String {
         let mut out = String::new();
@@ -222,4 +316,114 @@ pub(crate) fn base_to_raw(v: BaseField) -> u32 {
 pub(crate) fn secure_to_raw(v: SecureField) -> [u32; 4] {
     let arr = v.to_m31_array();
     [arr[0].0, arr[1].0, arr[2].0, arr[3].0]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_encode_simple_ops() {
+        let prog = BytecodeProgram {
+            ops: vec![
+                BytecodeOp::PushBaseField(42),
+                BytecodeOp::PushBaseField(100),
+                BytecodeOp::Add,
+                BytecodeOp::AddConstraint,
+            ],
+            n_constraints: 1,
+            n_trace_accesses: 0,
+            max_stack_depth: 2,
+        };
+        let words = prog.encode();
+        // PushBaseField(42): 0x01 << 24 | 42
+        assert_eq!(words[0], (0x01 << 24) | 42);
+        // PushBaseField(100): 0x01 << 24 | 100
+        assert_eq!(words[1], (0x01 << 24) | 100);
+        // Add: 0x10 << 24
+        assert_eq!(words[2], 0x10 << 24);
+        // AddConstraint: 0x40 << 24
+        assert_eq!(words[3], 0x40 << 24);
+    }
+
+    #[test]
+    fn test_encode_extended_basefield() {
+        // Value > 2^24 needs 2-word encoding
+        let big_val = (1 << 24) + 7;
+        let prog = BytecodeProgram {
+            ops: vec![BytecodeOp::PushBaseField(big_val)],
+            n_constraints: 0,
+            n_trace_accesses: 0,
+            max_stack_depth: 1,
+        };
+        let words = prog.encode();
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[0], (0x01 << 24) | (1 << 23)); // extended flag
+        assert_eq!(words[1], big_val);
+    }
+
+    #[test]
+    fn test_encode_secure_field() {
+        let prog = BytecodeProgram {
+            ops: vec![BytecodeOp::PushSecureField([10, 20, 30, 40])],
+            n_constraints: 0,
+            n_trace_accesses: 0,
+            max_stack_depth: 1,
+        };
+        let words = prog.encode();
+        assert_eq!(words.len(), 5);
+        assert_eq!(words[0], 0x02 << 24);
+        assert_eq!(words[1], 10);
+        assert_eq!(words[2], 20);
+        assert_eq!(words[3], 30);
+        assert_eq!(words[4], 40);
+    }
+
+    #[test]
+    fn test_encode_trace_val() {
+        let prog = BytecodeProgram {
+            ops: vec![BytecodeOp::PushTraceVal {
+                interaction: 1,
+                col_idx: 5,
+                offset: -1,
+            }],
+            n_constraints: 0,
+            n_trace_accesses: 1,
+            max_stack_depth: 1,
+        };
+        let words = prog.encode();
+        assert_eq!(words.len(), 1);
+        let word = words[0];
+        let opcode = word >> 24;
+        assert_eq!(opcode, 0x03);
+        let operand = word & 0xFFFFFF;
+        let interaction = (operand >> 20) & 0xF;
+        let col_idx = (operand >> 10) & 0x3FF;
+        let sign = (operand >> 9) & 1;
+        let abs_off = operand & 0x1FF;
+        assert_eq!(interaction, 1);
+        assert_eq!(col_idx, 5);
+        assert_eq!(sign, 1); // negative
+        assert_eq!(abs_off, 1);
+    }
+
+    #[test]
+    fn test_encode_roundtrip_deterministic() {
+        let prog = BytecodeProgram {
+            ops: vec![
+                BytecodeOp::PushTraceVal { interaction: 0, col_idx: 0, offset: 0 },
+                BytecodeOp::PushBaseField(1),
+                BytecodeOp::Sub,
+                BytecodeOp::PushTraceVal { interaction: 0, col_idx: 0, offset: 0 },
+                BytecodeOp::Mul,
+                BytecodeOp::AddConstraint,
+            ],
+            n_constraints: 1,
+            n_trace_accesses: 1,
+            max_stack_depth: 2,
+        };
+        let w1 = prog.encode();
+        let w2 = prog.encode();
+        assert_eq!(w1, w2);
+    }
 }

@@ -9,7 +9,7 @@
 //!
 //! 1. **`bytecode`** — Defines the `BytecodeOp` instruction set and `BytecodeProgram`.
 //! 2. **`tracing`** — `TracingEvalAtRow` implements `EvalAtRow` by emitting bytecode ops.
-//! 3. *(future)* **CUDA kernel** — GPU interpreter that replays the bytecode per-row.
+//! 3. **CUDA kernel** (`constraint_eval.cu`) — GPU interpreter that replays the bytecode per-row.
 //!
 //! # Usage
 //!
