@@ -1,10 +1,11 @@
 //! PolyOps: Circle polynomial operations.
 //!
-//! NTT evaluate/interpolate uses CPU fallback with stwo's twiddle format
-//! to ensure correctness. GPU Merkle + GPU accumulation handle the
-//! commitment and field operations.
-//!
-//! TODO: Port GPU NTT to use stwo's twiddle format for 200-400x speedup.
+//! NTT evaluate/interpolate uses stwo's twiddle format on GPU kernels.
+//! A global twiddle cache avoids recomputing and re-uploading twiddles
+//! for repeated coset sizes (hundreds of columns share the same cosets).
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use num_traits::Zero;
 use stwo::core::circle::{CirclePoint, Coset as StwoCoset};
@@ -28,6 +29,111 @@ use super::column::CudaColumn;
 /// GPU twiddle factors (placeholder — not used for NTT yet).
 pub struct CudaTwiddles {
     pub cache: TwiddleCache,
+}
+
+// ---------------------------------------------------------------------------
+// Global twiddle cache
+// ---------------------------------------------------------------------------
+
+/// Cache key: (initial.x, initial.y, step.x, step.y, log_size) as raw u32s.
+type CosetKey = (u32, u32, u32, u32, u32);
+
+fn coset_key(coset: &StwoCoset) -> CosetKey {
+    (coset.initial.x.0, coset.initial.y.0, coset.step.x.0, coset.step.y.0, coset.log_size)
+}
+
+/// Cached GPU twiddle pair: (forward twiddles, inverse twiddles) on device.
+struct GpuTwiddlePair {
+    twiddles: Arc<DeviceBuffer<u32>>,
+    itwiddles: Arc<DeviceBuffer<u32>>,
+}
+
+/// Cached CPU twiddle pair: raw u32 vectors (for FRI fallback and other CPU paths).
+pub(crate) struct CpuTwiddlePair {
+    pub twiddles: Arc<Vec<u32>>,
+    pub itwiddles: Arc<Vec<u32>>,
+    pub root_coset: StwoCoset,
+}
+
+fn gpu_cache() -> &'static Mutex<HashMap<CosetKey, GpuTwiddlePair>> {
+    static CACHE: OnceLock<Mutex<HashMap<CosetKey, GpuTwiddlePair>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cpu_cache() -> &'static Mutex<HashMap<CosetKey, CpuTwiddlePair>> {
+    static CACHE: OnceLock<Mutex<HashMap<CosetKey, CpuTwiddlePair>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Get cached GPU twiddle device buffers for a coset, computing + uploading if needed.
+fn cached_gpu_twiddles(coset: &StwoCoset) -> (Arc<DeviceBuffer<u32>>, Arc<DeviceBuffer<u32>>) {
+    let key = coset_key(coset);
+    {
+        let cache = gpu_cache().lock().unwrap();
+        if let Some(pair) = cache.get(&key) {
+            return (pair.twiddles.clone(), pair.itwiddles.clone());
+        }
+    }
+    // Compute on CPU, upload to GPU
+    let cpu_tw = CpuBackend::precompute_twiddles(*coset);
+    let d_twiddles = Arc::new(DeviceBuffer::from_host(
+        &cpu_tw.twiddles.iter().map(|t| t.0).collect::<Vec<u32>>()
+    ));
+    let d_itwiddles = Arc::new(DeviceBuffer::from_host(
+        &cpu_tw.itwiddles.iter().map(|t| t.0).collect::<Vec<u32>>()
+    ));
+    let result = (d_twiddles.clone(), d_itwiddles.clone());
+    {
+        let mut cache = gpu_cache().lock().unwrap();
+        cache.entry(key).or_insert(GpuTwiddlePair {
+            twiddles: d_twiddles,
+            itwiddles: d_itwiddles,
+        });
+    }
+    result
+}
+
+/// Get cached CPU twiddle data for a coset (used by FRI fallback).
+/// Returns (twiddles, itwiddles) as raw u32 vecs plus the root coset.
+pub(crate) fn cached_cpu_twiddles(coset: &StwoCoset) -> CpuTwiddlePair {
+    let key = coset_key(coset);
+    {
+        let cache = cpu_cache().lock().unwrap();
+        if let Some(pair) = cache.get(&key) {
+            return CpuTwiddlePair {
+                twiddles: pair.twiddles.clone(),
+                itwiddles: pair.itwiddles.clone(),
+                root_coset: pair.root_coset,
+            };
+        }
+    }
+    let cpu_tw = CpuBackend::precompute_twiddles(*coset);
+    let twiddles = Arc::new(cpu_tw.twiddles.iter().map(|t| t.0).collect::<Vec<u32>>());
+    let itwiddles = Arc::new(cpu_tw.itwiddles.iter().map(|t| t.0).collect::<Vec<u32>>());
+    let result = CpuTwiddlePair {
+        twiddles: twiddles.clone(),
+        itwiddles: itwiddles.clone(),
+        root_coset: cpu_tw.root_coset,
+    };
+    {
+        let mut cache = cpu_cache().lock().unwrap();
+        cache.entry(key).or_insert(CpuTwiddlePair {
+            twiddles,
+            itwiddles,
+            root_coset: cpu_tw.root_coset,
+        });
+    }
+    result
+}
+
+/// Reconstruct a `TwiddleTree<CpuBackend>` from cached CPU twiddle data.
+pub(crate) fn cached_cpu_twiddle_tree(coset: &StwoCoset) -> TwiddleTree<CpuBackend> {
+    let pair = cached_cpu_twiddles(coset);
+    TwiddleTree {
+        root_coset: pair.root_coset,
+        twiddles: pair.twiddles.iter().map(|&v| BaseField::from_u32_unchecked(v)).collect(),
+        itwiddles: pair.itwiddles.iter().map(|&v| BaseField::from_u32_unchecked(v)).collect(),
+    }
 }
 
 /// Convert stwo Coset → VortexSTARK Coset.
@@ -60,11 +166,8 @@ impl PolyOps for CudaBackend {
         let mut values = eval.values;
         let n = values.len() as u32;
 
-        // Compute stwo-format itwiddles on CPU, upload to GPU
-        let cpu_twiddles = CpuBackend::precompute_twiddles(eval.domain.half_coset);
-        let d_itwiddles = DeviceBuffer::from_host(
-            &cpu_twiddles.itwiddles.iter().map(|t| t.0).collect::<Vec<u32>>()
-        );
+        // Cached GPU itwiddles (avoids recomputing for repeated coset sizes)
+        let (_d_twiddles, d_itwiddles) = cached_gpu_twiddles(&eval.domain.half_coset);
 
         // GPU IFFT using stwo twiddle format
         unsafe {
@@ -113,7 +216,7 @@ impl PolyOps for CudaBackend {
         let cpu_evals = CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(
             evals.domain, evals.values.to_cpu(),
         );
-        let cpu_twiddles = CpuBackend::precompute_twiddles(evals.domain.half_coset);
+        let cpu_twiddles = cached_cpu_twiddle_tree(&evals.domain.half_coset);
         CpuBackend::eval_at_point_by_folding(&cpu_evals, point, &cpu_twiddles)
     }
 
@@ -152,11 +255,8 @@ impl PolyOps for CudaBackend {
         let mut values = Self::extend(poly, domain.log_size()).coeffs;
         let n = values.len() as u32;
 
-        // Compute stwo-format twiddles on CPU, upload to GPU
-        let cpu_twiddles = CpuBackend::precompute_twiddles(domain.half_coset);
-        let d_twiddles = DeviceBuffer::from_host(
-            &cpu_twiddles.twiddles.iter().map(|t| t.0).collect::<Vec<u32>>()
-        );
+        // Cached GPU twiddles (avoids recomputing for repeated coset sizes)
+        let (d_twiddles, _d_itwiddles) = cached_gpu_twiddles(&domain.half_coset);
 
         // GPU FFT using stwo twiddle format
         unsafe {
