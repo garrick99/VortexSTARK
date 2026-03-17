@@ -1,9 +1,9 @@
 //! FriOps: FRI folding — CPU fallback.
 //!
-//! GPU FRI kernels cause error 700 on WSL2 during FRI commit phase.
-//! Using CPU fallback with correct per-domain twiddles until the
-//! GPU kernel issue is resolved.
-//! TODO: Debug cuda_fold_line_soa / cuda_fold_circle_into_line_soa on WSL2.
+//! GPU FRI fold kernels use VortexSTARK's twiddle format which differs from
+//! stwo's coset conventions. Using CPU fallback until the fold twiddle
+//! computation is aligned (same approach as the NTT twiddle fix).
+//! TODO: Compute fold twiddles using stwo's conventions for GPU FRI.
 
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
