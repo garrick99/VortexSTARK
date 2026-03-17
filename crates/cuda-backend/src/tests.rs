@@ -158,6 +158,60 @@ mod tests {
         gpu_vs_cpu_evaluate(14); // 16384 elements
     }
 
+    /// Test a single NTT layer in isolation to verify twiddle indexing.
+    #[test]
+    fn test_single_layer_gpu_vs_cpu() {
+        init_gpu();
+        // Use log_size=2 for a tiny test (4 coefficients, domain size 8)
+        let log_size = 2u32;
+        let n = 1usize << (log_size + 1); // domain size = 8
+        let coeffs: Vec<BaseField> = (1..=n as u32).map(M31::from).collect();
+        let domain = CanonicCoset::new(log_size + 1).circle_domain();
+        let coset = CanonicCoset::new(log_size + 1).half_coset();
+
+        let cpu_twiddles = CpuBackend::precompute_twiddles(coset);
+
+        eprintln!("Test: log_size={log_size}, domain_size={n}, coset_log_size={}", coset.log_size);
+        eprintln!("Twiddle buffer ({} values):", cpu_twiddles.twiddles.len());
+        for (i, t) in cpu_twiddles.twiddles.iter().enumerate() {
+            eprintln!("  [{i}] = {}", t.0);
+        }
+
+        // CPU evaluate
+        let cpu_poly = stwo::prover::backend::cpu::CpuCirclePoly::new(coeffs[..4].to_vec());
+        let cpu_eval = CpuBackend::evaluate(&cpu_poly, domain, &cpu_twiddles);
+        eprintln!("CPU evaluate result:");
+        for (i, v) in cpu_eval.values.iter().enumerate() {
+            eprintln!("  [{i}] = {}", v.0);
+        }
+
+        // GPU: upload coefficients, pad to domain size, run ONE layer at a time
+        let mut gpu_data: Vec<u32> = coeffs[..4].iter().map(|m| m.0).collect();
+        gpu_data.resize(n, 0); // zero-pad
+        let mut d_data = vortexstark::device::DeviceBuffer::from_host(&gpu_data);
+
+        let twid_u32: Vec<u32> = cpu_twiddles.twiddles.iter().map(|t| t.0).collect();
+        let d_twid = vortexstark::device::DeviceBuffer::from_host(&twid_u32);
+
+        // Run the full stwo NTT
+        unsafe {
+            vortexstark::cuda::ffi::cuda_stwo_ntt_evaluate(
+                d_data.as_mut_ptr(), d_twid.as_ptr(), n as u32,
+            );
+        }
+        let gpu_result = d_data.to_host();
+        eprintln!("GPU evaluate result:");
+        for (i, v) in gpu_result.iter().enumerate() {
+            eprintln!("  [{i}] = {v}");
+        }
+
+        // Compare
+        for i in 0..n {
+            assert_eq!(gpu_result[i], cpu_eval.values[i].0,
+                "Mismatch at {i}: GPU={} CPU={}", gpu_result[i], cpu_eval.values[i].0);
+        }
+    }
+
     #[test]
     fn test_twiddle_comparison() {
         init_gpu();

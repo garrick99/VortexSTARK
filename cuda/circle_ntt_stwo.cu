@@ -158,20 +158,15 @@ void cuda_stwo_ntt_evaluate(
     // line_twiddles[k] = &buffer[n - 2^(k+1) .. n - 2^k]
     // (from domain_line_twiddles_from_tree with .rev())
     // Twiddle buffer has half_n values (= n/2).
-    // line_twiddles[k] = buf[half_n - 2^(k+1) .. half_n - 2^k]
+    // line_twiddles[k] starts at: half_n - 2^(n_line_layers - k)
     for (int k = (int)n_line_layers - 1; k >= 0; k--) {
-        uint32_t twid_offset = half_n - (2u << k); // half_n - 2^(k+1)
+        uint32_t twid_offset = half_n - (1u << (n_line_layers - k));
         stwo_ntt_layer_kernel<<<blocks, threads>>>(
             d_data, d_twiddles + twid_offset, (uint32_t)(k + 1), half_n, 1
         );
     }
 
-    // Circle layer: derived from line_twiddles[0] = buf[0..half_n/2]
-    // (first half_n/2 values, which are n/4 values = half of the largest line layer)
-    // Wait: line_twiddles[0] has half_n/2 values at buf[0..half_n/2].
-    // But circle_twiddles_from_line_twiddles takes ALL of line_twiddles[0].
-    // line_twiddles[0] = buf[half_n - 2^(n_line_layers)..half_n - 2^(n_line_layers-1)]
-    // = buf[0..half_n/2] for n_line_layers = log_n - 1
+    // Circle layer: derived from line_twiddles[0] at buf[0..half_n/2]
     stwo_circle_layer_kernel<<<blocks, threads>>>(
         d_data, d_twiddles, half_n, 1
     );
@@ -199,7 +194,7 @@ void cuda_stwo_ntt_interpolate(
 
     // Interpolate: line layers from lowest (largest) to highest (smallest).
     for (uint32_t k = 0; k < n_line_layers; k++) {
-        uint32_t twid_offset = half_n - (2u << k); // half_n - 2^(k+1)
+        uint32_t twid_offset = half_n - (1u << (n_line_layers - k));
         stwo_ntt_layer_kernel<<<blocks, threads>>>(
             d_data, d_itwiddles + twid_offset, k + 1, half_n, 0
         );
