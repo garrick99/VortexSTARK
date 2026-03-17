@@ -17,6 +17,7 @@ itertools = "0.12.0"
 num-traits = "0.2.17"
 tracing = "0.1.40"
 starknet-ff = { version = "0.3.7", default-features = false, features = ["alloc", "serde"] }
+blake2 = "0.10.6"
 
 [dev-dependencies]
 rand = "0.8.5"

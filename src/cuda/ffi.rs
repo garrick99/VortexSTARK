@@ -524,6 +524,20 @@ unsafe extern "C" {
     );
 }
 
+// Blake2s PoW grinding kernel
+unsafe extern "C" {
+    /// Launch GPU grind kernel. Each of n_threads threads tries one nonce
+    /// starting from batch_offset. Result is atomicMin'd into result[0]
+    /// (must be initialized to u64::MAX by caller).
+    pub fn cuda_grind_pow(
+        prefixed_digest: *const u32, // device ptr, [8] words
+        result: *mut u64,            // device ptr, [1] word
+        pow_bits: u32,
+        batch_offset: u64,
+        n_threads: u32,
+    );
+}
+
 // Blake2s Merkle tree kernels
 unsafe extern "C" {
     pub fn cuda_merkle_hash_leaves(

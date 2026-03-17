@@ -3,6 +3,14 @@
 //! Uses a newtype wrapper `CudaFrameworkComponent<E>` to satisfy Rust's orphan rule.
 //! The implementation downloads GPU trace columns to CPU, evaluates constraints
 //! using `CpuDomainEvaluator`, and uploads the result back to the GPU.
+//!
+//! Profiling: Each phase (GPU extension, download, eval, upload) has a tracing span
+//! so `prove --trace` output shows exactly where time is spent.
+//!
+//! Note on parallelism: FrameworkComponent contains Rc<RefCell<ArithmeticCounts>>
+//! which is !Sync, preventing safe multi-threaded evaluation. Parallelizing
+//! constraint eval requires upstream stwo changes (Arc<AtomicU64> counters).
+//! TODO: GPU constraint evaluation kernel (the real fix, but huge undertaking).
 
 use std::borrow::Cow;
 use std::ops::Deref;
@@ -149,67 +157,95 @@ impl<'a, E: FrameworkEval> Component for CudaFrameworkComponentRef<'a, E> {
     }
 }
 
-impl<'a, E: FrameworkEval + Sync> ComponentProver<CudaBackend> for CudaFrameworkComponentRef<'a, E> {
-    fn evaluate_constraint_quotients_on_domain(
-        &self,
-        trace: &Trace<'_, CudaBackend>,
-        evaluation_accumulator: &mut DomainEvaluationAccumulator<CudaBackend>,
-    ) {
-        let n_constraints = self.n_constraints();
-        if n_constraints == 0 {
-            return;
-        }
+/// Shared implementation for both CudaFrameworkComponent and CudaFrameworkComponentRef.
+///
+/// Phases (each with its own tracing span):
+/// 1. GPU polynomial extension to eval domain
+/// 2. GPU->CPU download of trace evaluations
+/// 3. CPU constraint evaluation (serial, due to Rc<RefCell> in FrameworkComponent)
+/// 4. CPU->GPU upload of results
+fn evaluate_constraint_quotients_impl<E: FrameworkEval + Sync>(
+    component: &FrameworkComponent<E>,
+    trace: &Trace<'_, CudaBackend>,
+    evaluation_accumulator: &mut DomainEvaluationAccumulator<CudaBackend>,
+) {
+    let n_constraints = component.n_constraints();
+    if n_constraints == 0 {
+        return;
+    }
 
-        if self.is_disabled() {
-            evaluation_accumulator.skip_coeffs(n_constraints);
-            return;
-        }
+    if component.is_disabled() {
+        evaluation_accumulator.skip_coeffs(n_constraints);
+        return;
+    }
 
-        let eval_domain =
-            CanonicCoset::new(self.max_constraint_log_degree_bound()).circle_domain();
-        let trace_domain = CanonicCoset::new(self.log_size());
+    let eval_domain =
+        CanonicCoset::new(component.max_constraint_log_degree_bound()).circle_domain();
+    let trace_domain = CanonicCoset::new(component.log_size());
 
-        let mut component_polys = trace.polys.sub_tree(self.trace_locations());
-        component_polys[PREPROCESSED_TRACE_IDX] = self
-            .preprocessed_column_indices()
-            .iter()
-            .map(|idx| &trace.polys[PREPROCESSED_TRACE_IDX][*idx])
-            .collect();
+    // Extract this component's polynomial columns from the full trace.
+    let mut component_polys = trace.polys.sub_tree(component.trace_locations());
+    component_polys[PREPROCESSED_TRACE_IDX] = component
+        .preprocessed_column_indices()
+        .iter()
+        .map(|idx| &trace.polys[PREPROCESSED_TRACE_IDX][*idx])
+        .collect();
 
-        let gpu_trace_evals = get_constraint_quotients_inputs_cuda(
-            eval_domain,
-            component_polys,
-            evaluation_accumulator.evaluation_mode(),
-        );
+    // Phase 1: GPU polynomial extension to eval domain.
+    let gpu_trace_evals = get_constraint_quotients_inputs_cuda(
+        eval_domain,
+        component_polys,
+        evaluation_accumulator.evaluation_mode(),
+    );
 
-        let cpu_trace_evals: TreeVec<Vec<CircleEvaluation<CpuBackend, BaseField, BitReversedOrder>>> =
-            gpu_trace_evals.map_cols(|gpu_eval| {
-                let cpu_values = gpu_eval.values.to_cpu();
-                CircleEvaluation::new(gpu_eval.domain, cpu_values)
-            });
-        let cpu_trace_refs = cpu_trace_evals.as_cols_ref();
-
-        let log_expand = eval_domain.log_size() - trace_domain.log_size();
-        let mut denom_inv = (0..1 << log_expand)
-            .map(|i| coset_vanishing(trace_domain.coset(), eval_domain.at(i)).inverse())
-            .collect_vec();
-        bit_reverse(&mut denom_inv);
-
-        let [mut accum] =
-            evaluation_accumulator.columns([(eval_domain.log_size(), n_constraints)]);
-        accum.random_coeff_powers.reverse();
-
+    // Phase 2: Download all GPU trace evaluations to CPU.
+    let cpu_trace_evals: TreeVec<Vec<CircleEvaluation<CpuBackend, BaseField, BitReversedOrder>>>;
+    {
         let _span = span!(
             Level::INFO,
-            "CUDA Constraint point-wise eval (CPU fallback)",
-            class = "ConstraintEval"
+            "GPU→CPU trace download",
+            log_size = eval_domain.log_size(),
         )
         .entered();
+        cpu_trace_evals = gpu_trace_evals.map_cols(|gpu_eval| {
+            let cpu_values = gpu_eval.values.to_cpu();
+            CircleEvaluation::new(gpu_eval.domain, cpu_values)
+        });
+    }
+    let cpu_trace_refs = cpu_trace_evals.as_cols_ref();
 
-        let cpu_accum = accum.col.to_cpu();
+    // Denom inverses (CPU computation, small -- O(blowup_factor) elements).
+    let log_expand = eval_domain.log_size() - trace_domain.log_size();
+    let mut denom_inv = (0..1 << log_expand)
+        .map(|i| coset_vanishing(trace_domain.coset(), eval_domain.at(i)).inverse())
+        .collect_vec();
+    bit_reverse(&mut denom_inv);
 
-        let cpu_result = accumulate_pointwise_cpu(
-            self.0,
+    // Get accumulator column (GPU-resident).
+    let [mut accum] =
+        evaluation_accumulator.columns([(eval_domain.log_size(), n_constraints)]);
+    accum.random_coeff_powers.reverse();
+
+    // Download current accumulator state to CPU.
+    let cpu_accum;
+    {
+        let _span = span!(Level::INFO, "GPU→CPU accum download").entered();
+        cpu_accum = accum.col.to_cpu();
+    }
+
+    // Phase 3: Run point-wise constraint evaluation on CPU.
+    let cpu_result;
+    {
+        let _span = span!(
+            Level::INFO,
+            "Constraint eval (CPU serial)",
+            log_eval_size = eval_domain.log_size(),
+            log_trace_size = trace_domain.log_size(),
+            n_constraints = n_constraints,
+        )
+        .entered();
+        cpu_result = accumulate_pointwise_cpu(
+            component,
             cpu_trace_refs,
             eval_domain.log_size(),
             trace_domain.log_size(),
@@ -217,7 +253,11 @@ impl<'a, E: FrameworkEval + Sync> ComponentProver<CudaBackend> for CudaFramework
             &accum.random_coeff_powers,
             &cpu_accum,
         );
+    }
 
+    // Phase 4: Upload result back to GPU.
+    {
+        let _span = span!(Level::INFO, "CPU→GPU result upload").entered();
         *accum.col = SecureColumnByCoords {
             columns: std::array::from_fn(|i| {
                 cpu_result.columns[i].iter().copied().collect()
@@ -226,90 +266,23 @@ impl<'a, E: FrameworkEval + Sync> ComponentProver<CudaBackend> for CudaFramework
     }
 }
 
-impl<E: FrameworkEval + Sync> ComponentProver<CudaBackend> for CudaFrameworkComponent<E> {
-    /// Evaluates constraint quotients by downloading GPU trace data to CPU,
-    /// running point-wise constraint evaluation, and uploading results back.
+impl<'a, E: FrameworkEval + Sync> ComponentProver<CudaBackend> for CudaFrameworkComponentRef<'a, E> {
     fn evaluate_constraint_quotients_on_domain(
         &self,
         trace: &Trace<'_, CudaBackend>,
         evaluation_accumulator: &mut DomainEvaluationAccumulator<CudaBackend>,
     ) {
-        let n_constraints = self.n_constraints();
-        if n_constraints == 0 {
-            return;
-        }
+        evaluate_constraint_quotients_impl(self.0, trace, evaluation_accumulator);
+    }
+}
 
-        if self.is_disabled() {
-            evaluation_accumulator.skip_coeffs(n_constraints);
-            return;
-        }
-
-        let eval_domain =
-            CanonicCoset::new(self.max_constraint_log_degree_bound()).circle_domain();
-        let trace_domain = CanonicCoset::new(self.log_size());
-
-        // Extract this component's polynomial columns from the full trace.
-        let mut component_polys = trace.polys.sub_tree(self.trace_locations());
-        component_polys[PREPROCESSED_TRACE_IDX] = self
-            .preprocessed_column_indices()
-            .iter()
-            .map(|idx| &trace.polys[PREPROCESSED_TRACE_IDX][*idx])
-            .collect();
-
-        // Get trace evaluations on the eval domain (GPU-resident).
-        let gpu_trace_evals = get_constraint_quotients_inputs_cuda(
-            eval_domain,
-            component_polys,
-            evaluation_accumulator.evaluation_mode(),
-        );
-
-        // Download all GPU trace evaluations to CPU.
-        let cpu_trace_evals: TreeVec<Vec<CircleEvaluation<CpuBackend, BaseField, BitReversedOrder>>> =
-            gpu_trace_evals.map_cols(|gpu_eval| {
-                let cpu_values = gpu_eval.values.to_cpu();
-                CircleEvaluation::new(gpu_eval.domain, cpu_values)
-            });
-        let cpu_trace_refs = cpu_trace_evals.as_cols_ref();
-
-        // Denom inverses (CPU computation, small).
-        let log_expand = eval_domain.log_size() - trace_domain.log_size();
-        let mut denom_inv = (0..1 << log_expand)
-            .map(|i| coset_vanishing(trace_domain.coset(), eval_domain.at(i)).inverse())
-            .collect_vec();
-        bit_reverse(&mut denom_inv);
-
-        // Get accumulator column (GPU-resident).
-        let [mut accum] =
-            evaluation_accumulator.columns([(eval_domain.log_size(), n_constraints)]);
-        accum.random_coeff_powers.reverse();
-
-        let _span = span!(
-            Level::INFO,
-            "CUDA Constraint point-wise eval (CPU fallback)",
-            class = "ConstraintEval"
-        )
-        .entered();
-
-        // Download current accumulator state to CPU.
-        let cpu_accum = accum.col.to_cpu();
-
-        // Run point-wise constraint evaluation on CPU.
-        let cpu_result = accumulate_pointwise_cpu(
-            &self.0,
-            cpu_trace_refs,
-            eval_domain.log_size(),
-            trace_domain.log_size(),
-            denom_inv,
-            &accum.random_coeff_powers,
-            &cpu_accum,
-        );
-
-        // Upload result back to GPU.
-        *accum.col = SecureColumnByCoords {
-            columns: std::array::from_fn(|i| {
-                cpu_result.columns[i].iter().copied().collect()
-            }),
-        };
+impl<E: FrameworkEval + Sync> ComponentProver<CudaBackend> for CudaFrameworkComponent<E> {
+    fn evaluate_constraint_quotients_on_domain(
+        &self,
+        trace: &Trace<'_, CudaBackend>,
+        evaluation_accumulator: &mut DomainEvaluationAccumulator<CudaBackend>,
+    ) {
+        evaluate_constraint_quotients_impl(&self.0, trace, evaluation_accumulator);
     }
 }
 
