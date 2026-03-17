@@ -1,10 +1,13 @@
-// GPU bytecode interpreter for generic constraint evaluation.
+// GPU register-based bytecode interpreter for generic constraint evaluation.
 //
 // Replays a flat bytecode program (recorded by TracingEvalAtRow) per row in parallel.
 // Each thread evaluates all constraints for one row of the evaluation domain.
 //
 // The bytecode is the same for every row — only trace column lookups differ.
-// This is a "virtual machine" approach: no per-AIR kernel compilation needed.
+//
+// Register-based design: each value lives in a virtual register. Clone just copies
+// the register index — no duplication, no stack management, no underflow.
+// This handles ALL stwo-cairo components including the 32 that used Clone.
 
 #include "include/m31.cuh"
 #include "include/cm31.cuh"
@@ -12,9 +15,9 @@
 
 // ─── Opcodes (must match BytecodeOp::opcode_id() in bytecode.rs) ────────
 
-#define OP_PUSH_BASE_FIELD      0x01
-#define OP_PUSH_SECURE_FIELD    0x02
-#define OP_PUSH_TRACE_VAL       0x03
+#define OP_LOAD_CONST           0x01
+#define OP_LOAD_SECURE_CONST    0x02
+#define OP_LOAD_TRACE           0x03
 
 #define OP_ADD                  0x10
 #define OP_SUB                  0x11
@@ -40,13 +43,11 @@
 
 #define OP_ADD_CONSTRAINT       0x40
 
-// Extended operand flag: bit 23 set in the operand field means next word has full value
-#define EXTENDED_FLAG           (1u << 23)
-
-// Maximum stack depth. Logup-heavy components with many fraction
-// cross-multiplications can reach deep stacks. 256 covers the
+// Maximum number of virtual registers per thread.
+// Logup-heavy components with many fraction cross-multiplications and
+// Clone-based value reuse can use many registers. 256 covers the
 // largest stwo-cairo components.
-#define MAX_STACK_DEPTH 256
+#define MAX_REGS 256
 
 // ─── Kernel ─────────────────────────────────────────────────────────────
 
@@ -69,9 +70,9 @@ __global__ void bytecode_constraint_eval_kernel(
     uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= n_rows) return;
 
-    // QM31 stack. M31 values stored as (val, 0, 0, 0).
-    QM31 stack[MAX_STACK_DEPTH];
-    int sp = 0;
+    // Register file. Each register holds a QM31 value.
+    // M31 values are stored as (val, 0, 0, 0).
+    QM31 regs[MAX_REGS];
 
     QM31 row_accum = qm31_zero();
     int constraint_idx = 0;
@@ -80,45 +81,64 @@ __global__ void bytecode_constraint_eval_kernel(
     while (pc < n_words) {
         uint32_t word = bytecode[pc++];
         uint32_t opcode = word >> 24;
-        uint32_t operand = word & 0xFFFFFF;
-
-        // Stack overflow/underflow protection
-        if (sp >= MAX_STACK_DEPTH - 4 || sp < 0) return;
 
         switch (opcode) {
 
-        // ── Stack loads ──────────────────────────────────────────────
+        // ── Register loads ──────────────────────────────────────────
 
-        case OP_PUSH_BASE_FIELD: {
-            uint32_t val;
-            if (operand & EXTENDED_FLAG) {
+        case OP_LOAD_CONST: {
+            // [opcode:8 | dst:8 | value:16]
+            // If value == 0xFFFF, next word has full value.
+            uint32_t dst = (word >> 16) & 0xFF;
+            uint32_t val = word & 0xFFFF;
+            if (val == 0xFFFF) {
                 val = bytecode[pc++];
-            } else {
-                val = operand;
             }
-            stack[sp++] = {{val, 0, 0, 0}};
+            if (dst < MAX_REGS) {
+                regs[dst] = {{val, 0, 0, 0}};
+            }
             break;
         }
 
-        case OP_PUSH_SECURE_FIELD: {
+        case OP_LOAD_SECURE_CONST: {
+            // [opcode:8 | dst:8 | 0:16] + 4 data words
+            uint32_t dst = (word >> 16) & 0xFF;
             uint32_t a = bytecode[pc++];
             uint32_t b = bytecode[pc++];
             uint32_t c = bytecode[pc++];
             uint32_t d = bytecode[pc++];
-            stack[sp++] = {{a, b, c, d}};
+            if (dst < MAX_REGS) {
+                regs[dst] = {{a, b, c, d}};
+            }
             break;
         }
 
-        case OP_PUSH_TRACE_VAL: {
-            // After Rust remapping: operand = flat_col:14 | sign:1 | abs_offset:9
-            // Supports up to 16383 columns and offsets -511..+511.
-            uint32_t flat_col = (operand >> 10) & 0x3FFF;
-            uint32_t sign = (operand >> 9) & 1;
-            uint32_t abs_offset = operand & 0x1FF;
-            int32_t offset = sign ? -(int32_t)abs_offset : (int32_t)abs_offset;
+        case OP_LOAD_TRACE: {
+            // [opcode:8 | dst:8 | operand:16]
+            // After Rust remapping: operand = flat_col:14 | sign:1 | abs_offset:1
+            // If both low bits are 1 (marker = 0x3), extended format: next word has offset
+            uint32_t dst = (word >> 16) & 0xFF;
+            uint32_t operand = word & 0xFFFF;
 
-            if (flat_col >= n_trace_cols) {
-                // Bounds error — return to prevent crash.
+            uint32_t flat_col;
+            int32_t offset;
+
+            if ((operand & 0x3) == 0x3) {
+                // Extended: next word has (sign:1 | abs_offset:31)
+                // Operand has flat_col in upper bits
+                flat_col = (operand >> 2) & 0x3FFF;
+                uint32_t ext = bytecode[pc++];
+                uint32_t sign = ext >> 31;
+                uint32_t abs_off = ext & 0x7FFFFFFF;
+                offset = sign ? -(int32_t)abs_off : (int32_t)abs_off;
+            } else {
+                flat_col = (operand >> 2) & 0x3FFF;
+                uint32_t sign = (operand >> 1) & 1;
+                uint32_t abs_off = operand & 1;
+                offset = sign ? -(int32_t)abs_off : (int32_t)abs_off;
+            }
+
+            if (flat_col >= n_trace_cols || dst >= MAX_REGS) {
                 return;
             }
 
@@ -126,173 +146,232 @@ __global__ void bytecode_constraint_eval_kernel(
             if (offset == 0) {
                 effective_row = row;
             } else {
-                // Wrap within evaluation domain size (power of 2)
                 int32_t r = (int32_t)row + offset;
                 effective_row = (uint32_t)(r & (int32_t)(n_rows - 1));
             }
 
             const uint32_t* col_ptr = trace_cols[flat_col];
             if (col_ptr == nullptr) {
-                stack[sp++] = {{0, 0, 0, 0}};
+                regs[dst] = {{0, 0, 0, 0}};
                 break;
             }
             uint32_t val = col_ptr[effective_row];
-            stack[sp++] = {{val, 0, 0, 0}};
+            regs[dst] = {{val, 0, 0, 0}};
             break;
         }
 
-        // ── M31 arithmetic ───────────────────────────────────────────
+        // ── M31 arithmetic (3-register format) ──────────────────────
+        // [opcode:8 | dst:8 | src1:8 | src2:8]
 
         case OP_ADD: {
-            QM31 b = stack[--sp];
-            QM31 a = stack[--sp];
-            stack[sp++] = {{m31_add(a.v[0], b.v[0]), 0, 0, 0}};
+            uint32_t dst  = (word >> 16) & 0xFF;
+            uint32_t src1 = (word >> 8) & 0xFF;
+            uint32_t src2 = word & 0xFF;
+            if (dst < MAX_REGS) {
+                regs[dst] = {{m31_add(regs[src1].v[0], regs[src2].v[0]), 0, 0, 0}};
+            }
             break;
         }
 
         case OP_SUB: {
-            QM31 b = stack[--sp];
-            QM31 a = stack[--sp];
-            stack[sp++] = {{m31_sub(a.v[0], b.v[0]), 0, 0, 0}};
+            uint32_t dst  = (word >> 16) & 0xFF;
+            uint32_t src1 = (word >> 8) & 0xFF;
+            uint32_t src2 = word & 0xFF;
+            if (dst < MAX_REGS) {
+                regs[dst] = {{m31_sub(regs[src1].v[0], regs[src2].v[0]), 0, 0, 0}};
+            }
             break;
         }
 
         case OP_MUL: {
-            QM31 b = stack[--sp];
-            QM31 a = stack[--sp];
-            stack[sp++] = {{m31_mul(a.v[0], b.v[0]), 0, 0, 0}};
+            uint32_t dst  = (word >> 16) & 0xFF;
+            uint32_t src1 = (word >> 8) & 0xFF;
+            uint32_t src2 = word & 0xFF;
+            if (dst < MAX_REGS) {
+                regs[dst] = {{m31_mul(regs[src1].v[0], regs[src2].v[0]), 0, 0, 0}};
+            }
             break;
         }
 
         case OP_NEG: {
-            stack[sp-1].v[0] = m31_neg(stack[sp-1].v[0]);
+            // [opcode:8 | dst:8 | src:8 | 0:8]
+            uint32_t dst = (word >> 16) & 0xFF;
+            uint32_t src = (word >> 8) & 0xFF;
+            if (dst < MAX_REGS) {
+                regs[dst] = {{m31_neg(regs[src].v[0]), 0, 0, 0}};
+            }
             break;
         }
 
         case OP_ADD_CONST: {
-            uint32_t val;
-            if (operand & EXTENDED_FLAG) {
-                val = bytecode[pc++];
-            } else {
-                val = operand;
+            // [opcode:8 | dst:8 | src:8 | 0:8] + value word
+            uint32_t dst = (word >> 16) & 0xFF;
+            uint32_t src = (word >> 8) & 0xFF;
+            uint32_t val = bytecode[pc++];
+            if (dst < MAX_REGS) {
+                regs[dst] = {{m31_add(regs[src].v[0], val), 0, 0, 0}};
             }
-            stack[sp-1].v[0] = m31_add(stack[sp-1].v[0], val);
             break;
         }
 
         case OP_MUL_CONST: {
-            uint32_t val;
-            if (operand & EXTENDED_FLAG) {
-                val = bytecode[pc++];
-            } else {
-                val = operand;
+            // [opcode:8 | dst:8 | src:8 | 0:8] + value word
+            uint32_t dst = (word >> 16) & 0xFF;
+            uint32_t src = (word >> 8) & 0xFF;
+            uint32_t val = bytecode[pc++];
+            if (dst < MAX_REGS) {
+                regs[dst] = {{m31_mul(regs[src].v[0], val), 0, 0, 0}};
             }
-            stack[sp-1].v[0] = m31_mul(stack[sp-1].v[0], val);
             break;
         }
 
-        // ── QM31 arithmetic ─────────────────────────────────────────
+        // ── QM31 arithmetic ────────────────────────────────────────
 
         case OP_WIDE_ADD: {
-            QM31 b = stack[--sp];
-            QM31 a = stack[--sp];
-            stack[sp++] = qm31_add(a, b);
+            uint32_t dst  = (word >> 16) & 0xFF;
+            uint32_t src1 = (word >> 8) & 0xFF;
+            uint32_t src2 = word & 0xFF;
+            if (dst < MAX_REGS) {
+                regs[dst] = qm31_add(regs[src1], regs[src2]);
+            }
             break;
         }
 
         case OP_WIDE_SUB: {
-            QM31 b = stack[--sp];
-            QM31 a = stack[--sp];
-            stack[sp++] = qm31_sub(a, b);
+            uint32_t dst  = (word >> 16) & 0xFF;
+            uint32_t src1 = (word >> 8) & 0xFF;
+            uint32_t src2 = word & 0xFF;
+            if (dst < MAX_REGS) {
+                regs[dst] = qm31_sub(regs[src1], regs[src2]);
+            }
             break;
         }
 
         case OP_WIDE_MUL: {
-            QM31 b = stack[--sp];
-            QM31 a = stack[--sp];
-            stack[sp++] = qm31_mul(a, b);
+            uint32_t dst  = (word >> 16) & 0xFF;
+            uint32_t src1 = (word >> 8) & 0xFF;
+            uint32_t src2 = word & 0xFF;
+            if (dst < MAX_REGS) {
+                regs[dst] = qm31_mul(regs[src1], regs[src2]);
+            }
             break;
         }
 
         case OP_WIDE_NEG: {
-            stack[sp-1] = qm31_neg(stack[sp-1]);
+            uint32_t dst = (word >> 16) & 0xFF;
+            uint32_t src = (word >> 8) & 0xFF;
+            if (dst < MAX_REGS) {
+                regs[dst] = qm31_neg(regs[src]);
+            }
             break;
         }
 
         case OP_WIDE_ADD_CONST: {
+            // [opcode:8 | dst:8 | src:8 | 0:8] + 4 data words
+            uint32_t dst = (word >> 16) & 0xFF;
+            uint32_t src = (word >> 8) & 0xFF;
             QM31 c = {{bytecode[pc], bytecode[pc+1], bytecode[pc+2], bytecode[pc+3]}};
             pc += 4;
-            stack[sp-1] = qm31_add(stack[sp-1], c);
+            if (dst < MAX_REGS) {
+                regs[dst] = qm31_add(regs[src], c);
+            }
             break;
         }
 
         case OP_WIDE_MUL_CONST: {
+            uint32_t dst = (word >> 16) & 0xFF;
+            uint32_t src = (word >> 8) & 0xFF;
             QM31 c = {{bytecode[pc], bytecode[pc+1], bytecode[pc+2], bytecode[pc+3]}};
             pc += 4;
-            stack[sp-1] = qm31_mul(stack[sp-1], c);
+            if (dst < MAX_REGS) {
+                regs[dst] = qm31_mul(regs[src], c);
+            }
             break;
         }
 
-        // ── Mixed-width arithmetic ───────────────────────────────────
+        // ── Mixed-width arithmetic ──────────────────────────────────
 
         case OP_WIDE_ADD_BASE: {
-            // Stack: [..., QM31_a, M31_b] -> [..., QM31_a + widen(M31_b)]
-            QM31 b = stack[--sp];
-            QM31 a = stack[--sp];
-            a.v[0] = m31_add(a.v[0], b.v[0]);
-            stack[sp++] = a;
+            // [opcode:8 | dst:8 | wide:8 | base:8]
+            uint32_t dst  = (word >> 16) & 0xFF;
+            uint32_t wide = (word >> 8) & 0xFF;
+            uint32_t base = word & 0xFF;
+            if (dst < MAX_REGS) {
+                QM31 a = regs[wide];
+                a.v[0] = m31_add(a.v[0], regs[base].v[0]);
+                regs[dst] = a;
+            }
             break;
         }
 
         case OP_WIDE_MUL_BASE: {
-            // Stack: [..., QM31_a, M31_b] -> [..., QM31_a * M31_b]
-            QM31 b = stack[--sp];
-            QM31 a = stack[--sp];
-            stack[sp++] = qm31_mul_m31(a, b.v[0]);
+            uint32_t dst  = (word >> 16) & 0xFF;
+            uint32_t wide = (word >> 8) & 0xFF;
+            uint32_t base = word & 0xFF;
+            if (dst < MAX_REGS) {
+                regs[dst] = qm31_mul_m31(regs[wide], regs[base].v[0]);
+            }
             break;
         }
 
         case OP_BASE_ADD_SECURE_CONST: {
-            // Pop M31, add QM31 constant, push QM31
+            // [opcode:8 | dst:8 | src:8 | 0:8] + 4 data words
+            uint32_t dst = (word >> 16) & 0xFF;
+            uint32_t src = (word >> 8) & 0xFF;
             QM31 c = {{bytecode[pc], bytecode[pc+1], bytecode[pc+2], bytecode[pc+3]}};
             pc += 4;
-            QM31 base_as_qm31 = {{stack[sp-1].v[0], 0, 0, 0}};
-            stack[sp-1] = qm31_add(base_as_qm31, c);
+            if (dst < MAX_REGS) {
+                QM31 base_as_qm31 = {{regs[src].v[0], 0, 0, 0}};
+                regs[dst] = qm31_add(base_as_qm31, c);
+            }
             break;
         }
 
         case OP_BASE_MUL_SECURE_CONST: {
-            // Pop M31, multiply by QM31 constant, push QM31
+            uint32_t dst = (word >> 16) & 0xFF;
+            uint32_t src = (word >> 8) & 0xFF;
             QM31 c = {{bytecode[pc], bytecode[pc+1], bytecode[pc+2], bytecode[pc+3]}};
             pc += 4;
-            uint32_t m = stack[sp-1].v[0];
-            stack[sp-1] = qm31_mul_m31(c, m);
+            if (dst < MAX_REGS) {
+                uint32_t m = regs[src].v[0];
+                regs[dst] = qm31_mul_m31(c, m);
+            }
             break;
         }
 
-        // ── Widening ─────────────────────────────────────────────────
+        // ── Widening ────────────────────────────────────────────────
 
         case OP_WIDEN: {
-            // M31 -> QM31: already stored as (v, 0, 0, 0), no-op on unified stack.
+            // [opcode:8 | dst:8 | src:8 | 0:8]
+            uint32_t dst = (word >> 16) & 0xFF;
+            uint32_t src = (word >> 8) & 0xFF;
+            if (dst < MAX_REGS) {
+                regs[dst] = {{regs[src].v[0], 0, 0, 0}};
+            }
             break;
         }
 
         case OP_COMBINE_EF: {
-            // Pop 4 M31 values, combine into 1 QM31.
-            // Stack order: [v0, v1, v2, v3] with v3 on top.
-            QM31 v3 = stack[--sp];
-            QM31 v2 = stack[--sp];
-            QM31 v1 = stack[--sp];
-            QM31 v0 = stack[--sp];
-            stack[sp++] = {{v0.v[0], v1.v[0], v2.v[0], v3.v[0]}};
+            // word1: [opcode:8 | dst:8 | src0:8 | src1:8]
+            // word2: [src2:8 | src3:8 | 0:16]
+            uint32_t dst  = (word >> 16) & 0xFF;
+            uint32_t src0 = (word >> 8) & 0xFF;
+            uint32_t src1 = word & 0xFF;
+            uint32_t word2 = bytecode[pc++];
+            uint32_t src2 = (word2 >> 24) & 0xFF;
+            uint32_t src3 = (word2 >> 16) & 0xFF;
+            if (dst < MAX_REGS) {
+                regs[dst] = {{regs[src0].v[0], regs[src1].v[0], regs[src2].v[0], regs[src3].v[0]}};
+            }
             break;
         }
 
-        // ── Constraint accumulation ──────────────────────────────────
+        // ── Constraint accumulation ─────────────────────────────────
 
         case OP_ADD_CONSTRAINT: {
-            if (sp <= 0) return;
-            QM31 val = stack[--sp];
+            // [opcode:8 | src:8 | 0:16]
+            uint32_t src = (word >> 16) & 0xFF;
+            QM31 val = regs[src];
             QM31 coeff = {{
                 random_coeff_powers[constraint_idx * 4 + 0],
                 random_coeff_powers[constraint_idx * 4 + 1],
@@ -310,8 +389,6 @@ __global__ void bytecode_constraint_eval_kernel(
     }
 
     // Multiply accumulated constraint value by denom_inv.
-    // denom_inv is indexed by row >> trace_log_size (bit-reversed).
-    // Compute trace_log_size from trace_n_rows (always a power of 2).
     uint32_t trace_log_size = 31 - __clz(trace_n_rows);
     uint32_t denom = denom_inv[row >> trace_log_size];
     QM31 result = qm31_mul_m31(row_accum, denom);

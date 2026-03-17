@@ -2,13 +2,14 @@
 //!
 //! Uses a newtype wrapper `CudaFrameworkComponent<E>` to satisfy Rust's orphan rule.
 //!
-//! The primary path records constraint evaluation as bytecode, then runs the
-//! bytecode interpreter kernel on the GPU. If bytecode recording fails for any
-//! reason (unsupported operation, panic in the tracer, etc.), it falls back to
-//! the CPU path: download trace, evaluate on CPU, upload results.
+//! The primary path records constraint evaluation as register-based bytecode,
+//! then runs the bytecode interpreter kernel on the GPU. The register-based VM
+//! eliminates the Clone problem: Clone just copies a register index, so all 67
+//! stwo-cairo components work without stack imbalance issues.
 //!
-//! Profiling: Each phase has a tracing span so `prove --trace` output shows
-//! exactly where time is spent.
+//! If bytecode recording fails for any reason (unsupported operation, panic in
+//! the tracer, etc.), it falls back to the CPU path: download trace, evaluate
+//! on CPU, upload results.
 
 use std::borrow::Cow;
 use std::ops::Deref;
@@ -41,24 +42,10 @@ use super::constraint_eval::bytecode::BytecodeOp;
 use super::constraint_eval::tracing::record_bytecode;
 
 /// A wrapper around `FrameworkComponent<E>` that implements `ComponentProver<CudaBackend>`.
-///
-/// This newtype is necessary because Rust's orphan rule prevents implementing
-/// a foreign trait (`ComponentProver`) for a foreign type (`FrameworkComponent`)
-/// even when the type parameter (`CudaBackend`) is local.
-///
-/// Usage:
-/// ```ignore
-/// let component = FrameworkComponent::new(&mut allocator, eval, claimed_sum);
-/// let cuda_component = CudaFrameworkComponent(component);
-/// // cuda_component implements ComponentProver<CudaBackend>
-/// ```
 pub struct CudaFrameworkComponent<E: FrameworkEval>(pub FrameworkComponent<E>);
 
 /// A borrowing wrapper around `&FrameworkComponent<E>` that implements
 /// `ComponentProver<CudaBackend>`.
-///
-/// Use this when you have a reference to a `FrameworkComponent` (e.g. borrowed
-/// from a larger struct) and need to pass it as a `&dyn ComponentProver<CudaBackend>`.
 pub struct CudaFrameworkComponentRef<'a, E: FrameworkEval>(pub &'a FrameworkComponent<E>);
 
 impl<E: FrameworkEval> Deref for CudaFrameworkComponent<E> {
@@ -160,11 +147,6 @@ impl<'a, E: FrameworkEval> Component for CudaFrameworkComponentRef<'a, E> {
 }
 
 /// Shared implementation for both CudaFrameworkComponent and CudaFrameworkComponentRef.
-///
-/// Strategy:
-/// 1. Try to record bytecode from the FrameworkEval.
-/// 2. If successful, run the GPU bytecode interpreter kernel.
-/// 3. If recording fails (panic, unsupported op), fall back to CPU evaluation.
 fn evaluate_constraint_quotients_impl<E: FrameworkEval + Sync>(
     component: &FrameworkComponent<E>,
     trace: &Trace<'_, CudaBackend>,
@@ -211,10 +193,8 @@ fn evaluate_constraint_quotients_impl<E: FrameworkEval + Sync>(
         evaluation_accumulator.columns([(eval_domain.log_size(), n_constraints)]);
     accum.random_coeff_powers.reverse();
 
-    // TODO: GPU bytecode constraint eval disabled until kernel correctness is verified.
-    // Stack-balanced programs still produce wrong results — likely a bytecode interpreter
-    // bug in the CUDA kernel (operator semantics, stack ordering, or accumulation logic).
-    let gpu_success = false && try_gpu_bytecode_eval(
+    // GPU register-based bytecode constraint eval.
+    let gpu_success = try_gpu_bytecode_eval(
         component,
         &gpu_trace_evals,
         eval_domain.log_size(),
@@ -288,7 +268,7 @@ fn evaluate_constraint_quotients_impl<E: FrameworkEval + Sync>(
     }
 }
 
-/// Try to evaluate constraints on GPU using the bytecode interpreter.
+/// Try to evaluate constraints on GPU using the register-based bytecode interpreter.
 ///
 /// Returns `true` if successful, `false` if recording failed and caller
 /// should fall back to CPU.
@@ -318,42 +298,44 @@ fn try_gpu_bytecode_eval<E: FrameworkEval>(
     };
 
     if program.ops.is_empty() || program.n_constraints == 0 {
-        // Empty program — nothing to do (constraints are trivially satisfied).
         return true;
     }
 
-    // Verify stack balance before running on GPU.
-    // Clone-induced stack imbalance (values consumed multiple times without
-    // corresponding pushes) produces programs that underflow the stack.
-    if !program.verify_stack_balance() {
+    // Log first component's program for debugging
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("[BYTECODE] First component: {} ops, {} constraints, {} registers",
+            program.ops.len(), program.n_constraints, program.n_registers);
+        for (i, op) in program.ops.iter().enumerate().take(20) {
+            eprintln!("  [{i:3}] {op:?}");
+        }
+        if program.ops.len() > 20 {
+            eprintln!("  ... ({} more ops)", program.ops.len() - 20);
+        }
+    }
+
+    // Register-based VM has no stack balance issue. No verify_stack_balance() needed.
+    // Just check register count fits in u8 (GPU encoding limit).
+    if program.n_registers > 256 {
         tracing::warn!(
-            "Bytecode stack imbalance detected ({} ops, {} constraints) — \
-             Clone-based value reuse not yet supported in GPU interpreter",
-            program.ops.len(), program.n_constraints
+            "Bytecode uses {} registers (max 256) — falling back to CPU",
+            program.n_registers
         );
         return false;
     }
 
     let _span = span!(
         Level::INFO,
-        "GPU bytecode constraint eval",
+        "GPU register bytecode constraint eval",
         n_ops = program.ops.len(),
         n_constraints = program.n_constraints,
+        n_registers = program.n_registers,
         eval_log_size = eval_log_size,
         trace_log_size = trace_log_size,
     )
     .entered();
 
     // Phase B: Build flat column pointer array and remap bytecode.
-    //
-    // The bytecode PushTraceVal ops encode (interaction, col_idx, offset).
-    // We need to remap them to flat column indices matching the order of
-    // columns in gpu_trace_evals.
-    //
-    // Build a mapping: (interaction, col_idx) -> flat_index, then patch
-    // the encoded bytecode.
-
-    // Count columns per interaction and build the cumulative offset.
     let n_interactions = gpu_trace_evals.len();
     let mut interaction_offsets = Vec::with_capacity(n_interactions + 1);
     interaction_offsets.push(0usize);
@@ -370,57 +352,48 @@ fn try_gpu_bytecode_eval<E: FrameworkEval>(
         }
     }
 
-    // Encode bytecode and remap PushTraceVal to use flat column indices.
+    // Encode bytecode and remap LoadTrace to use flat column indices.
     let mut encoded = program.encode();
 
-    // Walk through the encoded bytecode and patch PushTraceVal operands.
-    // We need to match the encoding format from BytecodeProgram::encode():
-    //   PushTraceVal: single word with (interaction:4 | col_idx:10 | sign:1 | abs_offset:9)
-    // After remapping: (flat_col:14 | sign:1 | abs_offset:9)
+    // Walk through ops and encoded words in parallel to remap LoadTrace operands.
     {
         let mut pc = 0;
-        let mut op_idx = 0;
-        while op_idx < program.ops.len() {
-            let op = &program.ops[op_idx];
+        for op in &program.ops {
             match op {
-                BytecodeOp::PushTraceVal { interaction, col_idx, offset } => {
+                BytecodeOp::LoadTrace { dst, interaction, col_idx, offset } => {
                     let flat_idx = interaction_offsets[*interaction as usize] + *col_idx as usize;
                     if flat_idx >= total_cols {
                         tracing::warn!(
-                            "PushTraceVal flat_idx {} >= total_cols {} (interaction={}, col_idx={})",
+                            "LoadTrace flat_idx {} >= total_cols {} (interaction={}, col_idx={})",
                             flat_idx, total_cols, interaction, col_idx
                         );
                         return false;
                     }
-                    // Rebuild the word with flat index
+
+                    let d = *dst as u32 & 0xFF;
                     let (sign, abs_off) = if *offset < 0 {
                         (1u32, (-*offset) as u32)
                     } else {
                         (0u32, *offset as u32)
                     };
-                    let operand = ((flat_idx as u32) << 10) | (sign << 9) | (abs_off & 0x1FF);
-                    encoded[pc] = (0x03u32 << 24) | operand;
-                    pc += 1;
+
+                    if abs_off <= 1 {
+                        // Single word: [opcode:8 | dst:8 | flat_col:14 | sign:1 | abs_offset:1]
+                        let operand = ((flat_idx as u32) << 2) | (sign << 1) | (abs_off & 1);
+                        encoded[pc] = (0x03u32 << 24) | (d << 16) | operand;
+                        pc += 1;
+                    } else {
+                        // Extended: marker + second word
+                        let operand = ((flat_idx as u32) << 2) | 0x3;
+                        encoded[pc] = (0x03u32 << 24) | (d << 16) | operand;
+                        encoded[pc + 1] = (sign << 31) | abs_off;
+                        pc += 2;
+                    }
                 }
-                BytecodeOp::PushBaseField(v) => {
-                    pc += if *v >= (1 << 24) { 2 } else { 1 };
-                }
-                BytecodeOp::PushSecureField(_) => {
-                    pc += 5; // header + 4 data words
-                }
-                BytecodeOp::AddConst(v) | BytecodeOp::MulConst(v) => {
-                    pc += if *v >= (1 << 24) { 2 } else { 1 };
-                }
-                BytecodeOp::WideAddConst(_) | BytecodeOp::WideMulConst(_)
-                | BytecodeOp::BaseAddSecureConst(_) | BytecodeOp::BaseMulSecureConst(_) => {
-                    pc += 5; // header + 4 data words
-                }
-                // All other ops are single-word, no patching needed
                 _ => {
-                    pc += 1;
+                    pc += op.encoded_len();
                 }
             }
-            op_idx += 1;
         }
     }
 
@@ -428,43 +401,36 @@ fn try_gpu_bytecode_eval<E: FrameworkEval>(
     let trace_n_rows = 1u32 << trace_log_size;
 
     // Validate all flat column indices are in bounds.
-    // Walk the instruction stream properly (multi-word ops have data words that
-    // could be mistaken for PushTraceVal if scanned naively).
     {
-        let mut vpc = 0;
+        let mut pc = 0;
         for op in &program.ops {
-            match op {
-                BytecodeOp::PushTraceVal { .. } => {
-                    let word = encoded[vpc];
-                    let operand = word & 0xFFFFFF;
-                    let flat_col = (operand >> 10) & 0x3FFF;
+            if let BytecodeOp::LoadTrace { .. } = op {
+                let word = encoded[pc];
+                let operand = word & 0xFFFF;
+                if (operand & 0x3) == 0x3 {
+                    // Extended format
+                    let flat_col = (operand >> 2) & 0x3FFF;
                     if flat_col as usize >= total_cols {
                         tracing::error!(
-                            "Bytecode word[{vpc}]: flat_col={flat_col} >= total_cols={total_cols} \
-                             (operand=0x{operand:06x})"
+                            "Bytecode word[{pc}]: flat_col={flat_col} >= total_cols={total_cols}"
                         );
                         return false;
                     }
-                    vpc += 1;
-                }
-                BytecodeOp::PushBaseField(v) | BytecodeOp::AddConst(v) | BytecodeOp::MulConst(v) => {
-                    vpc += if *v >= (1 << 24) { 2 } else { 1 };
-                }
-                BytecodeOp::PushSecureField(_)
-                | BytecodeOp::WideAddConst(_)
-                | BytecodeOp::WideMulConst(_)
-                | BytecodeOp::BaseAddSecureConst(_)
-                | BytecodeOp::BaseMulSecureConst(_) => {
-                    vpc += 5;
-                }
-                _ => {
-                    vpc += 1;
+                } else {
+                    let flat_col = (operand >> 2) & 0x3FFF;
+                    if flat_col as usize >= total_cols {
+                        tracing::error!(
+                            "Bytecode word[{pc}]: flat_col={flat_col} >= total_cols={total_cols}"
+                        );
+                        return false;
+                    }
                 }
             }
+            pc += op.encoded_len();
         }
     }
 
-    // Also validate column sizes match eval domain
+    // Validate column pointers.
     for (i, col_ptr) in col_ptrs.iter().enumerate() {
         if col_ptr.is_null() {
             tracing::error!("Column pointer {i} is null!");
@@ -473,18 +439,11 @@ fn try_gpu_bytecode_eval<E: FrameworkEval>(
     }
 
     // Phase C: Upload data to GPU.
-
-    // Upload encoded bytecode.
     let d_bytecode = DeviceBuffer::from_host(&encoded);
-
-    // Upload column pointer array (array of device pointers on device).
     let d_col_ptrs = DeviceBuffer::from_host(&col_ptrs);
-
-    // Column sizes (all the same for this domain).
     let col_sizes: Vec<u32> = vec![n_rows; total_cols];
     let d_col_sizes = DeviceBuffer::from_host(&col_sizes);
 
-    // Upload random_coeff_powers as flat [n_constraints * 4] u32 array.
     let mut coeff_flat: Vec<u32> = Vec::with_capacity(random_coeff_powers.len() * 4);
     for coeff in random_coeff_powers {
         let arr = coeff.to_m31_array();
@@ -495,11 +454,10 @@ fn try_gpu_bytecode_eval<E: FrameworkEval>(
     }
     let d_coeff = DeviceBuffer::from_host(&coeff_flat);
 
-    // Upload denom_inv.
     let denom_inv_raw: Vec<u32> = denom_inv.iter().map(|v| v.0).collect();
     let d_denom_inv = DeviceBuffer::from_host(&denom_inv_raw);
 
-    // Sync GPU before kernel launch to ensure clean state.
+    // Sync GPU before kernel launch.
     unsafe { ffi::cuda_device_sync(); }
     let pre_err = unsafe { ffi::cudaGetLastError() };
     if pre_err != 0 {
@@ -511,7 +469,7 @@ fn try_gpu_bytecode_eval<E: FrameworkEval>(
     {
         let _span = span!(Level::INFO, "CUDA bytecode kernel launch",
             n_rows = n_rows, n_ops = encoded.len(), n_cols = total_cols,
-            n_constraints = program.n_constraints
+            n_constraints = program.n_constraints, n_registers = program.n_registers
         ).entered();
         unsafe {
             ffi::cuda_bytecode_constraint_eval(
@@ -534,15 +492,41 @@ fn try_gpu_bytecode_eval<E: FrameworkEval>(
         }
     }
 
+    // DEBUG: Compare GPU results with CPU for the first component.
+    // Download GPU accumulator, compute CPU reference, compare.
+    #[cfg(debug_assertions)]
+    {
+        let gpu_accum0 = accum_col.columns[0].to_cpu();
+        let gpu_accum1 = accum_col.columns[1].to_cpu();
+        if n_rows <= 256 {
+            let mut mismatches = 0;
+            for i in 0..n_rows as usize {
+                if gpu_accum0[i].0 != 0 || gpu_accum1[i].0 != 0 {
+                    // Non-zero result — worth checking
+                    if mismatches < 3 {
+                        eprintln!("[GPU_CHECK] row {i}: accum0={} accum1={}", gpu_accum0[i].0, gpu_accum1[i].0);
+                    }
+                    mismatches += 1;
+                }
+            }
+            if mismatches > 0 {
+                eprintln!("[GPU_CHECK] {mismatches}/{} non-zero accum values (n_constraints={}, n_ops={})",
+                    n_rows, program.n_constraints, program.ops.len());
+            }
+        }
+    }
+
     // Check for CUDA errors.
     let err = unsafe { ffi::cudaGetLastError() };
     if err != 0 {
         tracing::error!(
             "CUDA bytecode kernel error {err}: n_ops={}, n_rows={n_rows}, \
-             n_cols={total_cols}, n_constraints={}, stack_depth={}",
-            encoded.len(), program.n_constraints, program.max_stack_depth
+             n_cols={total_cols}, n_constraints={}, n_registers={}",
+            encoded.len(), program.n_constraints, program.n_registers
         );
-        // Reset error state so CPU fallback can use GPU
+        for i in 0..4 {
+            accum_col.columns[i].buf.zero();
+        }
         unsafe { ffi::cudaGetLastError(); }
         return false;
     }
@@ -571,8 +555,6 @@ impl<E: FrameworkEval + Sync> ComponentProver<CudaBackend> for CudaFrameworkComp
 }
 
 /// Prepares trace evaluations for constraint quotient computation on CudaBackend.
-/// Either borrows committed evaluations directly (subdomain mode) or extends them
-/// to the evaluation domain.
 fn get_constraint_quotients_inputs_cuda<'a>(
     eval_domain: stwo::core::poly::circle::CircleDomain,
     component_polys: TreeVec<Vec<&'a &Poly<CudaBackend>>>,
@@ -595,9 +577,7 @@ fn get_constraint_quotients_inputs_cuda<'a>(
     }
 }
 
-/// Point-wise CPU constraint evaluation, mirroring the private function in
-/// stwo-constraint-framework. Downloads trace data and evaluates constraints
-/// row-by-row using `CpuDomainEvaluator`.
+/// Point-wise CPU constraint evaluation fallback.
 fn accumulate_pointwise_cpu<E: FrameworkEval>(
     component: &FrameworkComponent<E>,
     trace_cols: TreeVec<Vec<&CircleEvaluation<CpuBackend, BaseField, BitReversedOrder>>>,

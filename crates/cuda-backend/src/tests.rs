@@ -370,19 +370,21 @@ mod tests {
         assert_eq!(gpu_eval, cpu_eval, "eval_at_point must match CPU");
     }
 
-    // ---- GPU bytecode constraint evaluation kernel tests ----
+    // ---- GPU register-based bytecode constraint evaluation kernel tests ----
 
-    /// Test the GPU bytecode constraint eval kernel directly with a hand-crafted
+    /// Test the GPU register bytecode constraint eval kernel directly with a hand-crafted
     /// bytecode program and known trace data.
     ///
     /// Program: flag * (1 - flag) = 0
-    /// Bytecode:
-    ///   push_trace[col=0, offset=0]   -> stack: [flag]
-    ///   push_base(1)                  -> stack: [flag, 1]
-    ///   push_trace[col=0, offset=0]   -> stack: [flag, 1, flag]
-    ///   sub                           -> stack: [flag, (1-flag)]
-    ///   mul                           -> stack: [flag*(1-flag)]
-    ///   add_constraint                -> accumulate
+    /// Register bytecode:
+    ///   r0 = load_trace[flat_col=0, offset=0]    -- flag
+    ///   r1 = load_const(1)                        -- 1
+    ///   r2 = r1 - r0                              -- (1 - flag)
+    ///   r3 = r0 * r2                              -- flag * (1 - flag)
+    ///   add_constraint r3
+    ///
+    /// Note: flag is used twice (r0 in both Sub and Mul) — this is the Clone pattern
+    /// that broke the stack-based VM. In the register VM it just works.
     ///
     /// Trace: 4 rows with values [0, 1, 0, 1] (all valid flags).
     /// Expected: all constraint values are 0, so accumulator stays zero.
@@ -400,32 +402,31 @@ mod tests {
         let d_col_ptrs = DeviceBuffer::from_host(&[trace_col_ptr]);
         let d_col_sizes = DeviceBuffer::from_host(&[4u32]);
 
-        // Bytecode: flag * (1 - flag), one constraint
-        // Using flat col index 0 for the trace column
+        // Register-based bytecode: flag * (1 - flag), one constraint
+        // Encoding format:
+        //   LoadTrace:  [0x03:8 | dst:8 | flat_col:14 | sign:1 | abs_offset:1]
+        //   LoadConst:  [0x01:8 | dst:8 | value:16]
+        //   Sub:        [0x11:8 | dst:8 | src1:8 | src2:8]
+        //   Mul:        [0x12:8 | dst:8 | src1:8 | src2:8]
+        //   AddConstr:  [0x40:8 | src:8 | 0:16]
         let bytecode: Vec<u32> = vec![
-            // push_trace[flat_col=0, offset=0]
-            (0x03u32 << 24) | (0 << 10) | (0 << 9) | 0,
-            // push_base(1)
-            (0x01u32 << 24) | 1,
-            // push_trace[flat_col=0, offset=0]  (second copy for subtraction)
-            (0x03u32 << 24) | (0 << 10) | (0 << 9) | 0,
-            // sub: (1 - flag)
-            (0x11u32 << 24),
-            // mul: flag * (1 - flag)
-            (0x12u32 << 24),
-            // add_constraint
-            (0x40u32 << 24),
+            // r0 = load_trace[flat_col=0, offset=0]: operand = (0 << 2) | (0 << 1) | 0 = 0
+            (0x03u32 << 24) | (0 << 16) | 0,
+            // r1 = load_const(1): small value fits in 16 bits
+            (0x01u32 << 24) | (1 << 16) | 1,
+            // r2 = r1 - r0: [0x11 | dst=2 | src1=1 | src2=0]
+            (0x11u32 << 24) | (2 << 16) | (1 << 8) | 0,
+            // r3 = r0 * r2: [0x12 | dst=3 | src1=0 | src2=2]
+            (0x12u32 << 24) | (3 << 16) | (0 << 8) | 2,
+            // add_constraint r3: [0x40 | src=3 | 0]
+            (0x40u32 << 24) | (3 << 16),
         ];
         let d_bytecode = DeviceBuffer::from_host(&bytecode);
 
         // Random coeff powers: 1 constraint, so 4 u32s (one QM31)
-        // Use (1, 0, 0, 0) so result = constraint_value * 1
         let coeff: Vec<u32> = vec![1, 0, 0, 0];
         let d_coeff = DeviceBuffer::from_host(&coeff);
 
-        // Denom inv: for log_expand=0, just one value = 1
-        // Actually for eval domain = trace domain (no blowup), denom_inv = [1]
-        // With n_rows=4, trace_n_rows=4, log_expand=0
         let denom_inv: Vec<u32> = vec![1];
         let d_denom_inv = DeviceBuffer::from_host(&denom_inv);
 
@@ -479,9 +480,12 @@ mod tests {
 
     /// Test with a constraint that has non-zero output.
     /// Program: x - 5 = 0 (constraint value = x - 5)
+    /// Register bytecode:
+    ///   r0 = load_trace[flat_col=0, offset=0]    -- x
+    ///   r1 = r0 + const(-5 mod p)                -- x - 5
+    ///   add_constraint r1
+    ///
     /// Trace: [3, 5, 7, 5] -> constraint values: [-2, 0, 2, 0] in M31
-    /// With random_coeff = (1,0,0,0) and denom_inv = 1:
-    ///   accum[i] = (x[i] - 5) * 1 * 1 = x[i] - 5
     #[test]
     fn test_gpu_bytecode_kernel_nonzero_constraints() {
         use vortexstark::device::DeviceBuffer;
@@ -497,17 +501,17 @@ mod tests {
         let d_col_ptrs = DeviceBuffer::from_host(&[trace_col_ptr]);
         let d_col_sizes = DeviceBuffer::from_host(&[4u32]);
 
-        // Bytecode: push_trace[0], add_const(-5 mod p), add_constraint
-        // -5 mod p = p - 5
+        // Register-based bytecode: r0 = load_trace, r1 = r0 + const(p-5), add_constraint r1
+        // AddConst encoding: [0x14:8 | dst:8 | src:8 | 0:8] + value_word
         let neg5 = p - 5;
         let bytecode: Vec<u32> = vec![
-            // push_trace[flat_col=0, offset=0]
-            (0x03u32 << 24) | (0 << 10) | (0 << 9) | 0,
-            // add_const(neg5) -- need extended since neg5 > 2^24
-            (0x14u32 << 24) | (1 << 23), // extended flag
+            // r0 = load_trace[flat_col=0, offset=0]
+            (0x03u32 << 24) | (0 << 16) | 0,
+            // r1 = r0 + const(neg5): header + value word
+            (0x14u32 << 24) | (1 << 16) | (0 << 8),
             neg5,
-            // add_constraint
-            (0x40u32 << 24),
+            // add_constraint r1
+            (0x40u32 << 24) | (1 << 16),
         ];
         let d_bytecode = DeviceBuffer::from_host(&bytecode);
 
@@ -556,7 +560,7 @@ mod tests {
         assert_eq!(out0[3], 0,     "row 3: 5-5 = 0");
     }
 
-    /// Test the full encode -> GPU path using the bytecode encoder.
+    /// Test the full encode -> GPU path using the register-based bytecode encoder.
     #[test]
     fn test_gpu_bytecode_via_encoder() {
         use vortexstark::device::DeviceBuffer;
@@ -565,34 +569,32 @@ mod tests {
 
         init_gpu();
 
-        let p = 0x7FFFFFFFu32;
-
-        // Build a simple bytecode program: a + b - c = 0
+        // Build a register-based bytecode program: a + b - c = 0
+        // r0 = trace[0,0], r1 = trace[0,1], r2 = r0 + r1, r3 = trace[0,2], r4 = r2 - r3
         let prog = BytecodeProgram {
             ops: vec![
-                BytecodeOp::PushTraceVal { interaction: 0, col_idx: 0, offset: 0 },
-                BytecodeOp::PushTraceVal { interaction: 0, col_idx: 1, offset: 0 },
-                BytecodeOp::Add,
-                BytecodeOp::PushTraceVal { interaction: 0, col_idx: 2, offset: 0 },
-                BytecodeOp::Sub,
-                BytecodeOp::AddConstraint,
+                BytecodeOp::LoadTrace { dst: 0, interaction: 0, col_idx: 0, offset: 0 },
+                BytecodeOp::LoadTrace { dst: 1, interaction: 0, col_idx: 1, offset: 0 },
+                BytecodeOp::Add { dst: 2, src1: 0, src2: 1 },
+                BytecodeOp::LoadTrace { dst: 3, interaction: 0, col_idx: 2, offset: 0 },
+                BytecodeOp::Sub { dst: 4, src1: 2, src2: 3 },
+                BytecodeOp::AddConstraint { src: 4 },
             ],
             n_constraints: 1,
             n_trace_accesses: 3,
-            max_stack_depth: 3,
+            n_registers: 5,
         };
 
-        let mut encoded = prog.encode();
+        let encoded = prog.encode();
 
-        // Remap PushTraceVal: (interaction=0, col_idx=N) -> flat_col=N
-        // Since interaction 0 starts at offset 0, the mapping is identity.
-        // The encoding is already: (interaction:4 | col_idx:10 | sign:1 | abs_offset:9)
-        // We need to patch to: (flat_col:14 | sign:1 | abs_offset:9)
-        // For interaction=0, flat_col = col_idx, so (0 << 20 | col << 10 | ...) = (col << 10 | ...)
-        // That's the same as (flat_col << 10 | ...) since interaction=0. No patch needed!
+        // Remap LoadTrace: (interaction=0, col_idx=N) -> flat_col=N
+        // For interaction=0, flat_col = col_idx. The register-based encoding
+        // puts flat_col in bits [15:2] of the operand. Since interaction=0
+        // and the encoding uses interaction:4|col_idx:10|sign:1|abs:1,
+        // and flat_col replaces interaction:col_idx in the same bit positions,
+        // the encoding is already correct for interaction=0.
 
         // Trace: 3 columns, 4 rows
-        // a = [1, 2, 3, 4], b = [10, 20, 30, 40], c = [11, 22, 33, 44]
         let col_a: Vec<u32> = vec![1, 2, 3, 4];
         let col_b: Vec<u32> = vec![10, 20, 30, 40];
         let col_c: Vec<u32> = vec![11, 22, 33, 44];
