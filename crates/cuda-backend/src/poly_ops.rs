@@ -57,14 +57,23 @@ impl PolyOps for CudaBackend {
         eval: CircleEvaluation<Self, BaseField, BitReversedOrder>,
         _twiddles: &TwiddleTree<Self>,
     ) -> CircleCoefficients<Self> {
-        // CPU NTT for correctness — stwo's twiddle format differs from our GPU kernel
-        let cpu_vals = eval.values.to_cpu();
-        let cpu_eval = CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(
-            eval.domain, cpu_vals,
-        );
+        let mut values = eval.values;
+        let n = values.len() as u32;
+
+        // Compute stwo-format itwiddles on CPU, upload to GPU
         let cpu_twiddles = CpuBackend::precompute_twiddles(eval.domain.half_coset);
-        let cpu_poly = CpuBackend::interpolate(cpu_eval, &cpu_twiddles);
-        CircleCoefficients::new(cpu_poly.coeffs.into_iter().collect())
+        let d_itwiddles = DeviceBuffer::from_host(
+            &cpu_twiddles.itwiddles.iter().map(|t| t.0).collect::<Vec<u32>>()
+        );
+
+        // GPU IFFT using stwo twiddle format
+        unsafe {
+            vortexstark::cuda::ffi::cuda_stwo_ntt_interpolate(
+                values.buf.as_mut_ptr(), d_itwiddles.as_ptr(), n,
+            );
+        }
+
+        CircleCoefficients::new(values)
     }
 
     fn eval_at_point(poly: &CircleCoefficients<Self>, point: CirclePoint<SecureField>) -> SecureField {
@@ -140,12 +149,23 @@ impl PolyOps for CudaBackend {
         domain: CircleDomain,
         _twiddles: &TwiddleTree<Self>,
     ) -> CircleEvaluation<Self, BaseField, BitReversedOrder> {
-        // CPU NTT for correctness
-        let cpu_coeffs = poly.coeffs.to_cpu();
-        let cpu_poly = CircleCoefficients::<CpuBackend>::new(cpu_coeffs);
+        let mut values = Self::extend(poly, domain.log_size()).coeffs;
+        let n = values.len() as u32;
+
+        // Compute stwo-format twiddles on CPU, upload to GPU
         let cpu_twiddles = CpuBackend::precompute_twiddles(domain.half_coset);
-        let cpu_eval = CpuBackend::evaluate(&cpu_poly, domain, &cpu_twiddles);
-        CircleEvaluation::new(domain, cpu_eval.values.into_iter().collect())
+        let d_twiddles = DeviceBuffer::from_host(
+            &cpu_twiddles.twiddles.iter().map(|t| t.0).collect::<Vec<u32>>()
+        );
+
+        // GPU FFT using stwo twiddle format
+        unsafe {
+            vortexstark::cuda::ffi::cuda_stwo_ntt_evaluate(
+                values.buf.as_mut_ptr(), d_twiddles.as_ptr(), n,
+            );
+        }
+
+        CircleEvaluation::new(domain, values)
     }
 
     fn evaluate_into(

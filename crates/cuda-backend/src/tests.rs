@@ -211,14 +211,18 @@ mod tests {
         let gpu_col: CudaColumn<BaseField> = coeffs.iter().copied().collect();
         let gpu_poly = CircleCoefficients::<CudaBackend>::new(gpu_col);
 
-        // Re-enable GPU NTT for this test
-        let gpu_twiddles = CudaBackend::precompute_twiddles(coset);
-
-        // GPU evaluate: extend + NTT
+        // GPU evaluate via stwo-compatible NTT kernel
         let extended = CudaBackend::extend(&gpu_poly, domain.log_size());
         let mut gpu_vals_buf = extended.coeffs;
-        let cache = crate::poly_ops::twiddle_cache_for_coset(&domain.half_coset);
-        vortexstark::ntt::evaluate(&mut gpu_vals_buf.buf, &cache);
+        let d_twiddles = vortexstark::device::DeviceBuffer::from_host(
+            &cpu_twiddles.twiddles.iter().map(|t| t.0).collect::<Vec<u32>>()
+        );
+        unsafe {
+            vortexstark::cuda::ffi::cuda_stwo_ntt_evaluate(
+                gpu_vals_buf.buf.as_mut_ptr(), d_twiddles.as_ptr(),
+                (1u32 << (log_size + 1)),
+            );
+        }
         let gpu_vals = gpu_vals_buf.to_cpu();
 
         // Compare
@@ -264,14 +268,17 @@ mod tests {
         let cpu_twiddles = CpuBackend::precompute_twiddles(coset);
         let cpu_poly = CpuBackend::interpolate(cpu_eval, &cpu_twiddles);
 
-        // GPU interpolate
+        // GPU interpolate via stwo-compatible NTT kernel
         let gpu_col: CudaColumn<BaseField> = vals.iter().copied().collect();
-        let gpu_eval = stwo::prover::poly::circle::CircleEvaluation::<
-            CudaBackend, BaseField, stwo::prover::poly::BitReversedOrder
-        >::new(domain, gpu_col);
-        let cache = crate::poly_ops::twiddle_cache_for_coset(&coset);
-        let mut gpu_buf = gpu_eval.values;
-        vortexstark::ntt::interpolate(&mut gpu_buf.buf, &cache);
+        let mut gpu_buf = gpu_col;
+        let d_itwiddles = vortexstark::device::DeviceBuffer::from_host(
+            &cpu_twiddles.itwiddles.iter().map(|t| t.0).collect::<Vec<u32>>()
+        );
+        unsafe {
+            vortexstark::cuda::ffi::cuda_stwo_ntt_interpolate(
+                gpu_buf.buf.as_mut_ptr(), d_itwiddles.as_ptr(), n as u32,
+            );
+        }
         let gpu_coeffs = gpu_buf.to_cpu();
 
         // Compare

@@ -193,7 +193,15 @@ unsafe extern "C" {
     pub fn cuda_device_sync();
 }
 
-// Circle NTT kernels
+// Stwo-compatible Circle NTT kernels (flat twiddle format)
+unsafe extern "C" {
+    /// Forward NTT using stwo's flat twiddle buffer.
+    pub fn cuda_stwo_ntt_evaluate(d_data: *mut u32, d_twiddles: *const u32, n: u32);
+    /// Inverse NTT using stwo's flat twiddle buffer (includes 1/n scaling).
+    pub fn cuda_stwo_ntt_interpolate(d_data: *mut u32, d_itwiddles: *const u32, n: u32);
+}
+
+// Circle NTT kernels (original VortexSTARK format)
 unsafe extern "C" {
     pub fn cuda_circle_ntt_evaluate(
         d_data: *mut u32,
