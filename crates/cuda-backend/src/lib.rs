@@ -15,6 +15,7 @@ mod gkr_ops;
 mod merkle_ops;
 mod grind_ops;
 mod component_prover;
+pub mod constraint_eval;
 #[cfg(test)]
 mod tests;
 
