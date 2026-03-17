@@ -116,11 +116,9 @@ __global__ void bytecode_constraint_eval_kernel(
             if (offset == 0) {
                 effective_row = row;
             } else {
-                // Wrap within trace domain size (power of 2)
+                // Wrap within evaluation domain size (power of 2)
                 int32_t r = (int32_t)row + offset;
-                if (r < 0) r += (int32_t)trace_n_rows;
-                else if ((uint32_t)r >= trace_n_rows) r -= (int32_t)trace_n_rows;
-                effective_row = (uint32_t)r;
+                effective_row = (uint32_t)(r & (int32_t)(n_rows - 1));
             }
 
             uint32_t val = trace_cols[flat_col][effective_row];

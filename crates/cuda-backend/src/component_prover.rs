@@ -211,10 +211,8 @@ fn evaluate_constraint_quotients_impl<E: FrameworkEval + Sync>(
         evaluation_accumulator.columns([(eval_domain.log_size(), n_constraints)]);
     accum.random_coeff_powers.reverse();
 
-    // GPU bytecode path — disabled pending integration debugging.
-    // Unit tests pass but real stwo-cairo components cause illegal memory access.
-    // TODO: Debug operand encoding / trace column remapping for 60+ component types.
-    let gpu_success = false && try_gpu_bytecode_eval(
+    // Try GPU bytecode evaluation.
+    let gpu_success = try_gpu_bytecode_eval(
         component,
         &gpu_trace_evals,
         eval_domain.log_size(),
@@ -415,6 +413,30 @@ fn try_gpu_bytecode_eval<E: FrameworkEval>(
     let n_rows = 1u32 << eval_log_size;
     let trace_n_rows = 1u32 << trace_log_size;
 
+    // Validate all flat column indices are in bounds.
+    for (i, word) in encoded.iter().enumerate() {
+        let opcode = word >> 24;
+        if opcode == 0x03 { // OP_PUSH_TRACE_VAL
+            let operand = word & 0xFFFFFF;
+            let flat_col = (operand >> 10) & 0x3FFF;
+            if flat_col as usize >= total_cols {
+                tracing::error!(
+                    "Bytecode word[{i}]: flat_col={flat_col} >= total_cols={total_cols} \
+                     (operand=0x{operand:06x})"
+                );
+                return false;
+            }
+        }
+    }
+
+    // Also validate column sizes match eval domain
+    for (i, col_ptr) in col_ptrs.iter().enumerate() {
+        if col_ptr.is_null() {
+            tracing::error!("Column pointer {i} is null!");
+            return false;
+        }
+    }
+
     // Phase C: Upload data to GPU.
 
     // Upload encoded bytecode.
@@ -442,9 +464,20 @@ fn try_gpu_bytecode_eval<E: FrameworkEval>(
     let denom_inv_raw: Vec<u32> = denom_inv.iter().map(|v| v.0).collect();
     let d_denom_inv = DeviceBuffer::from_host(&denom_inv_raw);
 
+    // Sync GPU before kernel launch to ensure clean state.
+    unsafe { ffi::cuda_device_sync(); }
+    let pre_err = unsafe { ffi::cudaGetLastError() };
+    if pre_err != 0 {
+        tracing::error!("CUDA context already has error {} before bytecode kernel", pre_err);
+        return false;
+    }
+
     // Phase D: Launch kernel.
     {
-        let _span = span!(Level::INFO, "CUDA bytecode kernel launch", n_rows = n_rows).entered();
+        let _span = span!(Level::INFO, "CUDA bytecode kernel launch",
+            n_rows = n_rows, n_ops = encoded.len(), n_cols = total_cols,
+            n_constraints = program.n_constraints
+        ).entered();
         unsafe {
             ffi::cuda_bytecode_constraint_eval(
                 d_bytecode.as_ptr(),
@@ -469,7 +502,13 @@ fn try_gpu_bytecode_eval<E: FrameworkEval>(
     // Check for CUDA errors.
     let err = unsafe { ffi::cudaGetLastError() };
     if err != 0 {
-        tracing::error!("CUDA bytecode kernel error: {}", err);
+        tracing::error!(
+            "CUDA bytecode kernel error {err}: n_ops={}, n_rows={n_rows}, \
+             n_cols={total_cols}, n_constraints={}, stack_depth={}",
+            encoded.len(), program.n_constraints, program.max_stack_depth
+        );
+        // Reset error state so CPU fallback can use GPU
+        unsafe { ffi::cudaGetLastError(); }
         return false;
     }
 
