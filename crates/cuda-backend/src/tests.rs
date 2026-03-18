@@ -70,6 +70,141 @@ mod tests {
         assert_eq!(right_cpu, &values[4..]);
     }
 
+    // ---- GPU Merkle leaf hashing tests ----
+
+    #[test]
+    fn test_gpu_leaf_hash_vs_cpu() {
+        use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasher;
+        use stwo::prover::vcs_lifted::ops::MerkleOpsLifted;
+
+        init_gpu();
+
+        // Create 4 columns of 8 elements each (log_size=3), lifting_log_size=3.
+        let n = 8usize;
+        let lifting_log = 3u32;
+
+        let col_data: Vec<Vec<BaseField>> = (0..4).map(|c| {
+            (0..n).map(|r| M31::from((c * 100 + r) as u32)).collect()
+        }).collect();
+
+        // CPU reference
+        let cpu_col_refs: Vec<&Vec<BaseField>> = col_data.iter().collect();
+        let cpu_hashes = <CpuBackend as MerkleOpsLifted<Blake2sMerkleHasher>>::build_leaves(
+            &cpu_col_refs, lifting_log,
+        );
+
+        // GPU
+        let gpu_cols: Vec<CudaColumn<BaseField>> = col_data.iter().map(|c| c.iter().copied().collect()).collect();
+        let gpu_col_refs: Vec<&CudaColumn<BaseField>> = gpu_cols.iter().collect();
+        let gpu_hashes = <CudaBackend as MerkleOpsLifted<Blake2sMerkleHasher>>::build_leaves(
+            &gpu_col_refs, lifting_log,
+        );
+        let gpu_result = gpu_hashes.to_cpu();
+
+        assert_eq!(cpu_hashes.len(), gpu_result.len(), "Hash count mismatch");
+        let mut mismatches = 0;
+        for i in 0..cpu_hashes.len() {
+            if cpu_hashes[i] != gpu_result[i] {
+                if mismatches < 3 {
+                    eprintln!("[LEAF_HASH] mismatch at leaf {i}: CPU={:?} GPU={:?}",
+                        &cpu_hashes[i].0[..8], &gpu_result[i].0[..8]);
+                }
+                mismatches += 1;
+            }
+        }
+        assert_eq!(mismatches, 0, "{mismatches}/{} leaf hashes differ", cpu_hashes.len());
+    }
+
+    #[test]
+    fn test_gpu_leaf_hash_many_columns() {
+        use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasher;
+        use stwo::prover::vcs_lifted::ops::MerkleOpsLifted;
+
+        init_gpu();
+
+        // 20 columns (>16, tests multi-chunk hashing), log_size=4, lifting=4
+        let n = 16usize;
+        let lifting_log = 4u32;
+
+        let col_data: Vec<Vec<BaseField>> = (0..20).map(|c| {
+            (0..n).map(|r| M31::from((c * 1000 + r * 7 + 3) as u32)).collect()
+        }).collect();
+
+        let cpu_col_refs: Vec<&Vec<BaseField>> = col_data.iter().collect();
+        let cpu_hashes = <CpuBackend as MerkleOpsLifted<Blake2sMerkleHasher>>::build_leaves(
+            &cpu_col_refs, lifting_log,
+        );
+
+        let gpu_cols: Vec<CudaColumn<BaseField>> = col_data.iter().map(|c| c.iter().copied().collect()).collect();
+        let gpu_col_refs: Vec<&CudaColumn<BaseField>> = gpu_cols.iter().collect();
+        let gpu_hashes = <CudaBackend as MerkleOpsLifted<Blake2sMerkleHasher>>::build_leaves(
+            &gpu_col_refs, lifting_log,
+        );
+        let gpu_result = gpu_hashes.to_cpu();
+
+        let mut mismatches = 0;
+        for i in 0..cpu_hashes.len() {
+            if cpu_hashes[i] != gpu_result[i] {
+                if mismatches < 3 {
+                    eprintln!("[LEAF_HASH] mismatch at leaf {i}");
+                }
+                mismatches += 1;
+            }
+        }
+        assert_eq!(mismatches, 0, "{mismatches}/{} leaf hashes differ (20 cols, multi-chunk)",
+            cpu_hashes.len());
+    }
+
+    #[test]
+    fn test_gpu_leaf_hash_mixed_sizes() {
+        use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasher;
+        use stwo::prover::vcs_lifted::ops::MerkleOpsLifted;
+
+        init_gpu();
+
+        // Mixed column sizes: 2 cols of size 4 (log=2), 3 cols of size 8 (log=3).
+        // Lifting_log=3 (output 8 leaves).
+        // Columns MUST be sorted by ascending size (stwo requirement).
+        let lifting_log = 3u32;
+
+        let small_cols: Vec<Vec<BaseField>> = (0..2).map(|c| {
+            (0..4).map(|r| M31::from((c * 50 + r * 11 + 1) as u32)).collect()
+        }).collect();
+        let big_cols: Vec<Vec<BaseField>> = (0..3).map(|c| {
+            (0..8).map(|r| M31::from((c * 200 + r * 13 + 7) as u32)).collect()
+        }).collect();
+
+        let mut all_cols: Vec<Vec<BaseField>> = Vec::new();
+        all_cols.extend(small_cols);
+        all_cols.extend(big_cols);
+
+        let cpu_col_refs: Vec<&Vec<BaseField>> = all_cols.iter().collect();
+        let cpu_hashes = <CpuBackend as MerkleOpsLifted<Blake2sMerkleHasher>>::build_leaves(
+            &cpu_col_refs, lifting_log,
+        );
+
+        let gpu_cols: Vec<CudaColumn<BaseField>> = all_cols.iter().map(|c| c.iter().copied().collect()).collect();
+        let gpu_col_refs: Vec<&CudaColumn<BaseField>> = gpu_cols.iter().collect();
+        let gpu_hashes = <CudaBackend as MerkleOpsLifted<Blake2sMerkleHasher>>::build_leaves(
+            &gpu_col_refs, lifting_log,
+        );
+        let gpu_result = gpu_hashes.to_cpu();
+
+        let mut mismatches = 0;
+        for i in 0..cpu_hashes.len() {
+            if cpu_hashes[i] != gpu_result[i] {
+                if mismatches < 3 {
+                    eprintln!("[LEAF_HASH] mixed-size mismatch at leaf {i}: CPU={:02x}{:02x}{:02x}{:02x}... GPU={:02x}{:02x}{:02x}{:02x}...",
+                        cpu_hashes[i].0[0], cpu_hashes[i].0[1], cpu_hashes[i].0[2], cpu_hashes[i].0[3],
+                        gpu_result[i].0[0], gpu_result[i].0[1], gpu_result[i].0[2], gpu_result[i].0[3]);
+                }
+                mismatches += 1;
+            }
+        }
+        assert_eq!(mismatches, 0, "{mismatches}/{} leaf hashes differ (mixed sizes)",
+            cpu_hashes.len());
+    }
+
     // ---- Bit-reverse tests ----
 
     #[test]

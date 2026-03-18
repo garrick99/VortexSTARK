@@ -44,36 +44,45 @@ __global__ void build_leaves_lifted_kernel(
     // Init Blake2s state: personalization = 0x01010020 (hash length 32, no key)
     uint32_t h0 = IV0 ^ 0x01010020, h1 = IV1, h2 = IV2, h3 = IV3;
     uint32_t h4 = IV4, h5 = IV5, h6 = IV6, h7 = IV7;
-    uint32_t bytes_compressed = 0;
+    uint32_t total_bytes = 0;
+
+    // Accumulate values across chunks into a 16-word message buffer.
+    // Only compress when we have a full 64-byte block (16 words) or at the end.
+    // This matches the blake2 crate's buffering semantics.
+    uint32_t buf[16] = {0};
+    uint32_t buf_pos = 0;  // words in buffer (0-16)
 
     for (uint32_t chunk_idx = 0; chunk_idx < n_chunks; chunk_idx++) {
         LeafHashChunk chunk = schedule[chunk_idx];
         uint32_t row = lifted_row(leaf, lifting_log_size, chunk.log_size);
 
-        // Load up to 16 column values as message words.
-        // Each M31 value is 4 bytes (one u32 word).
-        uint32_t m[16] = {0};
         for (uint32_t c = 0; c < chunk.n_cols; c++) {
-            m[c] = col_ptrs[chunk.col_indices[c]][row];
+            buf[buf_pos++] = col_ptrs[chunk.col_indices[c]][row];
+
+            if (buf_pos == 16) {
+                // Full block — compress (not final).
+                total_bytes += 64;
+                blake2s_compress(h0, h1, h2, h3, h4, h5, h6, h7,
+                                 buf[0], buf[1], buf[2], buf[3],
+                                 buf[4], buf[5], buf[6], buf[7],
+                                 buf[8], buf[9], buf[10], buf[11],
+                                 buf[12], buf[13], buf[14], buf[15],
+                                 total_bytes, 0);
+                buf_pos = 0;
+                // Clear buffer for next block
+                for (int j = 0; j < 16; j++) buf[j] = 0;
+            }
         }
-
-        bytes_compressed += chunk.n_cols * 4;
-
-        // Last chunk gets the finalization flag (0xFFFFFFFF).
-        uint32_t last_block = (chunk_idx == n_chunks - 1) ? 0xFFFFFFFF : 0;
-        blake2s_compress(h0, h1, h2, h3, h4, h5, h6, h7,
-                         m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7],
-                         m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15],
-                         bytes_compressed, last_block);
     }
 
-    // If no chunks were processed, finalize with empty message.
-    if (n_chunks == 0) {
-        blake2s_compress(h0, h1, h2, h3, h4, h5, h6, h7,
-                         0, 0, 0, 0, 0, 0, 0, 0,
-                         0, 0, 0, 0, 0, 0, 0, 0,
-                         0, 0xFFFFFFFF);
-    }
+    // Final compression: remaining buffered data (padded with zeros).
+    total_bytes += buf_pos * 4;
+    blake2s_compress(h0, h1, h2, h3, h4, h5, h6, h7,
+                     buf[0], buf[1], buf[2], buf[3],
+                     buf[4], buf[5], buf[6], buf[7],
+                     buf[8], buf[9], buf[10], buf[11],
+                     buf[12], buf[13], buf[14], buf[15],
+                     total_bytes, 0xFFFFFFFF);
 
     // Write the 8-word hash to output.
     uint32_t* out = &output_hashes[leaf * 8];
