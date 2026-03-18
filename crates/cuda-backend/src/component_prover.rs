@@ -324,17 +324,6 @@ fn try_gpu_bytecode_eval<E: FrameworkEval>(
     )
     .entered();
 
-    // Dump first GPU component's bytecode for debugging
-    static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    let should_dump = !DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed);
-    if should_dump {
-        eprintln!("[BYTECODE_DUMP] {} ops, {} constraints, {} registers",
-            program.ops.len(), program.n_constraints, program.n_registers);
-        for (i, op) in program.ops.iter().enumerate() {
-            eprintln!("  [{i:3}] {op}");
-        }
-    }
-
     // Phase B: Build flat column pointer array and remap bytecode.
     let n_interactions = gpu_trace_evals.len();
     let mut interaction_offsets = Vec::with_capacity(n_interactions + 1);
@@ -381,27 +370,6 @@ fn try_gpu_bytecode_eval<E: FrameworkEval>(
                     pc += op.encoded_len();
                 }
             }
-        }
-    }
-
-    if should_dump {
-        eprintln!("[BYTECODE_DUMP] Encoded {} u32 words (from {} ops), interaction_offsets={:?}, total_cols={}",
-            encoded.len(), program.ops.len(), interaction_offsets, total_cols);
-        // Verify encoded word count matches sum of op.encoded_len()
-        let expected_len: usize = program.ops.iter().map(|op| op.encoded_len()).sum();
-        eprintln!("[BYTECODE_DUMP] Expected encoded len: {}, actual: {}", expected_len, encoded.len());
-        if expected_len != encoded.len() {
-            eprintln!("[BYTECODE_DUMP] MISMATCH in encoded length!");
-        }
-        // Print all LoadTrace ops with their flat column and offset info after remap
-        let mut pc = 0;
-        for (i, op) in program.ops.iter().enumerate() {
-            if let BytecodeOp::LoadTrace { interaction, col_idx, offset, .. } = op {
-                let flat_col = encoded[pc + 1];
-                let ext_word = encoded[pc + 2];
-                eprintln!("[REMAP] op[{i}] inter={interaction} col={col_idx} off={offset} -> flat={flat_col} word2=0x{ext_word:08x}");
-            }
-            pc += op.encoded_len();
         }
     }
 
@@ -489,116 +457,6 @@ fn try_gpu_bytecode_eval<E: FrameworkEval>(
         }
     }
 
-    // DEBUG: Compare GPU results with CPU for the first component.
-    // Download GPU accumulator, compute CPU reference, compare.
-    #[cfg(debug_assertions)]
-    {
-        let gpu_accum0 = accum_col.columns[0].to_cpu();
-        let gpu_accum1 = accum_col.columns[1].to_cpu();
-        if n_rows <= 256 {
-            let mut mismatches = 0;
-            for i in 0..n_rows as usize {
-                if gpu_accum0[i].0 != 0 || gpu_accum1[i].0 != 0 {
-                    // Non-zero result — worth checking
-                    if mismatches < 3 {
-                        eprintln!("[GPU_CHECK] row {i}: accum0={} accum1={}", gpu_accum0[i].0, gpu_accum1[i].0);
-                    }
-                    mismatches += 1;
-                }
-            }
-            if mismatches > 0 {
-                eprintln!("[GPU_CHECK] {mismatches}/{} non-zero accum values (n_constraints={}, n_ops={})",
-                    n_rows, program.n_constraints, program.ops.len());
-            }
-        }
-    }
-
-    // VALIDATION: Compare GPU result with CPU for the first component.
-    static VALIDATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !VALIDATED.swap(true, std::sync::atomic::Ordering::Relaxed) && n_rows <= 256 {
-        // Download GPU result
-        let gpu_c0 = accum_col.columns[0].to_cpu();
-        let gpu_c1 = accum_col.columns[1].to_cpu();
-        let gpu_c2 = accum_col.columns[2].to_cpu();
-        let gpu_c3 = accum_col.columns[3].to_cpu();
-
-        // Zero the accum and run CPU path
-        for i in 0..4 { accum_col.columns[i].buf.zero(); }
-
-        // CPU evaluation
-        let cpu_trace_evals: TreeVec<Vec<CircleEvaluation<CpuBackend, BaseField, BitReversedOrder>>> =
-            gpu_trace_evals.as_ref().map(|tree| {
-                tree.iter().map(|eval| {
-                    CircleEvaluation::new(eval.domain, eval.values.to_cpu())
-                }).collect()
-            });
-        // Print CPU trace values for row 0 (all columns of interaction 1)
-        if cpu_trace_evals.len() > 1 {
-            let inter1 = &cpu_trace_evals[1];
-            for col_idx in 0..std::cmp::min(12, inter1.len()) {
-                eprintln!("[CPU_DBG] row=0 inter=1 col={} val={}", col_idx, inter1[col_idx][0].0);
-            }
-        }
-        // Print interaction 2 columns with offset info
-        if cpu_trace_evals.len() > 2 {
-            let inter2 = &cpu_trace_evals[2];
-            for col_idx in 0..std::cmp::min(12, inter2.len()) {
-                let val_row0 = inter2[col_idx][0].0;
-                // Compute offset=-1 row index using stwo's function
-                let prev_row = stwo::core::utils::offset_bit_reversed_circle_domain_index(
-                    0, trace_log_size, eval_log_size, -1);
-                let val_prev = inter2[col_idx][prev_row].0;
-                eprintln!("[CPU_DBG] row=0 inter=2 col={} val_off0={} prev_row={} val_off-1={}",
-                    col_idx, val_row0, prev_row, val_prev);
-            }
-        }
-
-        let cpu_trace_refs = cpu_trace_evals.as_ref().map(|tree| {
-            tree.iter().map(|e| e).collect::<Vec<_>>()
-        });
-        let cpu_result = accumulate_pointwise_cpu(
-            component, cpu_trace_refs,
-            eval_log_size, trace_log_size,
-            denom_inv.to_vec(), random_coeff_powers,
-            &SecureColumnByCoords::<CpuBackend> {
-                columns: std::array::from_fn(|_| vec![BaseField::from(0u32); n_rows as usize]),
-            },
-        );
-
-        let mut mismatches = 0;
-        for row in 0..n_rows as usize {
-            let g0 = gpu_c0[row].0;
-            let c0 = cpu_result.columns[0][row].0;
-            if g0 != c0 {
-                if mismatches < 5 {
-                    eprintln!("[VALIDATE] row {row}: GPU=({},{},{},{}) CPU=({},{},{},{})",
-                        g0, gpu_c1[row].0, gpu_c2[row].0, gpu_c3[row].0,
-                        c0, cpu_result.columns[1][row].0, cpu_result.columns[2][row].0, cpu_result.columns[3][row].0);
-                }
-                mismatches += 1;
-            }
-        }
-        if mismatches > 0 {
-            eprintln!("[VALIDATE] {mismatches}/{n_rows} mismatches! GPU constraint eval is wrong.");
-            // Restore CPU result to accum
-            *accum_col = SecureColumnByCoords {
-                columns: std::array::from_fn(|i| cpu_result.columns[i].iter().copied().collect()),
-            };
-            return true; // "succeeded" but with CPU data
-        } else {
-            eprintln!("[VALIDATE] GPU matches CPU perfectly for {n_rows} rows!");
-            // Restore GPU result
-            *accum_col = SecureColumnByCoords {
-                columns: [
-                    gpu_c0.into_iter().collect(),
-                    gpu_c1.into_iter().collect(),
-                    gpu_c2.into_iter().collect(),
-                    gpu_c3.into_iter().collect(),
-                ],
-            };
-        }
-    }
-
     // Check for CUDA errors.
     let err = unsafe { ffi::cudaGetLastError() };
     if err != 0 {
@@ -671,8 +529,6 @@ fn accumulate_pointwise_cpu<E: FrameworkEval>(
     accum: &SecureColumnByCoords<CpuBackend>,
 ) -> SecureColumnByCoords<CpuBackend> {
     let mut res = SecureColumnByCoords::zeros(1 << eval_log_size);
-    static CPU_DBG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    let should_dbg = !CPU_DBG.swap(true, std::sync::atomic::Ordering::Relaxed);
     for row in 0..(1 << eval_log_size) {
         let eval = CpuDomainEvaluator::new(
             &trace_cols,
@@ -684,14 +540,6 @@ fn accumulate_pointwise_cpu<E: FrameworkEval>(
             component.claimed_sum(),
         );
         let row_res = component.evaluate(eval).row_res;
-
-        if should_dbg && row == 0 {
-            let arr = row_res.to_m31_array();
-            let dinv = denom_inv[row >> trace_log_size as usize];
-            eprintln!("[CPU_DBG] row=0 row_res=({},{},{},{}) denom_inv={}",
-                arr[0].0, arr[1].0, arr[2].0, arr[3].0, dinv.0);
-        }
-
         let row_denom_inv = denom_inv[row >> trace_log_size];
         res.set(row, accum.at(row) + row_res * row_denom_inv);
     }
