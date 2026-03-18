@@ -633,6 +633,28 @@ unsafe extern "C" {
         n_registers: u32,
     );
 
+    /// Warp-cooperative bytecode constraint eval kernel.
+    /// Uses one warp (32 threads) per row, distributing the register file
+    /// across warp lanes. Each thread holds ceil(n_registers/32) registers.
+    /// Same interface as cuda_bytecode_constraint_eval.
+    pub fn cuda_warp_bytecode_constraint_eval(
+        bytecode: *const u32,
+        n_words: u32,
+        trace_cols: *const *const u32,
+        trace_col_sizes: *const u32,
+        n_trace_cols: u32,
+        n_rows: u32,
+        trace_n_rows: u32,
+        random_coeff_powers: *const u32,
+        denom_inv: *const u32,
+        log_expand: u32,
+        accum0: *mut u32,
+        accum1: *mut u32,
+        accum2: *mut u32,
+        accum3: *mut u32,
+        n_registers: u32,
+    );
+
     // ── Barycentric evaluation ──────────────────────────────────────────
 
     /// Compute result = sum_i(evals[i] * weights[i]) using a parallel reduction.

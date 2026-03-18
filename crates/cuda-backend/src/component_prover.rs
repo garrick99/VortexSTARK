@@ -431,29 +431,54 @@ fn try_gpu_bytecode_eval<E: FrameworkEval>(
     }
 
     // Phase D: Launch kernel.
+    // Use warp-cooperative kernel for high-register components (>1024 regs)
+    // to avoid local memory spilling. The warp kernel distributes the register
+    // file across 32 lanes, reducing per-thread memory 32x.
     {
+        let use_warp = program.n_registers > 1024;
         let _span = span!(Level::INFO, "CUDA bytecode kernel launch",
             n_rows = n_rows, n_ops = encoded.len(), n_cols = total_cols,
-            n_constraints = program.n_constraints, n_registers = program.n_registers
+            n_constraints = program.n_constraints, n_registers = program.n_registers,
+            warp_cooperative = use_warp,
         ).entered();
         unsafe {
-            ffi::cuda_bytecode_constraint_eval(
-                d_bytecode.as_ptr(),
-                encoded.len() as u32,
-                d_col_ptrs.as_ptr() as *const *const u32,
-                d_col_sizes.as_ptr(),
-                total_cols as u32,
-                n_rows,
-                trace_n_rows,
-                d_coeff.as_ptr(),
-                d_denom_inv.as_ptr(),
-                log_expand,
-                accum_col.columns[0].buf.as_mut_ptr(),
-                accum_col.columns[1].buf.as_mut_ptr(),
-                accum_col.columns[2].buf.as_mut_ptr(),
-                accum_col.columns[3].buf.as_mut_ptr(),
-                program.n_registers as u32,
-            );
+            if use_warp {
+                ffi::cuda_warp_bytecode_constraint_eval(
+                    d_bytecode.as_ptr(),
+                    encoded.len() as u32,
+                    d_col_ptrs.as_ptr() as *const *const u32,
+                    d_col_sizes.as_ptr(),
+                    total_cols as u32,
+                    n_rows,
+                    trace_n_rows,
+                    d_coeff.as_ptr(),
+                    d_denom_inv.as_ptr(),
+                    log_expand,
+                    accum_col.columns[0].buf.as_mut_ptr(),
+                    accum_col.columns[1].buf.as_mut_ptr(),
+                    accum_col.columns[2].buf.as_mut_ptr(),
+                    accum_col.columns[3].buf.as_mut_ptr(),
+                    program.n_registers as u32,
+                );
+            } else {
+                ffi::cuda_bytecode_constraint_eval(
+                    d_bytecode.as_ptr(),
+                    encoded.len() as u32,
+                    d_col_ptrs.as_ptr() as *const *const u32,
+                    d_col_sizes.as_ptr(),
+                    total_cols as u32,
+                    n_rows,
+                    trace_n_rows,
+                    d_coeff.as_ptr(),
+                    d_denom_inv.as_ptr(),
+                    log_expand,
+                    accum_col.columns[0].buf.as_mut_ptr(),
+                    accum_col.columns[1].buf.as_mut_ptr(),
+                    accum_col.columns[2].buf.as_mut_ptr(),
+                    accum_col.columns[3].buf.as_mut_ptr(),
+                    program.n_registers as u32,
+                );
+            }
             ffi::cuda_device_sync();
         }
     }
