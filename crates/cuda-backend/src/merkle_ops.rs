@@ -126,7 +126,21 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
                 n_leaves,
             );
             ffi::cuda_device_sync();
+            let err = ffi::cudaGetLastError();
+            if err != 0 {
+                eprintln!("[LEAVES-GPU] CUDA error {err} after build_leaves_lifted! Falling back to CPU.");
+                let cpu_columns: Vec<Vec<BaseField>> = columns.iter().map(|c| c.to_cpu()).collect();
+                let cpu_col_refs: Vec<&Vec<BaseField>> = cpu_columns.iter().collect();
+                let cpu_result = <stwo::prover::backend::CpuBackend as MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M31_OUTPUT>>>::build_leaves(
+                    &cpu_col_refs, lifting_log_size,
+                );
+                return cpu_result.into_iter().collect();
+            }
         }
+
+        // Keep schedule and col_ptrs alive until after GPU sync.
+        drop(d_schedule);
+        drop(d_col_ptrs);
 
         let result = CudaColumn::from_device_buffer(d_hashes, n_leaves as usize);
         eprintln!("[LEAVES-GPU] done: {} hashes in {:.3}s", n_leaves, t0.elapsed().as_secs_f64());
