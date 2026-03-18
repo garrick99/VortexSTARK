@@ -630,6 +630,7 @@ unsafe extern "C" {
         accum1: *mut u32,
         accum2: *mut u32,
         accum3: *mut u32,
+        n_registers: u32,
     );
 
     // ── Barycentric evaluation ──────────────────────────────────────────

@@ -502,6 +502,7 @@ mod tests {
                 d_accum1.as_mut_ptr(),
                 d_accum2.as_mut_ptr(),
                 d_accum3.as_mut_ptr(),
+                64, // n_registers (small test programs)
             );
             ffi::cuda_device_sync();
         }
@@ -595,6 +596,7 @@ mod tests {
                 d_accum1.as_mut_ptr(),
                 d_accum2.as_mut_ptr(),
                 d_accum3.as_mut_ptr(),
+                64, // n_registers (small test programs)
             );
             ffi::cuda_device_sync();
         }
@@ -691,6 +693,7 @@ mod tests {
                 d_accum1.as_mut_ptr(),
                 d_accum2.as_mut_ptr(),
                 d_accum3.as_mut_ptr(),
+                64, // n_registers (small test programs)
             );
             ffi::cuda_device_sync();
         }
@@ -858,6 +861,7 @@ mod tests {
                 d_coeff.as_ptr(), d_denom_inv.as_ptr(),
                 log_expand,
                 d_a0.as_mut_ptr(), d_a1.as_mut_ptr(), d_a2.as_mut_ptr(), d_a3.as_mut_ptr(),
+                64, // n_registers (small test programs)
             );
             ffi::cuda_device_sync();
         }
@@ -1048,6 +1052,7 @@ mod tests {
                 d_coeff.as_ptr(), d_denom_inv.as_ptr(),
                 log_expand,
                 d_a0.as_mut_ptr(), d_a1.as_mut_ptr(), d_a2.as_mut_ptr(), d_a3.as_mut_ptr(),
+                64, // n_registers (small test programs)
             );
             ffi::cuda_device_sync();
         }
@@ -1221,6 +1226,7 @@ mod tests {
                 d_coeff.as_ptr(), d_denom_inv.as_ptr(),
                 log_expand,
                 d_a0.as_mut_ptr(), d_a1.as_mut_ptr(), d_a2.as_mut_ptr(), d_a3.as_mut_ptr(),
+                64, // n_registers (small test programs)
             );
             ffi::cuda_device_sync();
         }
@@ -1394,6 +1400,7 @@ mod tests {
                 1, n_rows, trace_n_rows,
                 d_coeff.as_ptr(), d_denom_inv.as_ptr(), log_expand,
                 d_a0.as_mut_ptr(), d_a1.as_mut_ptr(), d_a2.as_mut_ptr(), d_a3.as_mut_ptr(),
+                64, // n_registers (small test programs)
             );
             ffi::cuda_device_sync();
         }
@@ -1532,6 +1539,7 @@ mod tests {
                 d_accum1.as_mut_ptr(),
                 d_accum2.as_mut_ptr(),
                 d_accum3.as_mut_ptr(),
+                64, // n_registers (small test programs)
             );
             ffi::cuda_device_sync();
         }

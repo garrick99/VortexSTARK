@@ -463,9 +463,19 @@ void cuda_bytecode_constraint_eval(
     uint32_t* accum0,
     uint32_t* accum1,
     uint32_t* accum2,
-    uint32_t* accum3
+    uint32_t* accum3,
+    uint32_t n_registers
 ) {
-    uint32_t threads = 256;
+    // Adaptive block size: fewer threads for high-register components
+    // to reduce local memory spilling. Each register = 16 bytes (QM31).
+    // RTX 5090: 256KB register file per SM, ~128KB L1 for local mem.
+    uint32_t threads;
+    if (n_registers <= 256)       threads = 256;  // 4KB/thread → fits in registers
+    else if (n_registers <= 512)  threads = 128;  // 8KB/thread
+    else if (n_registers <= 1024) threads = 64;   // 16KB/thread
+    else if (n_registers <= 2048) threads = 32;   // 32KB/thread
+    else                          threads = 32;   // >32KB → heavy spill, minimize threads
+
     uint32_t blocks = (n_rows + threads - 1) / threads;
     bytecode_constraint_eval_kernel<<<blocks, threads>>>(
         bytecode, n_words,

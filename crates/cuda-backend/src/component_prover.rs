@@ -452,6 +452,7 @@ fn try_gpu_bytecode_eval<E: FrameworkEval>(
                 accum_col.columns[1].buf.as_mut_ptr(),
                 accum_col.columns[2].buf.as_mut_ptr(),
                 accum_col.columns[3].buf.as_mut_ptr(),
+                program.n_registers as u32,
             );
             ffi::cuda_device_sync();
         }
