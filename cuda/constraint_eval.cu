@@ -46,10 +46,9 @@
 
 // Maximum number of virtual registers per thread.
 // 16-bit register indices: theoretical max 65536.
-// 8192 covers all stwo-cairo components (largest uses ~5600 registers).
-// Each register is 16 bytes (QM31), so 8192 regs = 128 KB per thread.
-// RTX 5090 SM_100 has 256 KB registers per SM — sufficient for 1-2 threads/SM.
-#define MAX_REGS 8192
+// 1024 covers most stwo-cairo components. Components with >1024 registers
+// use the warp-cooperative kernel (constraint_eval_warp.cu) instead.
+#define MAX_REGS 1024
 
 // ─── Bit-reversed circle domain offset ───────────────────────────────
 //
