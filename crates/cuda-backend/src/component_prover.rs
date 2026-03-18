@@ -305,9 +305,9 @@ fn try_gpu_bytecode_eval<E: FrameworkEval>(
 
     // Register-based VM has no stack balance issue. No verify_stack_balance() needed.
     // 16-bit register indices support up to 65535 registers; GPU MAX_REGS=1024.
-    if program.n_registers > 1024 {
+    if program.n_registers > 8192 {
         tracing::warn!(
-            "Bytecode uses {} registers (max 1024) — falling back to CPU",
+            "Bytecode uses {} registers (max 8192) — falling back to CPU",
             program.n_registers
         );
         return false;

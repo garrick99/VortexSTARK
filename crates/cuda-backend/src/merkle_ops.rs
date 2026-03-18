@@ -25,22 +25,23 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
         columns: &[&Col<Self, BaseField>],
         lifting_log_size: u32,
     ) -> Col<Self, Blake2sHash> {
+        // Profile column sizes for GPU kernel planning.
+        use std::collections::BTreeMap;
+        let mut size_counts: BTreeMap<u32, usize> = BTreeMap::new();
+        for c in columns {
+            *size_counts.entry(c.len().ilog2()).or_default() += 1;
+        }
+        let t0 = std::time::Instant::now();
+        eprintln!("[LEAVES] {} cols, lift={lifting_log_size}, sizes: {:?}", columns.len(), size_counts);
+
         // CPU fallback: download, compute, upload.
-        let total_elements: usize = columns.iter().map(|c| c.len()).sum();
-        eprintln!("[CUDA] build_leaves: {} columns, lifting_log_size={lifting_log_size}, total_elements={total_elements}", columns.len());
         let cpu_columns: Vec<Vec<BaseField>> = columns.iter().map(|c| c.to_cpu()).collect();
-        eprintln!("[CUDA] build_leaves: downloaded {} CPU columns", cpu_columns.len());
         let cpu_col_refs: Vec<&Vec<BaseField>> = cpu_columns.iter().collect();
         let cpu_result = <stwo::prover::backend::CpuBackend as MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M31_OUTPUT>>>::build_leaves(
             &cpu_col_refs, lifting_log_size,
         );
-        eprintln!("[CUDA] build_leaves done: {} hashes, uploading to GPU...", cpu_result.len());
         let result: CudaColumn<Blake2sHash> = cpu_result.into_iter().collect();
-        eprintln!("[CUDA] build_leaves upload done");
-        drop(cpu_col_refs);
-        eprintln!("[CUDA] build_leaves: dropped cpu_col_refs");
-        drop(cpu_columns);
-        eprintln!("[CUDA] build_leaves: dropped cpu_columns");
+        eprintln!("[LEAVES] done: {} hashes in {:.3}s", result.len(), t0.elapsed().as_secs_f64());
         result
     }
 
