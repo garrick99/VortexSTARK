@@ -632,6 +632,24 @@ unsafe extern "C" {
         accum3: *mut u32,
     );
 
+    // ── Barycentric evaluation ──────────────────────────────────────────
+
+    /// Compute result = sum_i(evals[i] * weights[i]) using a parallel reduction.
+    ///
+    /// - `evals`: device pointer to n M31 values (1 u32 each)
+    /// - `weights`: device pointer to n QM31 values in AoS layout (4 u32 per element)
+    /// - `n`: number of elements
+    /// - `out`: device pointer to output buffer of `n_blocks * 4` u32s (QM31 partial sums)
+    /// - `n_blocks`: number of parallel reduction blocks (caller allocates out and
+    ///   must CPU-reduce the partial sums after the call)
+    pub fn cuda_barycentric_eval(
+        evals: *const u32,
+        weights: *const u32,
+        n: u32,
+        out: *mut u32,
+        n_blocks: u32,
+    );
+
     // ── FRI Quotient kernels ────────────────────────────────────────────
 
     /// Accumulate partial numerators for a single sample batch.

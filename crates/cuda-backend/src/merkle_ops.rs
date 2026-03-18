@@ -26,8 +26,10 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
         lifting_log_size: u32,
     ) -> Col<Self, Blake2sHash> {
         // CPU fallback: download, compute, upload.
-        eprintln!("[CUDA] build_leaves: {} columns, lifting_log_size={lifting_log_size}", columns.len());
+        let total_elements: usize = columns.iter().map(|c| c.len()).sum();
+        eprintln!("[CUDA] build_leaves: {} columns, lifting_log_size={lifting_log_size}, total_elements={total_elements}", columns.len());
         let cpu_columns: Vec<Vec<BaseField>> = columns.iter().map(|c| c.to_cpu()).collect();
+        eprintln!("[CUDA] build_leaves: downloaded {} CPU columns", cpu_columns.len());
         let cpu_col_refs: Vec<&Vec<BaseField>> = cpu_columns.iter().collect();
         let cpu_result = <stwo::prover::backend::CpuBackend as MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M31_OUTPUT>>>::build_leaves(
             &cpu_col_refs, lifting_log_size,
@@ -35,11 +37,16 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
         eprintln!("[CUDA] build_leaves done: {} hashes, uploading to GPU...", cpu_result.len());
         let result: CudaColumn<Blake2sHash> = cpu_result.into_iter().collect();
         eprintln!("[CUDA] build_leaves upload done");
+        drop(cpu_col_refs);
+        eprintln!("[CUDA] build_leaves: dropped cpu_col_refs");
+        drop(cpu_columns);
+        eprintln!("[CUDA] build_leaves: dropped cpu_columns");
         result
     }
 
     fn build_next_layer(prev_layer: &Col<Self, Blake2sHash>) -> Col<Self, Blake2sHash> {
         let n = prev_layer.len() / 2;
+        eprintln!("[CUDA] build_next_layer: n={n}");
         if n == 0 {
             return CudaColumn::from_device_buffer(DeviceBuffer::<u32>::alloc(0), 0);
         }

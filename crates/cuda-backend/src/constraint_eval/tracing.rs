@@ -782,9 +782,26 @@ impl EvalAtRow for TracingEvalAtRow {
         // Convert constraint to TracedSecureField to get its register index.
         // G implements Into<TracedSecureField> (via From<G> for Self::EF).
         let traced: TracedSecureField = constraint.into();
-        // Merge the constraint's recorder into ours if from a detached source
-        merge_recorders(&self.rec, &traced.rec);
-        let src = traced.reg;
+        // Merge the constraint's recorder into ours if from a detached source.
+        // If traced.rec is detached and gets merged into self.rec, the registers
+        // from traced.rec are remapped by an offset. We must apply that same
+        // offset to traced.reg.
+        let merged = merge_recorders(&self.rec, &traced.rec);
+        let src = if Rc::ptr_eq(&self.rec, &traced.rec) {
+            // Same recorder — no remapping needed.
+            traced.reg
+        } else if Rc::ptr_eq(&self.rec, &merged) {
+            // traced.rec was merged into self.rec.
+            // traced's registers were offset by self.rec's old next_reg.
+            let traced_n_regs = traced.rec.borrow().next_reg;
+            let merged_next = merged.borrow().next_reg;
+            let self_old_next = merged_next - traced_n_regs;
+            traced.reg + self_old_next
+        } else {
+            // self.rec was merged into traced.rec (shouldn't normally happen
+            // since self.rec is the main recorder, but handle it for safety).
+            traced.reg
+        };
         let mut inner = self.rec.borrow_mut();
         inner.emit(BytecodeOp::AddConstraint { src });
         inner.n_constraints += 1;

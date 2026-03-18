@@ -301,24 +301,13 @@ fn try_gpu_bytecode_eval<E: FrameworkEval>(
         return true;
     }
 
-    // Log first component's program for debugging
-    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        eprintln!("[BYTECODE] First component: {} ops, {} constraints, {} registers",
-            program.ops.len(), program.n_constraints, program.n_registers);
-        for (i, op) in program.ops.iter().enumerate().take(20) {
-            eprintln!("  [{i:3}] {op:?}");
-        }
-        if program.ops.len() > 20 {
-            eprintln!("  ... ({} more ops)", program.ops.len() - 20);
-        }
-    }
+    // (debug logging moved after register count check)
 
     // Register-based VM has no stack balance issue. No verify_stack_balance() needed.
-    // Just check register count fits in u8 (GPU encoding limit).
-    if program.n_registers > 256 {
+    // 16-bit register indices support up to 65535 registers; GPU MAX_REGS=1024.
+    if program.n_registers > 1024 {
         tracing::warn!(
-            "Bytecode uses {} registers (max 256) — falling back to CPU",
+            "Bytecode uses {} registers (max 1024) — falling back to CPU",
             program.n_registers
         );
         return false;
@@ -334,6 +323,17 @@ fn try_gpu_bytecode_eval<E: FrameworkEval>(
         trace_log_size = trace_log_size,
     )
     .entered();
+
+    // Dump first GPU component's bytecode for debugging
+    static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let should_dump = !DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed);
+    if should_dump {
+        eprintln!("[BYTECODE_DUMP] {} ops, {} constraints, {} registers",
+            program.ops.len(), program.n_constraints, program.n_registers);
+        for (i, op) in program.ops.iter().enumerate() {
+            eprintln!("  [{i:3}] {op}");
+        }
+    }
 
     // Phase B: Build flat column pointer array and remap bytecode.
     let n_interactions = gpu_trace_evals.len();
@@ -356,11 +356,13 @@ fn try_gpu_bytecode_eval<E: FrameworkEval>(
     let mut encoded = program.encode();
 
     // Walk through ops and encoded words in parallel to remap LoadTrace operands.
+    // LoadTrace is 3 words: word1=header (dst), word2=flat_col, word3=sign|abs_off.
+    // We overwrite word2 with the computed flat column index.
     {
         let mut pc = 0;
         for op in &program.ops {
             match op {
-                BytecodeOp::LoadTrace { dst, interaction, col_idx, offset } => {
+                BytecodeOp::LoadTrace { interaction, col_idx, .. } => {
                     let flat_idx = interaction_offsets[*interaction as usize] + *col_idx as usize;
                     if flat_idx >= total_cols {
                         tracing::warn!(
@@ -369,31 +371,37 @@ fn try_gpu_bytecode_eval<E: FrameworkEval>(
                         );
                         return false;
                     }
-
-                    let d = *dst as u32 & 0xFF;
-                    let (sign, abs_off) = if *offset < 0 {
-                        (1u32, (-*offset) as u32)
-                    } else {
-                        (0u32, *offset as u32)
-                    };
-
-                    if abs_off <= 1 {
-                        // Single word: [opcode:8 | dst:8 | flat_col:14 | sign:1 | abs_offset:1]
-                        let operand = ((flat_idx as u32) << 2) | (sign << 1) | (abs_off & 1);
-                        encoded[pc] = (0x03u32 << 24) | (d << 16) | operand;
-                        pc += 1;
-                    } else {
-                        // Extended: marker + second word
-                        let operand = ((flat_idx as u32) << 2) | 0x3;
-                        encoded[pc] = (0x03u32 << 24) | (d << 16) | operand;
-                        encoded[pc + 1] = (sign << 31) | abs_off;
-                        pc += 2;
-                    }
+                    // word1 (pc+0): already has correct [opcode | dst] from encode()
+                    // word2 (pc+1): replace pre-remap interaction/col_idx with flat_col
+                    encoded[pc + 1] = flat_idx as u32;
+                    // word3 (pc+2): sign|abs_off already correct from encode()
+                    pc += 3;
                 }
                 _ => {
                     pc += op.encoded_len();
                 }
             }
+        }
+    }
+
+    if should_dump {
+        eprintln!("[BYTECODE_DUMP] Encoded {} u32 words (from {} ops), interaction_offsets={:?}, total_cols={}",
+            encoded.len(), program.ops.len(), interaction_offsets, total_cols);
+        // Verify encoded word count matches sum of op.encoded_len()
+        let expected_len: usize = program.ops.iter().map(|op| op.encoded_len()).sum();
+        eprintln!("[BYTECODE_DUMP] Expected encoded len: {}, actual: {}", expected_len, encoded.len());
+        if expected_len != encoded.len() {
+            eprintln!("[BYTECODE_DUMP] MISMATCH in encoded length!");
+        }
+        // Print all LoadTrace ops with their flat column and offset info after remap
+        let mut pc = 0;
+        for (i, op) in program.ops.iter().enumerate() {
+            if let BytecodeOp::LoadTrace { interaction, col_idx, offset, .. } = op {
+                let flat_col = encoded[pc + 1];
+                let ext_word = encoded[pc + 2];
+                eprintln!("[REMAP] op[{i}] inter={interaction} col={col_idx} off={offset} -> flat={flat_col} word2=0x{ext_word:08x}");
+            }
+            pc += op.encoded_len();
         }
     }
 
@@ -405,25 +413,14 @@ fn try_gpu_bytecode_eval<E: FrameworkEval>(
         let mut pc = 0;
         for op in &program.ops {
             if let BytecodeOp::LoadTrace { .. } = op {
-                let word = encoded[pc];
-                let operand = word & 0xFFFF;
-                if (operand & 0x3) == 0x3 {
-                    // Extended format
-                    let flat_col = (operand >> 2) & 0x3FFF;
-                    if flat_col as usize >= total_cols {
-                        tracing::error!(
-                            "Bytecode word[{pc}]: flat_col={flat_col} >= total_cols={total_cols}"
-                        );
-                        return false;
-                    }
-                } else {
-                    let flat_col = (operand >> 2) & 0x3FFF;
-                    if flat_col as usize >= total_cols {
-                        tracing::error!(
-                            "Bytecode word[{pc}]: flat_col={flat_col} >= total_cols={total_cols}"
-                        );
-                        return false;
-                    }
+                // LoadTrace: 3 words. word2 (pc+1) holds flat_col after remap.
+                let flat_col = encoded[pc + 1];
+                if flat_col as usize >= total_cols {
+                    tracing::error!(
+                        "Bytecode word[{}]: flat_col={flat_col} >= total_cols={total_cols}",
+                        pc + 1
+                    );
+                    return false;
                 }
             }
             pc += op.encoded_len();
@@ -516,7 +513,7 @@ fn try_gpu_bytecode_eval<E: FrameworkEval>(
         }
     }
 
-    // VALIDATION: Compare GPU result with CPU for the first small component.
+    // VALIDATION: Compare GPU result with CPU for the first component.
     static VALIDATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !VALIDATED.swap(true, std::sync::atomic::Ordering::Relaxed) && n_rows <= 256 {
         // Download GPU result
@@ -535,6 +532,27 @@ fn try_gpu_bytecode_eval<E: FrameworkEval>(
                     CircleEvaluation::new(eval.domain, eval.values.to_cpu())
                 }).collect()
             });
+        // Print CPU trace values for row 0 (all columns of interaction 1)
+        if cpu_trace_evals.len() > 1 {
+            let inter1 = &cpu_trace_evals[1];
+            for col_idx in 0..std::cmp::min(12, inter1.len()) {
+                eprintln!("[CPU_DBG] row=0 inter=1 col={} val={}", col_idx, inter1[col_idx][0].0);
+            }
+        }
+        // Print interaction 2 columns with offset info
+        if cpu_trace_evals.len() > 2 {
+            let inter2 = &cpu_trace_evals[2];
+            for col_idx in 0..std::cmp::min(12, inter2.len()) {
+                let val_row0 = inter2[col_idx][0].0;
+                // Compute offset=-1 row index using stwo's function
+                let prev_row = stwo::core::utils::offset_bit_reversed_circle_domain_index(
+                    0, trace_log_size, eval_log_size, -1);
+                let val_prev = inter2[col_idx][prev_row].0;
+                eprintln!("[CPU_DBG] row=0 inter=2 col={} val_off0={} prev_row={} val_off-1={}",
+                    col_idx, val_row0, prev_row, val_prev);
+            }
+        }
+
         let cpu_trace_refs = cpu_trace_evals.as_ref().map(|tree| {
             tree.iter().map(|e| e).collect::<Vec<_>>()
         });
@@ -653,6 +671,8 @@ fn accumulate_pointwise_cpu<E: FrameworkEval>(
     accum: &SecureColumnByCoords<CpuBackend>,
 ) -> SecureColumnByCoords<CpuBackend> {
     let mut res = SecureColumnByCoords::zeros(1 << eval_log_size);
+    static CPU_DBG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let should_dbg = !CPU_DBG.swap(true, std::sync::atomic::Ordering::Relaxed);
     for row in 0..(1 << eval_log_size) {
         let eval = CpuDomainEvaluator::new(
             &trace_cols,
@@ -664,6 +684,13 @@ fn accumulate_pointwise_cpu<E: FrameworkEval>(
             component.claimed_sum(),
         );
         let row_res = component.evaluate(eval).row_res;
+
+        if should_dbg && row == 0 {
+            let arr = row_res.to_m31_array();
+            let dinv = denom_inv[row >> trace_log_size as usize];
+            eprintln!("[CPU_DBG] row=0 row_res=({},{},{},{}) denom_inv={}",
+                arr[0].0, arr[1].0, arr[2].0, arr[3].0, dinv.0);
+        }
 
         let row_denom_inv = denom_inv[row >> trace_log_size];
         res.set(row, accum.at(row) + row_res * row_denom_inv);

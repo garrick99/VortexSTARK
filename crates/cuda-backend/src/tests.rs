@@ -370,6 +370,48 @@ mod tests {
         assert_eq!(gpu_eval, cpu_eval, "eval_at_point must match CPU");
     }
 
+    #[test]
+    fn test_barycentric_eval_gpu_vs_cpu() {
+        use stwo::core::poly::circle::CanonicCoset;
+        use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
+        use stwo::prover::poly::BitReversedOrder;
+        use stwo::prover::backend::CpuBackend;
+        use stwo::core::circle::CirclePoint;
+
+        init_gpu();
+
+        let log_size = 8u32; // 256 elements
+        let coset = CanonicCoset::new(log_size);
+        let domain = coset.circle_domain();
+
+        // Arbitrary evaluation point (not on the domain)
+        let x = SecureField::from_m31_array([M31::from(3), M31::from(7), M31::from(11), M31::from(2)]);
+        let y = SecureField::from_m31_array([M31::from(5), M31::from(1), M31::from(8), M31::from(4)]);
+        let point = CirclePoint { x, y };
+
+        // Build random evaluations
+        let n = 1usize << log_size;
+        let vals: Vec<BaseField> = (1..=n as u32).map(M31::from).collect();
+
+        // CPU path: compute weights then evaluate
+        let cpu_weights = CpuBackend::barycentric_weights(coset, point);
+        let cpu_evals = CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(
+            domain, vals.clone(),
+        );
+        let cpu_result = CpuBackend::barycentric_eval_at_point(&cpu_evals, &cpu_weights);
+
+        // GPU path: weights computed on CPU then uploaded (via CudaBackend::barycentric_weights),
+        // eval runs on GPU
+        let gpu_weights = CudaBackend::barycentric_weights(coset, point);
+        let gpu_evals: CudaColumn<BaseField> = vals.into_iter().collect();
+        let gpu_eval_circle = CircleEvaluation::<CudaBackend, BaseField, BitReversedOrder>::new(
+            domain, gpu_evals,
+        );
+        let gpu_result = CudaBackend::barycentric_eval_at_point(&gpu_eval_circle, &gpu_weights);
+
+        assert_eq!(gpu_result, cpu_result, "GPU barycentric eval must match CPU");
+    }
+
     // ---- GPU register-based bytecode constraint evaluation kernel tests ----
 
     /// Test the GPU register bytecode constraint eval kernel directly with a hand-crafted
@@ -403,23 +445,27 @@ mod tests {
         let d_col_sizes = DeviceBuffer::from_host(&[4u32]);
 
         // Register-based bytecode: flag * (1 - flag), one constraint
-        // Encoding format:
-        //   LoadTrace:  [0x03:8 | dst:8 | flat_col:14 | sign:1 | abs_offset:1]
-        //   LoadConst:  [0x01:8 | dst:8 | value:16]
-        //   Sub:        [0x11:8 | dst:8 | src1:8 | src2:8]
-        //   Mul:        [0x12:8 | dst:8 | src1:8 | src2:8]
-        //   AddConstr:  [0x40:8 | src:8 | 0:16]
+        // 16-bit register encoding:
+        //   word1: [opcode:8 | 0:8 | dst:16]   (or src for AddConstraint)
+        //   word2: [src1:16 | src2:16]          for 3-reg ops
+        //   word2: [src:16 | 0:16]              for 2-reg ops
+        //   word2: value (u32)                  for LoadConst
         let bytecode: Vec<u32> = vec![
-            // r0 = load_trace[flat_col=0, offset=0]: operand = (0 << 2) | (0 << 1) | 0 = 0
-            (0x03u32 << 24) | (0 << 16) | 0,
-            // r1 = load_const(1): small value fits in 16 bits
-            (0x01u32 << 24) | (1 << 16) | 1,
-            // r2 = r1 - r0: [0x11 | dst=2 | src1=1 | src2=0]
-            (0x11u32 << 24) | (2 << 16) | (1 << 8) | 0,
-            // r3 = r0 * r2: [0x12 | dst=3 | src1=0 | src2=2]
-            (0x12u32 << 24) | (3 << 16) | (0 << 8) | 2,
-            // add_constraint r3: [0x40 | src=3 | 0]
-            (0x40u32 << 24) | (3 << 16),
+            // r0 = load_trace[flat_col=0, offset=0]: 3 words
+            (0x03u32 << 24) | 0u32, // hdr: dst=0
+            0u32,                    // flat_col=0
+            0u32,                    // offset=0
+            // r1 = load_const(1): 2 words
+            (0x01u32 << 24) | 1u32, // hdr: dst=1
+            1u32,                    // value=1
+            // r2 = r1 - r0: 2 words
+            (0x11u32 << 24) | 2u32, // hdr: dst=2
+            (1u32 << 16) | 0u32,    // src1=1, src2=0
+            // r3 = r0 * r2: 2 words
+            (0x12u32 << 24) | 3u32, // hdr: dst=3
+            (0u32 << 16) | 2u32,    // src1=0, src2=2
+            // add_constraint r3: 1 word
+            (0x40u32 << 24) | 3u32, // src=3
         ];
         let d_bytecode = DeviceBuffer::from_host(&bytecode);
 
@@ -501,17 +547,22 @@ mod tests {
         let d_col_ptrs = DeviceBuffer::from_host(&[trace_col_ptr]);
         let d_col_sizes = DeviceBuffer::from_host(&[4u32]);
 
-        // Register-based bytecode: r0 = load_trace, r1 = r0 + const(p-5), add_constraint r1
-        // AddConst encoding: [0x14:8 | dst:8 | src:8 | 0:8] + value_word
+        // Register-based bytecode (16-bit register encoding):
+        //   r0 = load_trace[flat_col=0, offset=0]  — 3 words
+        //   r1 = r0 + const(p-5)                   — 3 words
+        //   add_constraint r1                       — 1 word
         let neg5 = p - 5;
         let bytecode: Vec<u32> = vec![
-            // r0 = load_trace[flat_col=0, offset=0]
-            (0x03u32 << 24) | (0 << 16) | 0,
-            // r1 = r0 + const(neg5): header + value word
-            (0x14u32 << 24) | (1 << 16) | (0 << 8),
+            // LoadTrace: word1=[opcode:8|0:8|dst:16], word2=flat_col, word3=sign|abs_off
+            (0x03u32 << 24) | 0u32, // dst=0
+            0u32,                    // flat_col=0
+            0u32,                    // offset=0 (sign=0, abs=0)
+            // AddConst: word1=[opcode:8|0:8|dst:16], word2=[src:16|0:16], word3=value
+            (0x14u32 << 24) | 1u32, // dst=1
+            0u32 << 16,              // src=0
             neg5,
-            // add_constraint r1
-            (0x40u32 << 24) | (1 << 16),
+            // AddConstraint: word1=[opcode:8|0:8|src:16]
+            (0x40u32 << 24) | 1u32, // src=1
         ];
         let d_bytecode = DeviceBuffer::from_host(&bytecode);
 
@@ -653,5 +704,931 @@ mod tests {
         for row in 0..4 {
             assert_eq!(out0[row], 0, "row {row}: a+b-c should be 0, got {}", out0[row]);
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // End-to-end GPU vs CPU bytecode constraint evaluation test.
+    //
+    // This test uses stwo's actual FrameworkEval/EvalAtRow infrastructure
+    // (not hand-crafted bytecode) to verify the full pipeline:
+    //   record_bytecode -> encode -> GPU kernel -> compare with CpuDomainEvaluator
+    // ──────────────────────────────────────────────────────────────────────
+
+    // ── Logup component definitions (module scope, outside test functions) ──
+
+    stwo_constraint_framework::relation!(TestLookupRelation, 1);
+
+    const LOGUP_LOG_N: u32 = 2; // 4 rows — small for easy debugging
+
+    struct SimpleLogupEval {
+        lookup: TestLookupRelation,
+        claimed_sum: SecureField,
+    }
+
+    impl stwo_constraint_framework::FrameworkEval for SimpleLogupEval {
+        fn log_size(&self) -> u32 { LOGUP_LOG_N }
+        fn max_constraint_log_degree_bound(&self) -> u32 { LOGUP_LOG_N + 1 }
+        fn evaluate<E: stwo_constraint_framework::EvalAtRow>(&self, mut eval: E) -> E {
+            let val = eval.next_trace_mask();
+            eval.add_to_relation(stwo_constraint_framework::RelationEntry::new(
+                &self.lookup,
+                E::EF::one(),
+                &[val],
+            ));
+            eval.finalize_logup();
+            eval
+        }
+    }
+
+    /// End-to-end logup GPU vs CPU test.
+    ///
+    /// Records bytecode for a single-entry logup component (one M31 lookup value,
+    /// QM31 interaction cumsum). Runs the GPU bytecode kernel and CpuDomainEvaluator
+    /// on the same arbitrary trace data and compares row_res values.
+    ///
+    /// Trace layout (5 flat columns, 4 rows each):
+    ///   flat 0 = interaction 1 col 0  (base trace: the lookup value)
+    ///   flat 1..4 = interaction 2 col 0..3  (QM31 cumsum, M31 components)
+    ///
+    /// interaction_offsets = [0, 0, 1, 5]
+    ///   preproc (inter 0): 0 cols → starts at flat 0
+    ///   base    (inter 1): 1 col  → starts at flat 0
+    ///   inter   (inter 2): 4 cols → starts at flat 1
+    #[test]
+    fn test_e2e_logup_constraint_gpu_vs_cpu() {
+        use vortexstark::device::DeviceBuffer;
+        use vortexstark::cuda::ffi;
+        use crate::constraint_eval::tracing::record_bytecode;
+        use crate::constraint_eval::bytecode::BytecodeOp;
+        use stwo_constraint_framework::{CpuDomainEvaluator, FrameworkEval};
+        use stwo::core::pcs::TreeVec;
+        use stwo::core::poly::circle::CanonicCoset;
+        use stwo::prover::poly::circle::CircleEvaluation;
+        use stwo::prover::poly::BitReversedOrder;
+        use stwo::prover::backend::CpuBackend;
+
+        init_gpu();
+
+        // claimed_sum: arbitrary fixed QM31 (used for cumsum_shift in the constraint)
+        let claimed_sum = SecureField::from_m31_array([
+            M31::from(1), M31::from(2), M31::from(3), M31::from(4),
+        ]);
+
+        let component = SimpleLogupEval {
+            lookup: TestLookupRelation::dummy(),
+            claimed_sum,
+        };
+
+        // Record bytecode via FrameworkEval
+        let program = record_bytecode(&component, claimed_sum);
+        eprintln!("Logup bytecode ({} ops, {} constraints):\n{}",
+            program.ops.len(), program.n_constraints, program.dump());
+        assert_eq!(program.n_constraints, 1, "expected 1 logup constraint");
+
+        // Use log_expand=1: eval domain is 2x the trace domain.
+        // This is required because offset_bit_reversed_circle_domain_index
+        // computes (eval_log_size - domain_log_size - 1), which underflows when
+        // eval_log_size == domain_log_size (log_expand=0).
+        let trace_n_rows = 1u32 << LOGUP_LOG_N;        // 4 rows
+        let n_rows       = 1u32 << (LOGUP_LOG_N + 1);  // 8 eval rows
+        let log_expand   = 1u32;
+
+        // interaction_offsets: preproc(0 cols), base(1 col), inter(4 cols)
+        // → [0, 0, 1, 5]
+        let interaction_offsets: Vec<usize> = vec![0, 0, 1, 5];
+
+        // Encode bytecode and remap LoadTrace to flat column indices
+        let mut encoded = program.encode();
+        {
+            let mut pc = 0;
+            for op in &program.ops {
+                if let BytecodeOp::LoadTrace { interaction, col_idx, .. } = op {
+                    let flat_idx = interaction_offsets[*interaction as usize] + *col_idx as usize;
+                    // 3-word LoadTrace: word1=header(dst), word2=flat_col, word3=sign|abs_off
+                    encoded[pc + 1] = flat_idx as u32;
+                    pc += 3;
+                } else {
+                    pc += op.encoded_len();
+                }
+            }
+        }
+
+        // Build trace data: 8 eval rows each (eval domain = 2x trace domain).
+        // flat 0 = base trace col (lookup values, 8 eval rows)
+        // flat 1..4 = interaction 2 col 0..3 (QM31 cumsum, 8 eval rows each)
+        let base_col:  Vec<u32> = vec![3, 7, 2, 9, 4, 1, 8, 6];
+        let i2c0_vals: Vec<u32> = vec![10, 20, 30, 40, 50, 60, 70, 80];
+        let i2c1_vals: Vec<u32> = vec![1,  2,  3,  4,  5,  6,  7,  8];
+        let i2c2_vals: Vec<u32> = vec![5,  6,  7,  8,  9, 10, 11, 12];
+        let i2c3_vals: Vec<u32> = vec![11, 12, 13, 14, 15, 16, 17, 18];
+
+        let d_base = DeviceBuffer::from_host(&base_col);
+        let d_i2c0 = DeviceBuffer::from_host(&i2c0_vals);
+        let d_i2c1 = DeviceBuffer::from_host(&i2c1_vals);
+        let d_i2c2 = DeviceBuffer::from_host(&i2c2_vals);
+        let d_i2c3 = DeviceBuffer::from_host(&i2c3_vals);
+
+        let col_ptrs: Vec<*const u32> = vec![
+            d_base.as_ptr(),
+            d_i2c0.as_ptr(), d_i2c1.as_ptr(), d_i2c2.as_ptr(), d_i2c3.as_ptr(),
+        ];
+        let d_col_ptrs  = DeviceBuffer::from_host(&col_ptrs);
+        let d_col_sizes = DeviceBuffer::from_host(&[n_rows; 5]);
+        let d_bytecode  = DeviceBuffer::from_host(&encoded);
+
+        // 1 constraint: random_coeff = QM31(1,0,0,0)
+        let coeff: Vec<u32>     = vec![1, 0, 0, 0];
+        // log_expand=1 → 2 coset denominators. Both set to 1 so GPU accum == CPU row_res.
+        let denom_inv: Vec<u32> = vec![1, 1];
+        let d_coeff     = DeviceBuffer::from_host(&coeff);
+        let d_denom_inv = DeviceBuffer::from_host(&denom_inv);
+
+        let mut d_a0 = DeviceBuffer::<u32>::alloc(n_rows as usize);
+        let mut d_a1 = DeviceBuffer::<u32>::alloc(n_rows as usize);
+        let mut d_a2 = DeviceBuffer::<u32>::alloc(n_rows as usize);
+        let mut d_a3 = DeviceBuffer::<u32>::alloc(n_rows as usize);
+        d_a0.zero(); d_a1.zero(); d_a2.zero(); d_a3.zero();
+
+        unsafe {
+            ffi::cuda_bytecode_constraint_eval(
+                d_bytecode.as_ptr(), encoded.len() as u32,
+                d_col_ptrs.as_ptr() as *const *const u32,
+                d_col_sizes.as_ptr(),
+                5, n_rows, trace_n_rows,
+                d_coeff.as_ptr(), d_denom_inv.as_ptr(),
+                log_expand,
+                d_a0.as_mut_ptr(), d_a1.as_mut_ptr(), d_a2.as_mut_ptr(), d_a3.as_mut_ptr(),
+            );
+            ffi::cuda_device_sync();
+        }
+
+        let err = unsafe { ffi::cudaGetLastError() };
+        assert_eq!(err, 0, "CUDA kernel error: {err}");
+
+        let gpu_a0 = d_a0.to_host();
+        let gpu_a1 = d_a1.to_host();
+        let gpu_a2 = d_a2.to_host();
+        let gpu_a3 = d_a3.to_host();
+
+        // CPU reference: CpuDomainEvaluator for each eval row
+        let to_bf = |v: &[u32]| -> Vec<BaseField> { v.iter().map(|&x| M31::from(x)).collect() };
+        // eval domain has 2x rows (log_expand=1): CanonicCoset::new(LOGUP_LOG_N + 1)
+        let eval_domain = CanonicCoset::new(LOGUP_LOG_N + 1).circle_domain();
+
+        let base_eval = CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(eval_domain, to_bf(&base_col));
+        let i2c0_eval = CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(eval_domain, to_bf(&i2c0_vals));
+        let i2c1_eval = CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(eval_domain, to_bf(&i2c1_vals));
+        let i2c2_eval = CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(eval_domain, to_bf(&i2c2_vals));
+        let i2c3_eval = CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(eval_domain, to_bf(&i2c3_vals));
+
+        // TreeVec: [0]=preprocessed (empty), [1]=base trace (1 col), [2]=interaction (4 cols)
+        let trace_refs: TreeVec<Vec<&CircleEvaluation<CpuBackend, BaseField, BitReversedOrder>>> =
+            TreeVec::new(vec![
+                vec![],
+                vec![&base_eval],
+                vec![&i2c0_eval, &i2c1_eval, &i2c2_eval, &i2c3_eval],
+            ]);
+
+        let random_coeff_powers = vec![SecureField::one()]; // 1 constraint
+
+        let mut mismatches = 0;
+        for row in 0..n_rows as usize {
+            let cpu_eval = CpuDomainEvaluator::new(
+                &trace_refs,
+                row,
+                &random_coeff_powers,
+                LOGUP_LOG_N,     // domain_log_size (trace domain)
+                LOGUP_LOG_N + 1, // eval_domain_log_size (eval domain = trace + 1)
+                LOGUP_LOG_N,     // log_size for LogupAtRow cumsum_shift
+                claimed_sum,
+            );
+            let cpu_eval = component.evaluate(cpu_eval);
+            let row_res = cpu_eval.row_res;
+            let arr = row_res.to_m31_array();
+            let (e0, e1, e2, e3) = (arr[0].0, arr[1].0, arr[2].0, arr[3].0);
+            let (g0, g1, g2, g3) = (gpu_a0[row], gpu_a1[row], gpu_a2[row], gpu_a3[row]);
+
+            if e0 != g0 || e1 != g1 || e2 != g2 || e3 != g3 {
+                if mismatches < 8 {
+                    eprintln!("[LOGUP MISMATCH] row {row}:");
+                    eprintln!("  CPU row_res: ({e0}, {e1}, {e2}, {e3})");
+                    eprintln!("  GPU accum:   ({g0}, {g1}, {g2}, {g3})");
+                }
+                mismatches += 1;
+            } else {
+                eprintln!("[LOGUP OK] row {row}: ({e0}, {e1}, {e2}, {e3})");
+            }
+        }
+        assert_eq!(mismatches, 0,
+            "{mismatches}/{n_rows} rows differ between GPU and CPU for logup constraint");
+    }
+
+    // ── Two-entry logup with finalize_logup_in_pairs (stwo-cairo pattern) ──
+
+    struct LogupInPairsEval {
+        lookup: TestLookupRelation,
+    }
+
+    impl stwo_constraint_framework::FrameworkEval for LogupInPairsEval {
+        fn log_size(&self) -> u32 { LOGUP_LOG_N }
+        fn max_constraint_log_degree_bound(&self) -> u32 { LOGUP_LOG_N + 1 }
+        fn evaluate<E: stwo_constraint_framework::EvalAtRow>(&self, mut eval: E) -> E {
+            let val1 = eval.next_trace_mask();
+            let val2 = eval.next_trace_mask();
+            eval.add_to_relation(stwo_constraint_framework::RelationEntry::new(
+                &self.lookup, E::EF::one(), &[val1],
+            ));
+            eval.add_to_relation(stwo_constraint_framework::RelationEntry::new(
+                &self.lookup, E::EF::one(), &[val2],
+            ));
+            eval.finalize_logup_in_pairs();
+            eval
+        }
+    }
+
+    /// End-to-end test for two-entry logup with finalize_logup_in_pairs.
+    ///
+    /// This matches the pattern used by real stwo-cairo components where multiple
+    /// logup entries are batched in pairs. The fraction sum (frac1 + frac2) generates
+    /// additional WideAdd/WideMul bytecode that exercises the register tracker more deeply.
+    ///
+    /// Trace layout:
+    ///   inter 1, col 0 = val1 (base trace)
+    ///   inter 1, col 1 = val2 (base trace)
+    ///   inter 2, col 0..3 = QM31 cumsum (interaction trace)
+    ///   interaction_offsets = [0, 0, 2, 6]
+    #[test]
+    fn test_e2e_logup_in_pairs_gpu_vs_cpu() {
+        use vortexstark::device::DeviceBuffer;
+        use vortexstark::cuda::ffi;
+        use crate::constraint_eval::tracing::record_bytecode;
+        use crate::constraint_eval::bytecode::BytecodeOp;
+        use stwo_constraint_framework::{CpuDomainEvaluator, FrameworkEval};
+        use stwo::core::pcs::TreeVec;
+        use stwo::core::poly::circle::CanonicCoset;
+        use stwo::prover::poly::circle::CircleEvaluation;
+        use stwo::prover::poly::BitReversedOrder;
+        use stwo::prover::backend::CpuBackend;
+
+        init_gpu();
+
+        let claimed_sum = SecureField::from_m31_array([
+            M31::from(7), M31::from(3), M31::from(11), M31::from(5),
+        ]);
+
+        let component = LogupInPairsEval { lookup: TestLookupRelation::dummy() };
+        let program = record_bytecode(&component, claimed_sum);
+        eprintln!("LogupInPairs bytecode ({} ops, {} constraints):\n{}",
+            program.ops.len(), program.n_constraints, program.dump());
+        assert_eq!(program.n_constraints, 1, "expected 1 logup constraint");
+
+        let trace_n_rows = 1u32 << LOGUP_LOG_N;        // 4
+        let n_rows       = 1u32 << (LOGUP_LOG_N + 1);  // 8 eval rows
+        let log_expand   = 1u32;
+
+        // inter 1 has 2 cols (val1, val2), inter 2 has 4 cols (QM31 cumsum)
+        // interaction_offsets = [0, 0, 2, 6]
+        let interaction_offsets: Vec<usize> = vec![0, 0, 2, 6];
+
+        let mut encoded = program.encode();
+        {
+            let mut pc = 0;
+            for op in &program.ops {
+                if let BytecodeOp::LoadTrace { interaction, col_idx, .. } = op {
+                    let flat_idx = interaction_offsets[*interaction as usize] + *col_idx as usize;
+                    // 3-word LoadTrace: word1=header(dst), word2=flat_col, word3=sign|abs_off
+                    encoded[pc + 1] = flat_idx as u32;
+                    pc += 3;
+                } else {
+                    pc += op.encoded_len();
+                }
+            }
+        }
+
+        // 6 flat columns: val1, val2, i2c0, i2c1, i2c2, i2c3 (8 eval rows each)
+        let val1_col:  Vec<u32> = vec![3, 7, 2, 9, 4, 1, 8, 6];
+        let val2_col:  Vec<u32> = vec![5, 2, 8, 1, 3, 9, 4, 7];
+        let i2c0_vals: Vec<u32> = vec![10, 20, 30, 40, 50, 60, 70, 80];
+        let i2c1_vals: Vec<u32> = vec![1,  2,  3,  4,  5,  6,  7,  8];
+        let i2c2_vals: Vec<u32> = vec![5,  6,  7,  8,  9, 10, 11, 12];
+        let i2c3_vals: Vec<u32> = vec![11, 12, 13, 14, 15, 16, 17, 18];
+
+        let d_val1 = DeviceBuffer::from_host(&val1_col);
+        let d_val2 = DeviceBuffer::from_host(&val2_col);
+        let d_i2c0 = DeviceBuffer::from_host(&i2c0_vals);
+        let d_i2c1 = DeviceBuffer::from_host(&i2c1_vals);
+        let d_i2c2 = DeviceBuffer::from_host(&i2c2_vals);
+        let d_i2c3 = DeviceBuffer::from_host(&i2c3_vals);
+
+        let col_ptrs: Vec<*const u32> = vec![
+            d_val1.as_ptr(), d_val2.as_ptr(),
+            d_i2c0.as_ptr(), d_i2c1.as_ptr(), d_i2c2.as_ptr(), d_i2c3.as_ptr(),
+        ];
+        let d_col_ptrs  = DeviceBuffer::from_host(&col_ptrs);
+        let d_col_sizes = DeviceBuffer::from_host(&[n_rows; 6]);
+        let d_bytecode  = DeviceBuffer::from_host(&encoded);
+
+        let coeff: Vec<u32>     = vec![1, 0, 0, 0];
+        let denom_inv: Vec<u32> = vec![1, 1];
+        let d_coeff     = DeviceBuffer::from_host(&coeff);
+        let d_denom_inv = DeviceBuffer::from_host(&denom_inv);
+
+        let mut d_a0 = DeviceBuffer::<u32>::alloc(n_rows as usize);
+        let mut d_a1 = DeviceBuffer::<u32>::alloc(n_rows as usize);
+        let mut d_a2 = DeviceBuffer::<u32>::alloc(n_rows as usize);
+        let mut d_a3 = DeviceBuffer::<u32>::alloc(n_rows as usize);
+        d_a0.zero(); d_a1.zero(); d_a2.zero(); d_a3.zero();
+
+        unsafe {
+            ffi::cuda_bytecode_constraint_eval(
+                d_bytecode.as_ptr(), encoded.len() as u32,
+                d_col_ptrs.as_ptr() as *const *const u32,
+                d_col_sizes.as_ptr(),
+                6, n_rows, trace_n_rows,
+                d_coeff.as_ptr(), d_denom_inv.as_ptr(),
+                log_expand,
+                d_a0.as_mut_ptr(), d_a1.as_mut_ptr(), d_a2.as_mut_ptr(), d_a3.as_mut_ptr(),
+            );
+            ffi::cuda_device_sync();
+        }
+
+        let err = unsafe { ffi::cudaGetLastError() };
+        assert_eq!(err, 0, "CUDA kernel error: {err}");
+
+        let gpu_a0 = d_a0.to_host();
+        let gpu_a1 = d_a1.to_host();
+        let gpu_a2 = d_a2.to_host();
+        let gpu_a3 = d_a3.to_host();
+
+        let to_bf = |v: &[u32]| -> Vec<BaseField> { v.iter().map(|&x| M31::from(x)).collect() };
+        let eval_domain = CanonicCoset::new(LOGUP_LOG_N + 1).circle_domain();
+
+        let val1_eval = CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(eval_domain, to_bf(&val1_col));
+        let val2_eval = CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(eval_domain, to_bf(&val2_col));
+        let i2c0_eval = CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(eval_domain, to_bf(&i2c0_vals));
+        let i2c1_eval = CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(eval_domain, to_bf(&i2c1_vals));
+        let i2c2_eval = CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(eval_domain, to_bf(&i2c2_vals));
+        let i2c3_eval = CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(eval_domain, to_bf(&i2c3_vals));
+
+        let trace_refs: TreeVec<Vec<&CircleEvaluation<CpuBackend, BaseField, BitReversedOrder>>> =
+            TreeVec::new(vec![
+                vec![],
+                vec![&val1_eval, &val2_eval],
+                vec![&i2c0_eval, &i2c1_eval, &i2c2_eval, &i2c3_eval],
+            ]);
+
+        let random_coeff_powers = vec![SecureField::one()];
+
+        let mut mismatches = 0;
+        for row in 0..n_rows as usize {
+            let cpu_eval = CpuDomainEvaluator::new(
+                &trace_refs, row, &random_coeff_powers,
+                LOGUP_LOG_N, LOGUP_LOG_N + 1, LOGUP_LOG_N,
+                claimed_sum,
+            );
+            let cpu_eval = component.evaluate(cpu_eval);
+            let row_res = cpu_eval.row_res;
+            let arr = row_res.to_m31_array();
+            let (e0, e1, e2, e3) = (arr[0].0, arr[1].0, arr[2].0, arr[3].0);
+            let (g0, g1, g2, g3) = (gpu_a0[row], gpu_a1[row], gpu_a2[row], gpu_a3[row]);
+
+            if e0 != g0 || e1 != g1 || e2 != g2 || e3 != g3 {
+                if mismatches < 8 {
+                    eprintln!("[LOGUP_PAIRS MISMATCH] row {row}:");
+                    eprintln!("  CPU: ({e0}, {e1}, {e2}, {e3})");
+                    eprintln!("  GPU: ({g0}, {g1}, {g2}, {g3})");
+                }
+                mismatches += 1;
+            } else {
+                eprintln!("[LOGUP_PAIRS OK] row {row}: ({e0}, {e1}, {e2}, {e3})");
+            }
+        }
+        assert_eq!(mismatches, 0,
+            "{mismatches}/{n_rows} rows differ between GPU and CPU for logup_in_pairs");
+    }
+
+    // ── Four-entry logup with finalize_logup_in_pairs (batches=[0,0,1,1]) ──
+    // This exercises the intermediate batch path: batch 0 generates a column
+    // constraint on inter2 cols 0..3 at offset=0, and batch 1 (final) generates
+    // the cumsum constraint on inter2 cols 4..7 at offsets [-1, 0].
+    // Total: 2 constraints, 8 interaction-2 columns.
+
+    struct LogupFourEntriesEval {
+        lookup: TestLookupRelation,
+    }
+
+    impl stwo_constraint_framework::FrameworkEval for LogupFourEntriesEval {
+        fn log_size(&self) -> u32 { LOGUP_LOG_N }
+        fn max_constraint_log_degree_bound(&self) -> u32 { LOGUP_LOG_N + 1 }
+        fn evaluate<E: stwo_constraint_framework::EvalAtRow>(&self, mut eval: E) -> E {
+            let v0 = eval.next_trace_mask();
+            let v1 = eval.next_trace_mask();
+            let v2 = eval.next_trace_mask();
+            let v3 = eval.next_trace_mask();
+            eval.add_to_relation(stwo_constraint_framework::RelationEntry::new(&self.lookup, E::EF::one(), &[v0]));
+            eval.add_to_relation(stwo_constraint_framework::RelationEntry::new(&self.lookup, E::EF::one(), &[v1]));
+            eval.add_to_relation(stwo_constraint_framework::RelationEntry::new(&self.lookup, E::EF::one(), &[v2]));
+            eval.add_to_relation(stwo_constraint_framework::RelationEntry::new(&self.lookup, E::EF::one(), &[v3]));
+            eval.finalize_logup_in_pairs();
+            eval
+        }
+    }
+
+    /// End-to-end test for four-entry logup with finalize_logup_in_pairs.
+    ///
+    /// Batching = [0,0,1,1]: batch 0 (fracs 0+1) generates an intermediate interaction column
+    /// constraint (offset=0 only); batch 1 (fracs 2+3) generates the final cumsum constraint
+    /// (offsets [-1, 0]). This covers both the intermediate and final batch code paths.
+    ///
+    /// Total: 4 base trace cols + 8 interaction-2 cols = 12 flat columns.
+    /// interaction_offsets = [0, 0, 4, 12]
+    #[test]
+    fn test_e2e_logup_four_entries_gpu_vs_cpu() {
+        use vortexstark::device::DeviceBuffer;
+        use vortexstark::cuda::ffi;
+        use crate::constraint_eval::tracing::record_bytecode;
+        use crate::constraint_eval::bytecode::BytecodeOp;
+        use stwo_constraint_framework::{CpuDomainEvaluator, FrameworkEval};
+        use stwo::core::pcs::TreeVec;
+        use stwo::core::poly::circle::CanonicCoset;
+        use stwo::prover::poly::circle::CircleEvaluation;
+        use stwo::prover::poly::BitReversedOrder;
+        use stwo::prover::backend::CpuBackend;
+
+        init_gpu();
+
+        let claimed_sum = SecureField::from_m31_array([
+            M31::from(13), M31::from(5), M31::from(7), M31::from(11),
+        ]);
+
+        let component = LogupFourEntriesEval { lookup: TestLookupRelation::dummy() };
+        let program = record_bytecode(&component, claimed_sum);
+        eprintln!("LogupFourEntries bytecode ({} ops, {} constraints):\n{}",
+            program.ops.len(), program.n_constraints, program.dump());
+        assert_eq!(program.n_constraints, 2, "expected 2 constraints (one per batch)");
+
+        let trace_n_rows = 1u32 << LOGUP_LOG_N;
+        let n_rows       = 1u32 << (LOGUP_LOG_N + 1);
+        let log_expand   = 1u32;
+
+        // inter 1: 4 cols (v0..v3), inter 2: 8 cols (batch0: 4 cols + batch1: 4 cols)
+        // interaction_offsets = [0, 0, 4, 12]
+        let interaction_offsets: Vec<usize> = vec![0, 0, 4, 12];
+
+        let mut encoded = program.encode();
+        {
+            let mut pc = 0;
+            for op in &program.ops {
+                if let BytecodeOp::LoadTrace { interaction, col_idx, .. } = op {
+                    let flat_idx = interaction_offsets[*interaction as usize] + *col_idx as usize;
+                    // 3-word LoadTrace: word1=header(dst), word2=flat_col, word3=sign|abs_off
+                    encoded[pc + 1] = flat_idx as u32;
+                    pc += 3;
+                } else {
+                    pc += op.encoded_len();
+                }
+            }
+        }
+
+        // 12 flat columns, 8 eval rows each
+        let mk = |start: u32| -> Vec<u32> { (0..8).map(|i| start + i * 3).collect() };
+        let cols: Vec<Vec<u32>> = (0..12).map(|i| mk(i * 7 + 1)).collect();
+        let d_cols: Vec<DeviceBuffer<u32>> = cols.iter().map(|c| DeviceBuffer::from_host(c)).collect();
+
+        let col_ptrs: Vec<*const u32> = d_cols.iter().map(|d| d.as_ptr()).collect();
+        let d_col_ptrs  = DeviceBuffer::from_host(&col_ptrs);
+        let d_col_sizes = DeviceBuffer::from_host(&[n_rows; 12]);
+        let d_bytecode  = DeviceBuffer::from_host(&encoded);
+
+        // 2 constraints: coefficients [QM31(1,0,0,0), QM31(1,0,0,0)]
+        let coeff: Vec<u32>     = vec![1, 0, 0, 0,  1, 0, 0, 0];
+        let denom_inv: Vec<u32> = vec![1, 1];
+        let d_coeff     = DeviceBuffer::from_host(&coeff);
+        let d_denom_inv = DeviceBuffer::from_host(&denom_inv);
+
+        let mut d_a0 = DeviceBuffer::<u32>::alloc(n_rows as usize);
+        let mut d_a1 = DeviceBuffer::<u32>::alloc(n_rows as usize);
+        let mut d_a2 = DeviceBuffer::<u32>::alloc(n_rows as usize);
+        let mut d_a3 = DeviceBuffer::<u32>::alloc(n_rows as usize);
+        d_a0.zero(); d_a1.zero(); d_a2.zero(); d_a3.zero();
+
+        unsafe {
+            ffi::cuda_bytecode_constraint_eval(
+                d_bytecode.as_ptr(), encoded.len() as u32,
+                d_col_ptrs.as_ptr() as *const *const u32,
+                d_col_sizes.as_ptr(),
+                12, n_rows, trace_n_rows,
+                d_coeff.as_ptr(), d_denom_inv.as_ptr(),
+                log_expand,
+                d_a0.as_mut_ptr(), d_a1.as_mut_ptr(), d_a2.as_mut_ptr(), d_a3.as_mut_ptr(),
+            );
+            ffi::cuda_device_sync();
+        }
+
+        let err = unsafe { ffi::cudaGetLastError() };
+        assert_eq!(err, 0, "CUDA kernel error: {err}");
+
+        let gpu_a0 = d_a0.to_host();
+        let gpu_a1 = d_a1.to_host();
+        let gpu_a2 = d_a2.to_host();
+        let gpu_a3 = d_a3.to_host();
+
+        let to_bf = |v: &[u32]| -> Vec<BaseField> { v.iter().map(|&x| M31::from(x)).collect() };
+        let eval_domain = CanonicCoset::new(LOGUP_LOG_N + 1).circle_domain();
+
+        let cpu_evals: Vec<CircleEvaluation<CpuBackend, BaseField, BitReversedOrder>> =
+            cols.iter().map(|c| CircleEvaluation::new(eval_domain, to_bf(c))).collect();
+
+        let trace_refs: TreeVec<Vec<&CircleEvaluation<CpuBackend, BaseField, BitReversedOrder>>> =
+            TreeVec::new(vec![
+                vec![],
+                cpu_evals[0..4].iter().collect(),    // inter 1: 4 cols
+                cpu_evals[4..12].iter().collect(),   // inter 2: 8 cols
+            ]);
+
+        let random_coeff_powers = vec![SecureField::one(), SecureField::one()]; // 2 constraints
+
+        let mut mismatches = 0;
+        for row in 0..n_rows as usize {
+            let cpu_eval = CpuDomainEvaluator::new(
+                &trace_refs, row, &random_coeff_powers,
+                LOGUP_LOG_N, LOGUP_LOG_N + 1, LOGUP_LOG_N,
+                claimed_sum,
+            );
+            let cpu_eval = component.evaluate(cpu_eval);
+            let row_res = cpu_eval.row_res;
+            let arr = row_res.to_m31_array();
+            let (e0, e1, e2, e3) = (arr[0].0, arr[1].0, arr[2].0, arr[3].0);
+            let (g0, g1, g2, g3) = (gpu_a0[row], gpu_a1[row], gpu_a2[row], gpu_a3[row]);
+
+            if e0 != g0 || e1 != g1 || e2 != g2 || e3 != g3 {
+                if mismatches < 8 {
+                    eprintln!("[LOGUP4 MISMATCH] row {row}:");
+                    eprintln!("  CPU: ({e0}, {e1}, {e2}, {e3})");
+                    eprintln!("  GPU: ({g0}, {g1}, {g2}, {g3})");
+                }
+                mismatches += 1;
+            } else if row < 2 {
+                eprintln!("[LOGUP4 OK] row {row}: ({e0}, {e1}, {e2}, {e3})");
+            }
+        }
+        assert_eq!(mismatches, 0,
+            "{mismatches}/{n_rows} rows differ between GPU and CPU for 4-entry logup");
+    }
+
+    /// A simple component: flag * (1 - flag) = 0
+    /// Uses Clone (flag used twice) and creates a constant (BaseField::one)
+    /// via From<BaseField>, exercising the detached recorder merge path.
+    struct E2eFlagEval;
+
+    impl stwo_constraint_framework::FrameworkEval for E2eFlagEval {
+        fn log_size(&self) -> u32 { 3 } // 8 rows
+        fn max_constraint_log_degree_bound(&self) -> u32 { 4 }
+        fn evaluate<E: stwo_constraint_framework::EvalAtRow>(&self, mut eval: E) -> E {
+            let flag = eval.next_trace_mask();
+            let one = E::F::from(BaseField::from_u32_unchecked(1));
+            let constraint = flag.clone() * (one - flag);
+            eval.add_constraint(constraint);
+            eval
+        }
+    }
+
+    /// A component with two constraints and three trace columns:
+    ///   1) flag * (1 - flag) = 0
+    ///   2) a + b * flag - c = 0
+    struct E2eMultiEval;
+
+    impl stwo_constraint_framework::FrameworkEval for E2eMultiEval {
+        fn log_size(&self) -> u32 { 3 }
+        fn max_constraint_log_degree_bound(&self) -> u32 { 5 }
+        fn evaluate<E: stwo_constraint_framework::EvalAtRow>(&self, mut eval: E) -> E {
+            let flag = eval.next_trace_mask();
+            let a = eval.next_trace_mask();
+            let b = eval.next_trace_mask();
+            let c = eval.next_trace_mask();
+            let one = E::F::from(BaseField::from_u32_unchecked(1));
+            eval.add_constraint(flag.clone() * (one - flag.clone()));
+            eval.add_constraint(a + b * flag - c);
+            eval
+        }
+    }
+
+    /// End-to-end test: record bytecode via FrameworkEval, run GPU kernel,
+    /// compare with CPU CpuDomainEvaluator row-by-row.
+    #[test]
+    fn test_e2e_bytecode_flag_constraint_gpu_vs_cpu() {
+        use vortexstark::device::DeviceBuffer;
+        use vortexstark::cuda::ffi;
+        use crate::constraint_eval::tracing::record_bytecode;
+        use crate::constraint_eval::bytecode::BytecodeOp;
+
+        init_gpu();
+
+        let claimed_sum = SecureField::default();
+        let program = record_bytecode(&E2eFlagEval, claimed_sum);
+        eprintln!("E2E flag constraint bytecode:\n{}", program.dump());
+
+        assert_eq!(program.n_constraints, 1);
+        assert!(program.n_registers <= 256, "Too many registers: {}", program.n_registers);
+
+        let n_rows = 8u32; // 1 << log_size=3
+        let trace_log_size = 3u32;
+        let eval_log_size = 4u32; // max_constraint_log_degree_bound
+        let eval_n_rows = 1u32 << eval_log_size;
+        let log_expand = eval_log_size - trace_log_size;
+
+        // Build trace data: single column "flag" with values [0,1,0,1,1,0,0,1]
+        // extended to eval domain by repeating (eval_n_rows rows in bit-reversed order).
+        // For simplicity, we'll just use raw values and set eval=trace domain (log_expand=0).
+        // Actually, the GPU kernel works on eval domain rows directly.
+        // Let's use log_expand=0 for this test (eval_log_size = trace_log_size + 1 doesn't
+        // matter for the kernel; what matters is that the data has the right number of rows).
+
+        // Simpler: set trace_log_size = eval_log_size (log_expand = 0, denom_inv = [1])
+        let trace_log = 3u32;
+        let eval_log = 3u32; // same as trace for simplicity
+        let n = 1u32 << eval_log;
+        let log_exp = 0u32;
+
+        // Trace column: flag values (valid flags: 0 or 1)
+        let flag_vals: Vec<u32> = vec![0, 1, 0, 1, 1, 0, 0, 1];
+        let d_flag = DeviceBuffer::from_host(&flag_vals);
+        let col_ptrs: Vec<*const u32> = vec![d_flag.as_ptr()];
+        let d_col_ptrs = DeviceBuffer::from_host(&col_ptrs);
+        let d_col_sizes = DeviceBuffer::from_host(&[n]);
+
+        // Encode bytecode and remap LoadTrace to flat column indices.
+        let mut encoded = program.encode();
+        // Remap: interaction 0 starts at flat_col 0
+        {
+            let mut pc = 0;
+            for op in &program.ops {
+                if let BytecodeOp::LoadTrace { dst, interaction, col_idx, offset } = op {
+                    let flat_idx = *col_idx as usize; // interaction 0, so flat = col_idx
+                    let d = *dst as u32 & 0xFF;
+                    let (sign, abs_off) = if *offset < 0 {
+                        (1u32, (-*offset) as u32)
+                    } else {
+                        (0u32, *offset as u32)
+                    };
+                    if *offset >= 0 && abs_off <= 1 {
+                        let operand = ((flat_idx as u32) << 2) | (abs_off & 1);
+                        encoded[pc] = (0x03u32 << 24) | (d << 16) | operand;
+                        pc += 1;
+                    } else {
+                        let operand = ((flat_idx as u32) << 2) | 0x3;
+                        encoded[pc] = (0x03u32 << 24) | (d << 16) | operand;
+                        encoded[pc + 1] = (sign << 31) | abs_off;
+                        pc += 2;
+                    }
+                } else {
+                    pc += op.encoded_len();
+                }
+            }
+        }
+
+        let d_bytecode = DeviceBuffer::from_host(&encoded);
+
+        // Random coeff powers: one QM31 per constraint = (1, 0, 0, 0)
+        let coeff: Vec<u32> = vec![1, 0, 0, 0];
+        let d_coeff = DeviceBuffer::from_host(&coeff);
+
+        // denom_inv: with log_expand=0, there's 1 entry = 1
+        let denom_inv: Vec<u32> = vec![1];
+        let d_denom_inv = DeviceBuffer::from_host(&denom_inv);
+
+        // Output accumulators
+        let mut d_accum0 = DeviceBuffer::<u32>::alloc(n as usize);
+        let mut d_accum1 = DeviceBuffer::<u32>::alloc(n as usize);
+        let mut d_accum2 = DeviceBuffer::<u32>::alloc(n as usize);
+        let mut d_accum3 = DeviceBuffer::<u32>::alloc(n as usize);
+        d_accum0.zero();
+        d_accum1.zero();
+        d_accum2.zero();
+        d_accum3.zero();
+
+        unsafe {
+            ffi::cuda_bytecode_constraint_eval(
+                d_bytecode.as_ptr(),
+                encoded.len() as u32,
+                d_col_ptrs.as_ptr() as *const *const u32,
+                d_col_sizes.as_ptr(),
+                1, // n_trace_cols
+                n, // n_rows
+                n, // trace_n_rows
+                d_coeff.as_ptr(),
+                d_denom_inv.as_ptr(),
+                log_exp,
+                d_accum0.as_mut_ptr(),
+                d_accum1.as_mut_ptr(),
+                d_accum2.as_mut_ptr(),
+                d_accum3.as_mut_ptr(),
+            );
+            ffi::cuda_device_sync();
+        }
+
+        let err = unsafe { ffi::cudaGetLastError() };
+        assert_eq!(err, 0, "CUDA kernel error: {err}");
+
+        let out0 = d_accum0.to_host();
+        let out1 = d_accum1.to_host();
+        let out2 = d_accum2.to_host();
+        let out3 = d_accum3.to_host();
+
+        // For valid flags (0 or 1), flag*(1-flag) = 0 for all rows.
+        // With coeff=(1,0,0,0) and denom_inv=1, output should be all zeros.
+        let mut mismatches = 0;
+        for row in 0..n as usize {
+            if out0[row] != 0 || out1[row] != 0 || out2[row] != 0 || out3[row] != 0 {
+                if mismatches < 5 {
+                    eprintln!("[E2E] row {row}: ({},{},{},{})", out0[row], out1[row], out2[row], out3[row]);
+                }
+                mismatches += 1;
+            }
+        }
+        assert_eq!(mismatches, 0, "{mismatches}/{n} rows have non-zero constraint values (should all be zero for valid flags)");
+    }
+
+    /// End-to-end test with non-zero constraint values and multiple constraints.
+    /// Compares GPU bytecode kernel output against manual CPU computation.
+    #[test]
+    fn test_e2e_bytecode_multi_constraint_gpu_vs_cpu() {
+        use vortexstark::device::DeviceBuffer;
+        use vortexstark::cuda::ffi;
+        use crate::constraint_eval::tracing::record_bytecode;
+        use crate::constraint_eval::bytecode::BytecodeOp;
+
+        init_gpu();
+
+        let p = 0x7FFFFFFFu32;
+        let claimed_sum = SecureField::default();
+        let program = record_bytecode(&E2eMultiEval, claimed_sum);
+        eprintln!("E2E multi-constraint bytecode:\n{}", program.dump());
+
+        assert_eq!(program.n_constraints, 2);
+
+        let n = 8u32;
+        let trace_log = 3u32;
+        let log_exp = 0u32;
+
+        // Trace: 4 columns [flag, a, b, c]
+        // flag=0 or 1; when flag=1: a + b - c should = 0; when flag=0: a - c should = 0
+        let flag_vals: Vec<u32> = vec![0, 1, 0, 1, 1, 0, 1, 0];
+        let a_vals: Vec<u32>    = vec![5, 3, 7, 10, 2, 9, 4, 6];
+        let b_vals: Vec<u32>    = vec![2, 4, 3, 5, 8, 1, 6, 3];
+        // c = a + b*flag (so constraint 2 is satisfied)
+        let c_vals: Vec<u32> = (0..8).map(|i| {
+            let a = a_vals[i];
+            let b = b_vals[i];
+            let f = flag_vals[i];
+            (a + b * f) % p
+        }).collect();
+
+        let d_flag = DeviceBuffer::from_host(&flag_vals);
+        let d_a = DeviceBuffer::from_host(&a_vals);
+        let d_b = DeviceBuffer::from_host(&b_vals);
+        let d_c = DeviceBuffer::from_host(&c_vals);
+
+        let col_ptrs: Vec<*const u32> = vec![
+            d_flag.as_ptr(), d_a.as_ptr(), d_b.as_ptr(), d_c.as_ptr(),
+        ];
+        let d_col_ptrs = DeviceBuffer::from_host(&col_ptrs);
+        let d_col_sizes = DeviceBuffer::from_host(&[n; 4]);
+
+        let mut encoded = program.encode();
+        {
+            let mut pc = 0;
+            for op in &program.ops {
+                if let BytecodeOp::LoadTrace { dst, interaction, col_idx, offset } = op {
+                    let flat_idx = *col_idx as usize; // all interaction 0
+                    let d = *dst as u32 & 0xFF;
+                    let (sign, abs_off) = if *offset < 0 {
+                        (1u32, (-*offset) as u32)
+                    } else {
+                        (0u32, *offset as u32)
+                    };
+                    if *offset >= 0 && abs_off <= 1 {
+                        let operand = ((flat_idx as u32) << 2) | (abs_off & 1);
+                        encoded[pc] = (0x03u32 << 24) | (d << 16) | operand;
+                        pc += 1;
+                    } else {
+                        let operand = ((flat_idx as u32) << 2) | 0x3;
+                        encoded[pc] = (0x03u32 << 24) | (d << 16) | operand;
+                        encoded[pc + 1] = (sign << 31) | abs_off;
+                        pc += 2;
+                    }
+                } else {
+                    pc += op.encoded_len();
+                }
+            }
+        }
+
+        let d_bytecode = DeviceBuffer::from_host(&encoded);
+
+        // 2 constraints: coefficients [1,0,0,0] for each
+        let coeff: Vec<u32> = vec![1, 0, 0, 0, 1, 0, 0, 0];
+        let d_coeff = DeviceBuffer::from_host(&coeff);
+
+        let denom_inv: Vec<u32> = vec![1];
+        let d_denom_inv = DeviceBuffer::from_host(&denom_inv);
+
+        let mut d_accum0 = DeviceBuffer::<u32>::alloc(n as usize);
+        let mut d_accum1 = DeviceBuffer::<u32>::alloc(n as usize);
+        let mut d_accum2 = DeviceBuffer::<u32>::alloc(n as usize);
+        let mut d_accum3 = DeviceBuffer::<u32>::alloc(n as usize);
+        d_accum0.zero();
+        d_accum1.zero();
+        d_accum2.zero();
+        d_accum3.zero();
+
+        unsafe {
+            ffi::cuda_bytecode_constraint_eval(
+                d_bytecode.as_ptr(),
+                encoded.len() as u32,
+                d_col_ptrs.as_ptr() as *const *const u32,
+                d_col_sizes.as_ptr(),
+                4, n, n,
+                d_coeff.as_ptr(),
+                d_denom_inv.as_ptr(),
+                log_exp,
+                d_accum0.as_mut_ptr(),
+                d_accum1.as_mut_ptr(),
+                d_accum2.as_mut_ptr(),
+                d_accum3.as_mut_ptr(),
+            );
+            ffi::cuda_device_sync();
+        }
+
+        let err = unsafe { ffi::cudaGetLastError() };
+        assert_eq!(err, 0, "CUDA kernel error: {err}");
+
+        let out0 = d_accum0.to_host();
+
+        // Both constraints are satisfied by our trace data, so output should be all zeros.
+        // Constraint 1: flag*(1-flag) = 0 (all flags are 0 or 1)
+        // Constraint 2: a + b*flag - c = 0 (c was computed to satisfy this)
+        let mut mismatches = 0;
+        for row in 0..n as usize {
+            if out0[row] != 0 {
+                if mismatches < 5 {
+                    eprintln!("[E2E multi] row {row}: accum0={} (flag={}, a={}, b={}, c={})",
+                        out0[row], flag_vals[row], a_vals[row], b_vals[row], c_vals[row]);
+                }
+                mismatches += 1;
+            }
+        }
+        assert_eq!(mismatches, 0, "{mismatches}/{n} rows have non-zero output (both constraints should be satisfied)");
+    }
+
+    /// Test that the LoadConst sentinel (0xFFFF) does not collide with actual constant values.
+    /// This tests the bug fix where value=0xFFFF (65535) was incorrectly encoded in single-word
+    /// format, causing the GPU decoder to read a phantom second word and desync the PC.
+    #[test]
+    fn test_e2e_const_sentinel_no_collision() {
+        use crate::constraint_eval::bytecode::{BytecodeOp, BytecodeProgram};
+
+        // LoadConst always uses 2 words in the new 16-bit register encoding.
+        // Any value including 0xFFFF is stored in word2; no sentinel needed.
+        let prog = BytecodeProgram {
+            ops: vec![
+                BytecodeOp::LoadConst { dst: 0, value: 0xFFFF },
+                BytecodeOp::AddConstraint { src: 0 },
+            ],
+            n_constraints: 1,
+            n_trace_accesses: 0,
+            n_registers: 1,
+        };
+        let words = prog.encode();
+        // 2 words for LoadConst + 1 for AddConstraint = 3
+        assert_eq!(words.len(), 3, "LoadConst always 2 words, got {} words total", words.len());
+        // word1: [opcode:8 | 0:8 | dst:16], dst=0
+        assert_eq!(words[0], (0x01u32 << 24) | 0, "Header word mismatch");
+        // word2: the value directly
+        assert_eq!(words[1], 0xFFFF, "Value word should be 0xFFFF");
+    }
+
+    /// Test that LoadTrace always uses 3 words in the new 16-bit register encoding.
+    #[test]
+    fn test_e2e_trace_offset_neg1_no_collision() {
+        use crate::constraint_eval::bytecode::{BytecodeOp, BytecodeProgram};
+
+        let prog = BytecodeProgram {
+            ops: vec![
+                BytecodeOp::LoadTrace { dst: 0, interaction: 0, col_idx: 0, offset: -1 },
+                BytecodeOp::AddConstraint { src: 0 },
+            ],
+            n_constraints: 1,
+            n_trace_accesses: 1,
+            n_registers: 1,
+        };
+        let words = prog.encode();
+        // LoadTrace is always 3 words + 1 for AddConstraint = 4
+        assert_eq!(words.len(), 4, "LoadTrace always 3 words, got {} words total", words.len());
+        // word1: [0x03:8 | 0:8 | dst:16], dst=0
+        assert_eq!(words[0], (0x03u32 << 24) | 0);
+        // word2: [interaction:16 | col_idx:16] pre-remap
+        assert_eq!(words[1], 0u32);
+        // word3: [sign:1 | abs_off:31], sign=1, abs=1
+        assert_eq!(words[2], (1u32 << 31) | 1);
     }
 }

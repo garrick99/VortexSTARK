@@ -234,13 +234,49 @@ impl PolyOps for CudaBackend {
         evals: &CircleEvaluation<Self, BaseField, BitReversedOrder>,
         weights: &CudaColumn<SecureField>,
     ) -> SecureField {
-        // CPU fallback — barycentric eval is a weighted dot product, small
-        // TODO: GPU dot product kernel
-        let cpu_evals = CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(
-            evals.domain, evals.values.to_cpu(),
-        );
-        let cpu_weights = weights.to_cpu();
-        CpuBackend::barycentric_eval_at_point(&cpu_evals, &cpu_weights)
+        use vortexstark::cuda::ffi;
+        use vortexstark::device::DeviceBuffer;
+
+        let n = evals.values.len() as u32;
+        if n == 0 {
+            return SecureField::default();
+        }
+
+        // Launch at most 256 blocks of 256 threads each.
+        // CPU final-reduces the partial sums (at most 256 QM31 values).
+        const MAX_BLOCKS: u32 = 256;
+        let n_blocks = ((n + 255) / 256).min(MAX_BLOCKS);
+
+        let d_out = DeviceBuffer::<u32>::alloc((n_blocks * 4) as usize);
+        unsafe {
+            ffi::cuda_barycentric_eval(
+                evals.values.device_ptr(),
+                weights.device_ptr(),
+                n,
+                d_out.as_ptr() as *mut u32,
+                n_blocks,
+            );
+        }
+
+        // Download partial sums and reduce on CPU.
+        let partial = d_out.to_host();
+        let m31_add = |a: u32, b: u32| -> u32 {
+            let s = a + b;
+            if s >= 0x7FFF_FFFFu32 { s - 0x7FFF_FFFFu32 } else { s }
+        };
+        let mut result = [0u32; 4];
+        for b in 0..n_blocks as usize {
+            for j in 0..4 {
+                result[j] = m31_add(result[j], partial[b * 4 + j]);
+            }
+        }
+        use stwo::core::fields::m31::M31;
+        SecureField::from_m31_array([
+            M31::from_u32_unchecked(result[0]),
+            M31::from_u32_unchecked(result[1]),
+            M31::from_u32_unchecked(result[2]),
+            M31::from_u32_unchecked(result[3]),
+        ])
     }
 
     fn eval_at_point_by_folding(

@@ -7,31 +7,48 @@
 //!
 //! ## Encoding format
 //!
-//! Each instruction is encoded as 1 or more u32 words:
+//! All register indices are 16-bit (u16), supporting up to 65536 virtual registers.
+//! Every instruction begins with a header word `[opcode:8 | 0:8 | dst:16]`.
 //!
 //! **3-register ops** (Add, Sub, Mul, WideAdd, ...):
-//!   `[opcode:8 | dst:8 | src1:8 | src2:8]` — 1 word
+//!   word1: `[opcode:8 | 0:8 | dst:16]`
+//!   word2: `[src1:16 | src2:16]`
 //!
 //! **2-register ops** (Neg, WideNeg, Widen):
-//!   `[opcode:8 | dst:8 | src:8 | 0:8]` — 1 word
-//!
-//! **LoadTrace**:
-//!   `[opcode:8 | dst:8 | flat_col:14 | sign:1 | abs_offset:1]` — 1 word (after remap)
-//!   Pre-remap: `[opcode:8 | dst:8 | interaction:4 | col_idx:10 | sign:1 | abs_offset:1]`
-//!   For offsets > 1: 2 words — header + packed (flat_col:16 | sign:1 | abs_offset:15)
+//!   word1: `[opcode:8 | 0:8 | dst:16]`
+//!   word2: `[src:16 | 0:16]`
 //!
 //! **LoadConst**:
-//!   Small (< 2^16): `[opcode:8 | dst:8 | value:16]` — 1 word
-//!   Large: `[opcode:8 | dst:8 | 0xFFFF:16]` + full u32 — 2 words
+//!   word1: `[opcode:8 | 0:8 | dst:16]`
+//!   word2: `[value:32]`
 //!
-//! **LoadSecureConst**: header `[opcode:8 | dst:8 | 0:16]` + 4 data words — 5 words
+//! **LoadSecureConst**:
+//!   word1: `[opcode:8 | 0:8 | dst:16]`
+//!   words 2–5: value[0..3]
 //!
-//! **ConstOps** (AddConst, MulConst, WideAddConst, etc.):
-//!   Similar to LoadConst/LoadSecureConst but with src register in place of dst.
+//! **LoadTrace** (pre-remap):
+//!   word1: `[opcode:8 | 0:8 | dst:16]`
+//!   word2: `[interaction:16 | col_idx:16]`
+//!   word3: `[sign:1 | abs_offset:31]`
+//!   After remap by component_prover.rs:
+//!   word2: `[flat_col:32]`  (word3 unchanged)
 //!
-//! **AddConstraint**: `[opcode:8 | src:8 | 0:16]` — 1 word
+//! **ConstOps** (AddConst, MulConst):
+//!   word1: `[opcode:8 | 0:8 | dst:16]`
+//!   word2: `[src:16 | 0:16]`
+//!   word3: `[value:32]`
 //!
-//! **CombineEF**: `[opcode:8 | dst:8 | src0:8 | src1:8]` + `[src2:8 | src3:8 | 0:16]` — 2 words
+//! **SecureConstOps** (WideAddConst, WideMulConst, BaseAddSecureConst, BaseMulSecureConst):
+//!   word1: `[opcode:8 | 0:8 | dst:16]`
+//!   word2: `[src:16 | 0:16]`
+//!   words 3–6: value[0..3]
+//!
+//! **CombineEF**:
+//!   word1: `[opcode:8 | 0:8 | dst:16]`
+//!   word2: `[src0:16 | src1:16]`
+//!   word3: `[src2:16 | src3:16]`
+//!
+//! **AddConstraint**: `[opcode:8 | 0:8 | src:16]` — 1 word (no dst)
 
 use std::fmt;
 
@@ -152,127 +169,116 @@ const OP_ADD_CONSTRAINT: u8 = 0x40;
 impl BytecodeProgram {
     /// Encode the bytecode program as a flat `Vec<u32>` for GPU consumption.
     ///
-    /// Register-based encoding: each op encodes dst/src register indices inline.
-    /// All register indices are u8 (max 255 registers).
+    /// All register indices are 16-bit (max 65535 registers).
     pub fn encode(&self) -> Vec<u32> {
-        let mut words = Vec::with_capacity(self.ops.len() * 2);
+        let mut words = Vec::with_capacity(self.ops.len() * 3);
 
         for op in &self.ops {
             match op {
                 BytecodeOp::LoadConst { dst, value } => {
-                    let d = *dst as u32 & 0xFF;
-                    if *value < (1 << 16) {
-                        // Single word: [opcode:8 | dst:8 | value:16]
-                        words.push(((OP_LOAD_CONST as u32) << 24) | (d << 16) | *value);
-                    } else {
-                        // Two words: header with 0xFFFF marker, then full value
-                        words.push(((OP_LOAD_CONST as u32) << 24) | (d << 16) | 0xFFFF);
-                        words.push(*value);
-                    }
+                    // 2 words: header + value
+                    words.push(hdr(OP_LOAD_CONST, *dst));
+                    words.push(*value);
                 }
                 BytecodeOp::LoadSecureConst { dst, value } => {
-                    let d = *dst as u32 & 0xFF;
-                    words.push(((OP_LOAD_SECURE_CONST as u32) << 24) | (d << 16));
+                    // 5 words: header + 4 data words
+                    words.push(hdr(OP_LOAD_SECURE_CONST, *dst));
                     words.extend_from_slice(value);
                 }
                 BytecodeOp::LoadTrace { dst, interaction, col_idx, offset } => {
-                    // Pre-remap encoding (Rust side sees interaction/col_idx).
-                    // component_prover.rs will remap to flat col indices.
-                    // Encoding: word1 = [opcode:8 | dst:8 | interaction:4 | col_idx:10 | sign:1 | abs_offset:1]
-                    // For |offset| > 1: word1 marker + word2 with full offset
-                    let d = *dst as u32 & 0xFF;
-                    let inter = (*interaction as u32) & 0xF;
-                    let col = (*col_idx as u32) & 0x3FF;
+                    // 3 words: header, [interaction:16|col_idx:16], [sign:1|abs_off:31]
+                    // component_prover.rs will remap word2 to flat_col.
                     let (sign, abs_off) = if *offset < 0 {
                         (1u32, (-*offset) as u32)
                     } else {
                         (0u32, *offset as u32)
                     };
-                    if abs_off <= 1 {
-                        let operand = (inter << 12) | (col << 2) | (sign << 1) | (abs_off & 1);
-                        words.push(((OP_LOAD_TRACE as u32) << 24) | (d << 16) | operand);
-                    } else {
-                        // Extended: marker bit in operand, second word has full info
-                        let operand = (inter << 12) | (col << 2) | 0x3; // 0x3 = both bits set = marker
-                        words.push(((OP_LOAD_TRACE as u32) << 24) | (d << 16) | operand);
-                        words.push((sign << 31) | abs_off);
-                    }
+                    words.push(hdr(OP_LOAD_TRACE, *dst));
+                    words.push(((*interaction as u32) << 16) | (*col_idx as u32));
+                    words.push((sign << 31) | abs_off);
                 }
 
-                // 3-register arithmetic: [opcode:8 | dst:8 | src1:8 | src2:8]
+                // 3-register arithmetic: 2 words
                 BytecodeOp::Add { dst, src1, src2 } => {
-                    words.push(encode_3reg(OP_ADD, *dst, *src1, *src2));
+                    encode_3reg(&mut words, OP_ADD, *dst, *src1, *src2);
                 }
                 BytecodeOp::Sub { dst, src1, src2 } => {
-                    words.push(encode_3reg(OP_SUB, *dst, *src1, *src2));
+                    encode_3reg(&mut words, OP_SUB, *dst, *src1, *src2);
                 }
                 BytecodeOp::Mul { dst, src1, src2 } => {
-                    words.push(encode_3reg(OP_MUL, *dst, *src1, *src2));
+                    encode_3reg(&mut words, OP_MUL, *dst, *src1, *src2);
                 }
                 BytecodeOp::WideAdd { dst, src1, src2 } => {
-                    words.push(encode_3reg(OP_WIDE_ADD, *dst, *src1, *src2));
+                    encode_3reg(&mut words, OP_WIDE_ADD, *dst, *src1, *src2);
                 }
                 BytecodeOp::WideSub { dst, src1, src2 } => {
-                    words.push(encode_3reg(OP_WIDE_SUB, *dst, *src1, *src2));
+                    encode_3reg(&mut words, OP_WIDE_SUB, *dst, *src1, *src2);
                 }
                 BytecodeOp::WideMul { dst, src1, src2 } => {
-                    words.push(encode_3reg(OP_WIDE_MUL, *dst, *src1, *src2));
+                    encode_3reg(&mut words, OP_WIDE_MUL, *dst, *src1, *src2);
                 }
                 BytecodeOp::WideAddBase { dst, wide, base } => {
-                    words.push(encode_3reg(OP_WIDE_ADD_BASE, *dst, *wide, *base));
+                    encode_3reg(&mut words, OP_WIDE_ADD_BASE, *dst, *wide, *base);
                 }
                 BytecodeOp::WideMulBase { dst, wide, base } => {
-                    words.push(encode_3reg(OP_WIDE_MUL_BASE, *dst, *wide, *base));
+                    encode_3reg(&mut words, OP_WIDE_MUL_BASE, *dst, *wide, *base);
                 }
 
-                // 2-register ops: [opcode:8 | dst:8 | src:8 | 0:8]
+                // 2-register ops: 2 words
                 BytecodeOp::Neg { dst, src } => {
-                    words.push(encode_2reg(OP_NEG, *dst, *src));
+                    encode_2reg(&mut words, OP_NEG, *dst, *src);
                 }
                 BytecodeOp::WideNeg { dst, src } => {
-                    words.push(encode_2reg(OP_WIDE_NEG, *dst, *src));
+                    encode_2reg(&mut words, OP_WIDE_NEG, *dst, *src);
                 }
                 BytecodeOp::Widen { dst, src } => {
-                    words.push(encode_2reg(OP_WIDEN, *dst, *src));
+                    encode_2reg(&mut words, OP_WIDEN, *dst, *src);
                 }
 
-                // Const ops: [opcode:8 | dst:8 | src:8 | 0:8] + value word(s)
+                // M31 const ops: 3 words (header + src word + value)
                 BytecodeOp::AddConst { dst, src, value } => {
-                    words.push(encode_2reg(OP_ADD_CONST, *dst, *src));
+                    words.push(hdr(OP_ADD_CONST, *dst));
+                    words.push((*src as u32) << 16);
                     words.push(*value);
                 }
                 BytecodeOp::MulConst { dst, src, value } => {
-                    words.push(encode_2reg(OP_MUL_CONST, *dst, *src));
+                    words.push(hdr(OP_MUL_CONST, *dst));
+                    words.push((*src as u32) << 16);
                     words.push(*value);
                 }
+
+                // QM31 const ops: 6 words (header + src word + 4 data words)
                 BytecodeOp::WideAddConst { dst, src, value } => {
-                    words.push(encode_2reg(OP_WIDE_ADD_CONST, *dst, *src));
+                    words.push(hdr(OP_WIDE_ADD_CONST, *dst));
+                    words.push((*src as u32) << 16);
                     words.extend_from_slice(value);
                 }
                 BytecodeOp::WideMulConst { dst, src, value } => {
-                    words.push(encode_2reg(OP_WIDE_MUL_CONST, *dst, *src));
+                    words.push(hdr(OP_WIDE_MUL_CONST, *dst));
+                    words.push((*src as u32) << 16);
                     words.extend_from_slice(value);
                 }
                 BytecodeOp::BaseAddSecureConst { dst, src, value } => {
-                    words.push(encode_2reg(OP_BASE_ADD_SECURE_CONST, *dst, *src));
+                    words.push(hdr(OP_BASE_ADD_SECURE_CONST, *dst));
+                    words.push((*src as u32) << 16);
                     words.extend_from_slice(value);
                 }
                 BytecodeOp::BaseMulSecureConst { dst, src, value } => {
-                    words.push(encode_2reg(OP_BASE_MUL_SECURE_CONST, *dst, *src));
+                    words.push(hdr(OP_BASE_MUL_SECURE_CONST, *dst));
+                    words.push((*src as u32) << 16);
                     words.extend_from_slice(value);
                 }
 
-                // CombineEF: 2 words
-                // word1: [opcode:8 | dst:8 | src0:8 | src1:8]
-                // word2: [src2:8 | src3:8 | 0:16]
+                // CombineEF: 3 words
                 BytecodeOp::CombineEF { dst, src } => {
-                    words.push(encode_3reg(OP_COMBINE_EF, *dst, src[0], src[1]));
-                    words.push(((src[2] as u32 & 0xFF) << 24) | ((src[3] as u32 & 0xFF) << 16));
+                    words.push(hdr(OP_COMBINE_EF, *dst));
+                    words.push(((src[0] as u32) << 16) | (src[1] as u32));
+                    words.push(((src[2] as u32) << 16) | (src[3] as u32));
                 }
 
-                // AddConstraint: [opcode:8 | src:8 | 0:16]
+                // AddConstraint: 1 word, src in low 16 bits
                 BytecodeOp::AddConstraint { src } => {
-                    words.push(((OP_ADD_CONSTRAINT as u32) << 24) | ((*src as u32 & 0xFF) << 16));
+                    words.push(((OP_ADD_CONSTRAINT as u32) << 24) | (*src as u32));
                 }
             }
         }
@@ -296,19 +302,24 @@ impl BytecodeProgram {
     }
 }
 
-/// Encode a 3-register op: [opcode:8 | dst:8 | src1:8 | src2:8]
-fn encode_3reg(opcode: u8, dst: u16, src1: u16, src2: u16) -> u32 {
-    ((opcode as u32) << 24)
-        | ((dst as u32 & 0xFF) << 16)
-        | ((src1 as u32 & 0xFF) << 8)
-        | (src2 as u32 & 0xFF)
+/// Build a header word: `[opcode:8 | 0:8 | dst:16]`
+#[inline]
+fn hdr(opcode: u8, dst: u16) -> u32 {
+    ((opcode as u32) << 24) | (dst as u32)
 }
 
-/// Encode a 2-register op: [opcode:8 | dst:8 | src:8 | 0:8]
-fn encode_2reg(opcode: u8, dst: u16, src: u16) -> u32 {
-    ((opcode as u32) << 24)
-        | ((dst as u32 & 0xFF) << 16)
-        | ((src as u32 & 0xFF) << 8)
+/// Encode a 3-register op: 2 words.
+/// word1: `[opcode:8 | 0:8 | dst:16]`, word2: `[src1:16 | src2:16]`
+fn encode_3reg(words: &mut Vec<u32>, opcode: u8, dst: u16, src1: u16, src2: u16) {
+    words.push(hdr(opcode, dst));
+    words.push(((src1 as u32) << 16) | (src2 as u32));
+}
+
+/// Encode a 2-register op: 2 words.
+/// word1: `[opcode:8 | 0:8 | dst:16]`, word2: `[src:16 | 0:16]`
+fn encode_2reg(words: &mut Vec<u32>, opcode: u8, dst: u16, src: u16) {
+    words.push(hdr(opcode, dst));
+    words.push((src as u32) << 16);
 }
 
 impl BytecodeOp {
@@ -343,32 +354,36 @@ impl BytecodeOp {
     /// Number of u32 words this op occupies when encoded.
     pub fn encoded_len(&self) -> usize {
         match self {
-            BytecodeOp::LoadConst { value, .. } => {
-                if *value < (1 << 16) { 1 } else { 2 }
-            }
+            // 2 words: header + value
+            BytecodeOp::LoadConst { .. } => 2,
+            // 5 words: header + 4 data
             BytecodeOp::LoadSecureConst { .. } => 5,
-            BytecodeOp::LoadTrace { offset, .. } => {
-                let abs_off = if *offset < 0 { -(*offset) as u32 } else { *offset as u32 };
-                if abs_off <= 1 { 1 } else { 2 }
-            }
+            // 3 words: header + interaction/col word + sign/abs_off word
+            BytecodeOp::LoadTrace { .. } => 3,
+            // 2 words: header + src1/src2 word
             BytecodeOp::Add { .. }
             | BytecodeOp::Sub { .. }
             | BytecodeOp::Mul { .. }
-            | BytecodeOp::Neg { .. }
             | BytecodeOp::WideAdd { .. }
             | BytecodeOp::WideSub { .. }
             | BytecodeOp::WideMul { .. }
-            | BytecodeOp::WideNeg { .. }
             | BytecodeOp::WideAddBase { .. }
-            | BytecodeOp::WideMulBase { .. }
-            | BytecodeOp::Widen { .. }
-            | BytecodeOp::AddConstraint { .. } => 1,
-            BytecodeOp::AddConst { .. } | BytecodeOp::MulConst { .. } => 2,
+            | BytecodeOp::WideMulBase { .. } => 2,
+            // 2 words: header + src word
+            BytecodeOp::Neg { .. }
+            | BytecodeOp::WideNeg { .. }
+            | BytecodeOp::Widen { .. } => 2,
+            // 1 word: opcode + src
+            BytecodeOp::AddConstraint { .. } => 1,
+            // 3 words: header + src word + value
+            BytecodeOp::AddConst { .. } | BytecodeOp::MulConst { .. } => 3,
+            // 6 words: header + src word + 4 data
             BytecodeOp::WideAddConst { .. }
             | BytecodeOp::WideMulConst { .. }
             | BytecodeOp::BaseAddSecureConst { .. }
-            | BytecodeOp::BaseMulSecureConst { .. } => 5,
-            BytecodeOp::CombineEF { .. } => 2,
+            | BytecodeOp::BaseMulSecureConst { .. } => 6,
+            // 3 words: header + src0/src1 word + src2/src3 word
+            BytecodeOp::CombineEF { .. } => 3,
         }
     }
 }
@@ -447,29 +462,46 @@ mod tests {
             n_registers: 3,
         };
         let words = prog.encode();
-        // LoadConst(dst=0, val=42): [0x01:8 | 0:8 | 42:16]
-        assert_eq!(words[0], (0x01 << 24) | (0 << 16) | 42);
-        // LoadConst(dst=1, val=100): [0x01:8 | 1:8 | 100:16]
-        assert_eq!(words[1], (0x01 << 24) | (1 << 16) | 100);
-        // Add(dst=2, src1=0, src2=1): [0x10:8 | 2:8 | 0:8 | 1:8]
-        assert_eq!(words[2], (0x10 << 24) | (2 << 16) | (0 << 8) | 1);
-        // AddConstraint(src=2): [0x40:8 | 2:8 | 0:16]
-        assert_eq!(words[3], (0x40 << 24) | (2 << 16));
+        // LoadConst(dst=0, val=42): word[0]=[0x01:8|0:8|0:16], word[1]=42
+        assert_eq!(words[0], (0x01u32 << 24) | 0);
+        assert_eq!(words[1], 42);
+        // LoadConst(dst=1, val=100): word[2]=[0x01:8|0:8|1:16], word[3]=100
+        assert_eq!(words[2], (0x01u32 << 24) | 1);
+        assert_eq!(words[3], 100);
+        // Add(dst=2, src1=0, src2=1): word[4]=[0x10:8|0:8|2:16], word[5]=[0:16|1:16]
+        assert_eq!(words[4], (0x10u32 << 24) | 2);
+        assert_eq!(words[5], (0u32 << 16) | 1);
+        // AddConstraint(src=2): word[6]=[0x40:8|0:8|2:16]
+        assert_eq!(words[6], (0x40u32 << 24) | 2);
+        assert_eq!(words.len(), 7);
     }
 
     #[test]
-    fn test_encode_extended_const() {
-        let big_val = (1 << 24) + 7;
+    fn test_encode_load_const_always_2_words() {
+        // Small value
         let prog = BytecodeProgram {
-            ops: vec![BytecodeOp::LoadConst { dst: 0, value: big_val }],
+            ops: vec![BytecodeOp::LoadConst { dst: 0, value: 42 }],
             n_constraints: 0,
             n_trace_accesses: 0,
             n_registers: 1,
         };
         let words = prog.encode();
         assert_eq!(words.len(), 2);
-        assert_eq!(words[0], (0x01 << 24) | (0 << 16) | 0xFFFF);
-        assert_eq!(words[1], big_val);
+        assert_eq!(words[0], (0x01u32 << 24) | 0);
+        assert_eq!(words[1], 42);
+
+        // Large value
+        let big_val = (1 << 24) + 7;
+        let prog2 = BytecodeProgram {
+            ops: vec![BytecodeOp::LoadConst { dst: 0, value: big_val }],
+            n_constraints: 0,
+            n_trace_accesses: 0,
+            n_registers: 1,
+        };
+        let words2 = prog2.encode();
+        assert_eq!(words2.len(), 2);
+        assert_eq!(words2[0], (0x01u32 << 24) | 0);
+        assert_eq!(words2[1], big_val);
     }
 
     #[test]
@@ -482,7 +514,7 @@ mod tests {
         };
         let words = prog.encode();
         assert_eq!(words.len(), 5);
-        assert_eq!(words[0], (0x02 << 24) | (5 << 16));
+        assert_eq!(words[0], (0x02u32 << 24) | 5);
         assert_eq!(words[1], 10);
         assert_eq!(words[2], 20);
         assert_eq!(words[3], 30);
@@ -490,7 +522,8 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_trace_val() {
+    fn test_encode_load_trace_3_words() {
+        // offset=-1: 3 words, word3 has sign=1 | abs=1
         let prog = BytecodeProgram {
             ops: vec![BytecodeOp::LoadTrace {
                 dst: 3,
@@ -503,22 +536,80 @@ mod tests {
             n_registers: 4,
         };
         let words = prog.encode();
-        assert_eq!(words.len(), 1);
-        let word = words[0];
-        let opcode = word >> 24;
-        assert_eq!(opcode, 0x03);
-        let dst = (word >> 16) & 0xFF;
-        assert_eq!(dst, 3);
-        let operand = word & 0xFFFF;
-        // interaction:4=1 | col_idx:10=5 | sign:1=1 | abs_offset:1=1
-        let interaction = (operand >> 12) & 0xF;
-        let col_idx = (operand >> 2) & 0x3FF;
-        let sign = (operand >> 1) & 1;
-        let abs_off = operand & 1;
-        assert_eq!(interaction, 1);
-        assert_eq!(col_idx, 5);
-        assert_eq!(sign, 1);
-        assert_eq!(abs_off, 1);
+        assert_eq!(words.len(), 3, "LoadTrace always 3 words");
+        // word1: [0x03:8 | 0:8 | 3:16]
+        assert_eq!(words[0], (0x03u32 << 24) | 3);
+        // word2: [interaction:16 | col_idx:16]
+        assert_eq!(words[1], (1u32 << 16) | 5);
+        // word3: [sign:1 | abs_off:31] = 1<<31 | 1
+        assert_eq!(words[2], (1u32 << 31) | 1);
+    }
+
+    #[test]
+    fn test_encode_load_trace_positive_offset() {
+        // offset=+1: 3 words, word3 has sign=0 | abs=1
+        let prog = BytecodeProgram {
+            ops: vec![BytecodeOp::LoadTrace {
+                dst: 2,
+                interaction: 0,
+                col_idx: 3,
+                offset: 1,
+            }],
+            n_constraints: 0,
+            n_trace_accesses: 1,
+            n_registers: 3,
+        };
+        let words = prog.encode();
+        assert_eq!(words.len(), 3, "LoadTrace always 3 words");
+        assert_eq!(words[0], (0x03u32 << 24) | 2);
+        assert_eq!(words[1], (0u32 << 16) | 3);
+        assert_eq!(words[2], 1u32); // sign=0, abs=1
+    }
+
+    #[test]
+    fn test_encode_load_trace_zero_offset() {
+        let prog = BytecodeProgram {
+            ops: vec![BytecodeOp::LoadTrace {
+                dst: 0,
+                interaction: 0,
+                col_idx: 0,
+                offset: 0,
+            }],
+            n_constraints: 0,
+            n_trace_accesses: 1,
+            n_registers: 1,
+        };
+        let words = prog.encode();
+        assert_eq!(words.len(), 3);
+        assert_eq!(words[0], (0x03u32 << 24) | 0);
+        assert_eq!(words[1], 0u32); // interaction=0, col_idx=0
+        assert_eq!(words[2], 0u32); // sign=0, abs=0
+    }
+
+    #[test]
+    fn test_encode_high_register_indices() {
+        // Verify 16-bit register indices work (> 255)
+        let prog = BytecodeProgram {
+            ops: vec![
+                BytecodeOp::LoadConst { dst: 300, value: 1 },
+                BytecodeOp::LoadConst { dst: 500, value: 2 },
+                BytecodeOp::Add { dst: 1000, src1: 300, src2: 500 },
+                BytecodeOp::AddConstraint { src: 1000 },
+            ],
+            n_constraints: 1,
+            n_trace_accesses: 0,
+            n_registers: 1001,
+        };
+        let words = prog.encode();
+        // LoadConst dst=300
+        assert_eq!(words[0], (0x01u32 << 24) | 300);
+        // LoadConst dst=500
+        assert_eq!(words[2], (0x01u32 << 24) | 500);
+        // Add dst=1000, src1=300, src2=500
+        assert_eq!(words[4], (0x10u32 << 24) | 1000);
+        assert_eq!(words[5], (300u32 << 16) | 500);
+        // AddConstraint src=1000
+        assert_eq!(words[6], (0x40u32 << 24) | 1000);
     }
 
     #[test]
@@ -538,5 +629,50 @@ mod tests {
         let w1 = prog.encode();
         let w2 = prog.encode();
         assert_eq!(w1, w2);
+    }
+
+    #[test]
+    fn test_encoded_len_matches_encode() {
+        // Verify encoded_len() matches actual encode() word count for every op type.
+        let ops: Vec<BytecodeOp> = vec![
+            BytecodeOp::LoadConst { dst: 0, value: 42 },
+            BytecodeOp::LoadSecureConst { dst: 1, value: [1, 2, 3, 4] },
+            BytecodeOp::LoadTrace { dst: 2, interaction: 0, col_idx: 0, offset: 0 },
+            BytecodeOp::LoadTrace { dst: 3, interaction: 1, col_idx: 2, offset: -3 },
+            BytecodeOp::Add { dst: 4, src1: 0, src2: 1 },
+            BytecodeOp::Sub { dst: 5, src1: 0, src2: 1 },
+            BytecodeOp::Mul { dst: 6, src1: 0, src2: 1 },
+            BytecodeOp::Neg { dst: 7, src: 0 },
+            BytecodeOp::AddConst { dst: 8, src: 0, value: 7 },
+            BytecodeOp::MulConst { dst: 9, src: 0, value: 3 },
+            BytecodeOp::WideAdd { dst: 10, src1: 0, src2: 1 },
+            BytecodeOp::WideSub { dst: 11, src1: 0, src2: 1 },
+            BytecodeOp::WideMul { dst: 12, src1: 0, src2: 1 },
+            BytecodeOp::WideNeg { dst: 13, src: 0 },
+            BytecodeOp::WideAddConst { dst: 14, src: 0, value: [1, 2, 3, 4] },
+            BytecodeOp::WideMulConst { dst: 15, src: 0, value: [1, 2, 3, 4] },
+            BytecodeOp::WideAddBase { dst: 16, wide: 0, base: 1 },
+            BytecodeOp::WideMulBase { dst: 17, wide: 0, base: 1 },
+            BytecodeOp::BaseAddSecureConst { dst: 18, src: 0, value: [1, 2, 3, 4] },
+            BytecodeOp::BaseMulSecureConst { dst: 19, src: 0, value: [1, 2, 3, 4] },
+            BytecodeOp::Widen { dst: 20, src: 0 },
+            BytecodeOp::CombineEF { dst: 21, src: [0, 1, 2, 3] },
+            BytecodeOp::AddConstraint { src: 4 },
+        ];
+        for op in &ops {
+            let prog = BytecodeProgram {
+                ops: vec![op.clone()],
+                n_constraints: if matches!(op, BytecodeOp::AddConstraint { .. }) { 1 } else { 0 },
+                n_trace_accesses: if matches!(op, BytecodeOp::LoadTrace { .. }) { 1 } else { 0 },
+                n_registers: 30,
+            };
+            let encoded = prog.encode();
+            assert_eq!(
+                encoded.len(),
+                op.encoded_len(),
+                "encoded_len mismatch for {:?}",
+                op
+            );
+        }
     }
 }
