@@ -104,14 +104,13 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
         let col_ptrs: Vec<*const u32> = columns.iter().map(|c| c.buf.as_ptr()).collect();
         let d_col_ptrs = DeviceBuffer::from_host(&col_ptrs);
 
-        // Upload schedule to GPU.
-        let schedule_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                schedule.as_ptr() as *const u8,
-                schedule.len() * std::mem::size_of::<LeafHashChunk>(),
-            )
+        // Upload schedule to GPU as u32 words (18 words per chunk = 72 bytes).
+        let schedule_words: Vec<u32> = unsafe {
+            let ptr = schedule.as_ptr() as *const u32;
+            let n_words = schedule.len() * (std::mem::size_of::<LeafHashChunk>() / 4);
+            std::slice::from_raw_parts(ptr, n_words).to_vec()
         };
-        let d_schedule = DeviceBuffer::<u8>::from_host(schedule_bytes);
+        let d_schedule = DeviceBuffer::<u32>::from_host(&schedule_words);
 
         // Allocate output: n_leaves * 8 u32s (Blake2s hash = 32 bytes = 8 words).
         let mut d_hashes = DeviceBuffer::<u32>::alloc(n_leaves as usize * 8);
@@ -119,7 +118,7 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
         unsafe {
             ffi::cuda_build_leaves_lifted(
                 d_col_ptrs.as_ptr() as *const *const u32,
-                d_schedule.as_ptr(),
+                d_schedule.as_ptr() as *const u8,
                 schedule.len() as u32,
                 lifting_log_size,
                 d_hashes.as_mut_ptr(),
@@ -143,6 +142,7 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
         drop(d_col_ptrs);
 
         let result = CudaColumn::from_device_buffer(d_hashes, n_leaves as usize);
+
         eprintln!("[LEAVES-GPU] done: {} hashes in {:.3}s", n_leaves, t0.elapsed().as_secs_f64());
         result
     }
