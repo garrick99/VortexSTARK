@@ -205,6 +205,52 @@ mod tests {
             cpu_hashes.len());
     }
 
+    #[test]
+    fn test_gpu_leaf_hash_many_mixed_sizes() {
+        use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasher;
+        use stwo::prover::vcs_lifted::ops::MerkleOpsLifted;
+
+        init_gpu();
+
+        // Simulate preprocessed trace pattern: many columns at different sizes.
+        // Columns must be sorted ascending by size.
+        let lifting_log = 8u32;
+        let mut all_cols: Vec<Vec<BaseField>> = Vec::new();
+
+        // 5 cols of size 4 (log=2)
+        for c in 0..5 { all_cols.push((0..4).map(|r| M31::from((c*100+r+1) as u32)).collect()); }
+        // 10 cols of size 16 (log=4)
+        for c in 0..10 { all_cols.push((0..16).map(|r| M31::from((c*300+r*7+2) as u32)).collect()); }
+        // 20 cols of size 64 (log=6)
+        for c in 0..20 { all_cols.push((0..64).map(|r| M31::from((c*500+r*13+5) as u32)).collect()); }
+        // 3 cols of size 256 (log=8)
+        for c in 0..3 { all_cols.push((0..256).map(|r| M31::from((c*1000+r*3+9) as u32)).collect()); }
+
+        let cpu_col_refs: Vec<&Vec<BaseField>> = all_cols.iter().collect();
+        let cpu_hashes = <CpuBackend as MerkleOpsLifted<Blake2sMerkleHasher>>::build_leaves(
+            &cpu_col_refs, lifting_log,
+        );
+
+        let gpu_cols: Vec<CudaColumn<BaseField>> = all_cols.iter().map(|c| c.iter().copied().collect()).collect();
+        let gpu_col_refs: Vec<&CudaColumn<BaseField>> = gpu_cols.iter().collect();
+        let gpu_hashes = <CudaBackend as MerkleOpsLifted<Blake2sMerkleHasher>>::build_leaves(
+            &gpu_col_refs, lifting_log,
+        );
+        let gpu_result = gpu_hashes.to_cpu();
+
+        let mut mismatches = 0;
+        for i in 0..cpu_hashes.len() {
+            if cpu_hashes[i] != gpu_result[i] {
+                if mismatches < 3 {
+                    eprintln!("[LEAF_HASH] many-mixed mismatch at leaf {i}");
+                }
+                mismatches += 1;
+            }
+        }
+        assert_eq!(mismatches, 0, "{mismatches}/{} leaf hashes differ (38 cols, 4 sizes, lift=8)",
+            cpu_hashes.len());
+    }
+
     // ---- Bit-reverse tests ----
 
     #[test]
