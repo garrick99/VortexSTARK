@@ -1315,12 +1315,21 @@ mod tests {
 
     /// End-to-end test: record bytecode via FrameworkEval, run GPU kernel,
     /// compare with CPU CpuDomainEvaluator row-by-row.
+    ///
+    /// Uses INVALID flag values (2, 3) to produce non-zero constraint values,
+    /// ensuring the GPU kernel actually computes the right answer (not just zeros).
     #[test]
     fn test_e2e_bytecode_flag_constraint_gpu_vs_cpu() {
         use vortexstark::device::DeviceBuffer;
         use vortexstark::cuda::ffi;
         use crate::constraint_eval::tracing::record_bytecode;
         use crate::constraint_eval::bytecode::BytecodeOp;
+        use stwo_constraint_framework::{CpuDomainEvaluator, FrameworkEval};
+        use stwo::core::pcs::TreeVec;
+        use stwo::core::poly::circle::CanonicCoset;
+        use stwo::prover::poly::circle::CircleEvaluation;
+        use stwo::prover::poly::BitReversedOrder;
+        use stwo::prover::backend::CpuBackend;
 
         init_gpu();
 
@@ -1329,58 +1338,35 @@ mod tests {
         eprintln!("E2E flag constraint bytecode:\n{}", program.dump());
 
         assert_eq!(program.n_constraints, 1);
-        assert!(program.n_registers <= 256, "Too many registers: {}", program.n_registers);
 
-        let n_rows = 8u32; // 1 << log_size=3
+        // Use log_expand=1 so offset calculations work properly.
         let trace_log_size = 3u32;
-        let eval_log_size = 4u32; // max_constraint_log_degree_bound
-        let eval_n_rows = 1u32 << eval_log_size;
-        let log_expand = eval_log_size - trace_log_size;
+        let eval_log_size = trace_log_size + 1;
+        let n_rows = 1u32 << eval_log_size; // 16 eval rows
+        let trace_n_rows = 1u32 << trace_log_size; // 8 trace rows
+        let log_expand = 1u32;
 
-        // Build trace data: single column "flag" with values [0,1,0,1,1,0,0,1]
-        // extended to eval domain by repeating (eval_n_rows rows in bit-reversed order).
-        // For simplicity, we'll just use raw values and set eval=trace domain (log_expand=0).
-        // Actually, the GPU kernel works on eval domain rows directly.
-        // Let's use log_expand=0 for this test (eval_log_size = trace_log_size + 1 doesn't
-        // matter for the kernel; what matters is that the data has the right number of rows).
+        // Flag values: include INVALID values (2, 3) so constraint != 0.
+        // flag*(1-flag): 0→0, 1→0, 2→-2, 3→-6 (non-zero!)
+        let flag_vals: Vec<u32> = vec![0, 1, 2, 3, 1, 0, 2, 0,
+                                       0, 1, 2, 3, 1, 0, 2, 0];
 
-        // Simpler: set trace_log_size = eval_log_size (log_expand = 0, denom_inv = [1])
-        let trace_log = 3u32;
-        let eval_log = 3u32; // same as trace for simplicity
-        let n = 1u32 << eval_log;
-        let log_exp = 0u32;
-
-        // Trace column: flag values (valid flags: 0 or 1)
-        let flag_vals: Vec<u32> = vec![0, 1, 0, 1, 1, 0, 0, 1];
         let d_flag = DeviceBuffer::from_host(&flag_vals);
+        // interaction_offsets: [0, 0, 1] — preproc=0 cols, base=1 col
         let col_ptrs: Vec<*const u32> = vec![d_flag.as_ptr()];
         let d_col_ptrs = DeviceBuffer::from_host(&col_ptrs);
-        let d_col_sizes = DeviceBuffer::from_host(&[n]);
+        let d_col_sizes = DeviceBuffer::from_host(&[n_rows]);
 
-        // Encode bytecode and remap LoadTrace to flat column indices.
+        // Encode bytecode and remap LoadTrace (16-bit encoding: always 3 words).
         let mut encoded = program.encode();
-        // Remap: interaction 0 starts at flat_col 0
         {
             let mut pc = 0;
             for op in &program.ops {
-                if let BytecodeOp::LoadTrace { dst, interaction, col_idx, offset } = op {
-                    let flat_idx = *col_idx as usize; // interaction 0, so flat = col_idx
-                    let d = *dst as u32 & 0xFF;
-                    let (sign, abs_off) = if *offset < 0 {
-                        (1u32, (-*offset) as u32)
-                    } else {
-                        (0u32, *offset as u32)
-                    };
-                    if *offset >= 0 && abs_off <= 1 {
-                        let operand = ((flat_idx as u32) << 2) | (abs_off & 1);
-                        encoded[pc] = (0x03u32 << 24) | (d << 16) | operand;
-                        pc += 1;
-                    } else {
-                        let operand = ((flat_idx as u32) << 2) | 0x3;
-                        encoded[pc] = (0x03u32 << 24) | (d << 16) | operand;
-                        encoded[pc + 1] = (sign << 31) | abs_off;
-                        pc += 2;
-                    }
+                if let BytecodeOp::LoadTrace { interaction, col_idx, .. } = op {
+                    // Flat col = col_idx (only 1 interaction with columns)
+                    let flat_idx = *col_idx as usize;
+                    encoded[pc + 1] = flat_idx as u32;
+                    pc += 3;
                 } else {
                     pc += op.encoded_len();
                 }
@@ -1389,40 +1375,25 @@ mod tests {
 
         let d_bytecode = DeviceBuffer::from_host(&encoded);
 
-        // Random coeff powers: one QM31 per constraint = (1, 0, 0, 0)
         let coeff: Vec<u32> = vec![1, 0, 0, 0];
+        let denom_inv: Vec<u32> = vec![1, 1]; // 2 entries for log_expand=1
         let d_coeff = DeviceBuffer::from_host(&coeff);
-
-        // denom_inv: with log_expand=0, there's 1 entry = 1
-        let denom_inv: Vec<u32> = vec![1];
         let d_denom_inv = DeviceBuffer::from_host(&denom_inv);
 
-        // Output accumulators
-        let mut d_accum0 = DeviceBuffer::<u32>::alloc(n as usize);
-        let mut d_accum1 = DeviceBuffer::<u32>::alloc(n as usize);
-        let mut d_accum2 = DeviceBuffer::<u32>::alloc(n as usize);
-        let mut d_accum3 = DeviceBuffer::<u32>::alloc(n as usize);
-        d_accum0.zero();
-        d_accum1.zero();
-        d_accum2.zero();
-        d_accum3.zero();
+        let mut d_a0 = DeviceBuffer::<u32>::alloc(n_rows as usize);
+        let mut d_a1 = DeviceBuffer::<u32>::alloc(n_rows as usize);
+        let mut d_a2 = DeviceBuffer::<u32>::alloc(n_rows as usize);
+        let mut d_a3 = DeviceBuffer::<u32>::alloc(n_rows as usize);
+        d_a0.zero(); d_a1.zero(); d_a2.zero(); d_a3.zero();
 
         unsafe {
             ffi::cuda_bytecode_constraint_eval(
-                d_bytecode.as_ptr(),
-                encoded.len() as u32,
+                d_bytecode.as_ptr(), encoded.len() as u32,
                 d_col_ptrs.as_ptr() as *const *const u32,
                 d_col_sizes.as_ptr(),
-                1, // n_trace_cols
-                n, // n_rows
-                n, // trace_n_rows
-                d_coeff.as_ptr(),
-                d_denom_inv.as_ptr(),
-                log_exp,
-                d_accum0.as_mut_ptr(),
-                d_accum1.as_mut_ptr(),
-                d_accum2.as_mut_ptr(),
-                d_accum3.as_mut_ptr(),
+                1, n_rows, trace_n_rows,
+                d_coeff.as_ptr(), d_denom_inv.as_ptr(), log_expand,
+                d_a0.as_mut_ptr(), d_a1.as_mut_ptr(), d_a2.as_mut_ptr(), d_a3.as_mut_ptr(),
             );
             ffi::cuda_device_sync();
         }
@@ -1430,23 +1401,42 @@ mod tests {
         let err = unsafe { ffi::cudaGetLastError() };
         assert_eq!(err, 0, "CUDA kernel error: {err}");
 
-        let out0 = d_accum0.to_host();
-        let out1 = d_accum1.to_host();
-        let out2 = d_accum2.to_host();
-        let out3 = d_accum3.to_host();
+        let gpu_a0 = d_a0.to_host();
+        let gpu_a1 = d_a1.to_host();
+        let gpu_a2 = d_a2.to_host();
+        let gpu_a3 = d_a3.to_host();
 
-        // For valid flags (0 or 1), flag*(1-flag) = 0 for all rows.
-        // With coeff=(1,0,0,0) and denom_inv=1, output should be all zeros.
+        // CPU reference via CpuDomainEvaluator
+        let to_bf = |v: &[u32]| -> Vec<BaseField> { v.iter().map(|&x| M31::from(x)).collect() };
+        let eval_domain = CanonicCoset::new(eval_log_size).circle_domain();
+        let flag_eval = CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(
+            eval_domain, to_bf(&flag_vals));
+        let trace_refs: TreeVec<Vec<&CircleEvaluation<CpuBackend, BaseField, BitReversedOrder>>> =
+            TreeVec::new(vec![vec![], vec![&flag_eval]]);
+        let random_coeff_powers = vec![SecureField::one()];
+
         let mut mismatches = 0;
-        for row in 0..n as usize {
-            if out0[row] != 0 || out1[row] != 0 || out2[row] != 0 || out3[row] != 0 {
+        let mut has_nonzero = false;
+        for row in 0..n_rows as usize {
+            let cpu_eval = CpuDomainEvaluator::new(
+                &trace_refs, row, &random_coeff_powers,
+                trace_log_size, eval_log_size, trace_log_size, claimed_sum,
+            );
+            let cpu_eval = E2eFlagEval.evaluate(cpu_eval);
+            let arr = cpu_eval.row_res.to_m31_array();
+            let (e0, e1, e2, e3) = (arr[0].0, arr[1].0, arr[2].0, arr[3].0);
+            let (g0, g1, g2, g3) = (gpu_a0[row], gpu_a1[row], gpu_a2[row], gpu_a3[row]);
+            if e0 != 0 || e1 != 0 || e2 != 0 || e3 != 0 { has_nonzero = true; }
+            if e0 != g0 || e1 != g1 || e2 != g2 || e3 != g3 {
                 if mismatches < 5 {
-                    eprintln!("[E2E] row {row}: ({},{},{},{})", out0[row], out1[row], out2[row], out3[row]);
+                    eprintln!("[FLAG MISMATCH] row {row}: CPU=({e0},{e1},{e2},{e3}) GPU=({g0},{g1},{g2},{g3})");
                 }
                 mismatches += 1;
             }
         }
-        assert_eq!(mismatches, 0, "{mismatches}/{n} rows have non-zero constraint values (should all be zero for valid flags)");
+        assert!(has_nonzero, "Test must produce non-zero constraint values to be meaningful");
+        assert_eq!(mismatches, 0,
+            "{mismatches}/{n_rows} rows differ between GPU and CPU for flag constraint");
     }
 
     /// End-to-end test with non-zero constraint values and multiple constraints.
@@ -1496,27 +1486,14 @@ mod tests {
         let d_col_sizes = DeviceBuffer::from_host(&[n; 4]);
 
         let mut encoded = program.encode();
+        // Remap LoadTrace to flat column indices (16-bit encoding: always 3 words)
         {
             let mut pc = 0;
             for op in &program.ops {
-                if let BytecodeOp::LoadTrace { dst, interaction, col_idx, offset } = op {
-                    let flat_idx = *col_idx as usize; // all interaction 0
-                    let d = *dst as u32 & 0xFF;
-                    let (sign, abs_off) = if *offset < 0 {
-                        (1u32, (-*offset) as u32)
-                    } else {
-                        (0u32, *offset as u32)
-                    };
-                    if *offset >= 0 && abs_off <= 1 {
-                        let operand = ((flat_idx as u32) << 2) | (abs_off & 1);
-                        encoded[pc] = (0x03u32 << 24) | (d << 16) | operand;
-                        pc += 1;
-                    } else {
-                        let operand = ((flat_idx as u32) << 2) | 0x3;
-                        encoded[pc] = (0x03u32 << 24) | (d << 16) | operand;
-                        encoded[pc + 1] = (sign << 31) | abs_off;
-                        pc += 2;
-                    }
+                if let BytecodeOp::LoadTrace { interaction, col_idx, .. } = op {
+                    let flat_idx = *col_idx as usize; // all interaction 1, flat = col_idx
+                    encoded[pc + 1] = flat_idx as u32;
+                    pc += 3;
                 } else {
                     pc += op.encoded_len();
                 }
