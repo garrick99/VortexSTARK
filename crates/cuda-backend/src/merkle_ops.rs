@@ -25,23 +25,111 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
         columns: &[&Col<Self, BaseField>],
         lifting_log_size: u32,
     ) -> Col<Self, Blake2sHash> {
-        // Profile column sizes for GPU kernel planning.
-        use std::collections::BTreeMap;
-        let mut size_counts: BTreeMap<u32, usize> = BTreeMap::new();
-        for c in columns {
-            *size_counts.entry(c.len().ilog2()).or_default() += 1;
-        }
         let t0 = std::time::Instant::now();
-        eprintln!("[LEAVES] {} cols, lift={lifting_log_size}, sizes: {:?}", columns.len(), size_counts);
+        let n_leaves = 1u32 << lifting_log_size;
 
-        // CPU fallback: download, compute, upload.
-        let cpu_columns: Vec<Vec<BaseField>> = columns.iter().map(|c| c.to_cpu()).collect();
-        let cpu_col_refs: Vec<&Vec<BaseField>> = cpu_columns.iter().collect();
-        let cpu_result = <stwo::prover::backend::CpuBackend as MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M31_OUTPUT>>>::build_leaves(
-            &cpu_col_refs, lifting_log_size,
-        );
-        let result: CudaColumn<Blake2sHash> = cpu_result.into_iter().collect();
-        eprintln!("[LEAVES] done: {} hashes in {:.3}s", result.len(), t0.elapsed().as_secs_f64());
+        if columns.is_empty() {
+            // Empty columns: return default hashes (CPU, trivial)
+            let cpu_result = <stwo::prover::backend::CpuBackend as MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M31_OUTPUT>>>::build_leaves(
+                &[], lifting_log_size,
+            );
+            return cpu_result.into_iter().collect();
+        }
+
+        // Build the hash schedule: group columns by log_size (ascending),
+        // chunk by 16 (one Blake2s compression block per chunk).
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct LeafHashChunk {
+            col_indices: [u32; 16],
+            n_cols: u32,
+            log_size: u32,
+        }
+
+        // Columns must be sorted by ascending log_size (stwo guarantees this).
+        let mut schedule: Vec<LeafHashChunk> = Vec::new();
+        let mut col_idx = 0usize;
+
+        while col_idx < columns.len() {
+            let log_size = columns[col_idx].len().ilog2();
+            // Collect all columns at this log_size, chunked by 16.
+            let group_start = col_idx;
+            while col_idx < columns.len() && columns[col_idx].len().ilog2() == log_size {
+                col_idx += 1;
+            }
+            let group = &columns[group_start..col_idx];
+
+            for chunk in group.chunks(16) {
+                let mut entry = LeafHashChunk {
+                    col_indices: [0; 16],
+                    n_cols: chunk.len() as u32,
+                    log_size,
+                };
+                for (i, _) in chunk.iter().enumerate() {
+                    entry.col_indices[i] = (group_start + (col_idx - group_start - group.len()) + i + (chunk.as_ptr() as usize - group.as_ptr() as usize) / std::mem::size_of::<&Col<Self, BaseField>>()) as u32;
+                }
+                schedule.push(entry);
+            }
+        }
+
+        // Fix col_indices: we need absolute indices into the columns array.
+        // Rebuild cleanly:
+        schedule.clear();
+        let mut abs_idx = 0usize;
+        let mut i = 0;
+        while i < columns.len() {
+            let log_size = columns[i].len().ilog2();
+            let group_start = i;
+            while i < columns.len() && columns[i].len().ilog2() == log_size {
+                i += 1;
+            }
+            for chunk_start in (group_start..i).step_by(16) {
+                let chunk_end = std::cmp::min(chunk_start + 16, i);
+                let mut entry = LeafHashChunk {
+                    col_indices: [0; 16],
+                    n_cols: (chunk_end - chunk_start) as u32,
+                    log_size,
+                };
+                for j in 0..(chunk_end - chunk_start) {
+                    entry.col_indices[j] = (chunk_start + j) as u32;
+                }
+                schedule.push(entry);
+            }
+        }
+
+        eprintln!("[LEAVES-GPU] {} cols, lift={lifting_log_size}, {} chunks, {} leaves",
+            columns.len(), schedule.len(), n_leaves);
+
+        // Collect device pointers for all columns.
+        let col_ptrs: Vec<*const u32> = columns.iter().map(|c| c.buf.as_ptr()).collect();
+        let d_col_ptrs = DeviceBuffer::from_host(&col_ptrs);
+
+        // Upload schedule to GPU.
+        let schedule_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                schedule.as_ptr() as *const u8,
+                schedule.len() * std::mem::size_of::<LeafHashChunk>(),
+            )
+        };
+        let d_schedule = DeviceBuffer::<u8>::from_host(schedule_bytes);
+
+        // Allocate output: n_leaves * 8 u32s (Blake2s hash = 32 bytes = 8 words).
+        let mut d_hashes = DeviceBuffer::<u32>::alloc(n_leaves as usize * 8);
+
+        unsafe {
+            ffi::cuda_build_leaves_lifted(
+                d_col_ptrs.as_ptr() as *const *const u32,
+                d_schedule.as_ptr(),
+                schedule.len() as u32,
+                lifting_log_size,
+                d_hashes.as_mut_ptr(),
+                n_leaves,
+            );
+            ffi::cuda_device_sync();
+        }
+
+        let result = CudaColumn::from_device_buffer(d_hashes, n_leaves as usize);
+        eprintln!("[LEAVES-GPU] done: {} hashes in {:.3}s", n_leaves, t0.elapsed().as_secs_f64());
         result
     }
 

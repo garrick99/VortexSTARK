@@ -655,6 +655,26 @@ unsafe extern "C" {
         n_registers: u32,
     );
 
+    // ── GPU lifted Merkle leaf hashing ──────────────────────────────────
+
+    /// Build Merkle leaves on GPU using the lifted hashing algorithm.
+    /// Columns of different sizes are handled via the lifted row index formula.
+    ///
+    /// - `col_ptrs`: device pointer to array of column device pointers
+    /// - `schedule`: device pointer to array of LeafHashChunk structs
+    /// - `n_chunks`: number of chunks in the schedule
+    /// - `lifting_log_size`: log2 of output leaf count
+    /// - `output_hashes`: device pointer to [n_leaves * 8] u32s (Blake2s hashes)
+    /// - `n_leaves`: 2^lifting_log_size
+    pub fn cuda_build_leaves_lifted(
+        col_ptrs: *const *const u32,
+        schedule: *const u8,  // LeafHashChunk array (passed as raw bytes)
+        n_chunks: u32,
+        lifting_log_size: u32,
+        output_hashes: *mut u32,
+        n_leaves: u32,
+    );
+
     // ── Barycentric evaluation ──────────────────────────────────────────
 
     /// Compute result = sum_i(evals[i] * weights[i]) using a parallel reduction.
