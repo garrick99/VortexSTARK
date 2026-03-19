@@ -541,6 +541,21 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
 
     let t_total = Instant::now();
 
+    // Reusable pinned buffer for eval download. First call: 855ms alloc. Subsequent: 0ms.
+    use std::sync::Mutex;
+    static EVAL_PINNED_POOL: Mutex<Option<crate::device::PinnedBuffer<u32>>> = Mutex::new(None);
+    let t_pa = Instant::now();
+    let mut eval_full_pinned = {
+        let mut pool = EVAL_PINNED_POOL.lock().unwrap();
+        match pool.take() {
+            Some(mut pb) => { pb.ensure_capacity(eval_size); pb }
+            None => crate::device::PinnedBuffer::<u32>::alloc(eval_size),
+        }
+    };
+    if timed { eprintln!("  pinned_prealloc: {:.1}ms ({:.1} GB)",
+        t_pa.elapsed().as_secs_f64() * 1000.0,
+        (eval_size as f64 * 4.0) / (1024.0 * 1024.0 * 1024.0)); }
+
     // --- Step 1: Generate trace ---
     let t0 = Instant::now();
     let bytes = n * std::mem::size_of::<u32>();
@@ -591,11 +606,7 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
         MerkleTree::commit_root_only_with_subtrees(std::slice::from_ref(&d_eval_full), log_eval_size);
     if timed { eprintln!("  trace_commit: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0); }
 
-    // Download eval to host for decommitment (quotient recomputation needs it).
-    // Then drop GPU copy to free 8GB for FRI arena.
-    let t0 = Instant::now();
-    let eval_full_host = d_eval_full.to_host();
-    if timed { eprintln!("  trace_download: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0); }
+    // eval_full_pinned already joined above (after trace_gen)
 
     // --- Steps 6+7: Fused quotient + circle fold (zero host transfer!) ---
     // Instead of: quotient → download 32GB → upload for fold
@@ -617,6 +628,7 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
 
     // Compute quotient Merkle subtree roots chunk-by-chunk
     // (we need these for quotient commitment + decommitment)
+    let t_qsub = Instant::now();
     for chunk_idx in 0..n_chunks {
         let offset = chunk_idx * chunk_size;
         let mut dq0 = DeviceBuffer::<u32>::alloc(chunk_size);
@@ -658,6 +670,7 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
 
     let quotient_commitment = reduce_subtree_roots_to_root(&all_quotient_subtrees);
     channel.mix_digest(&quotient_commitment);
+    if timed { eprintln!("  quotient_subtrees: {:.1}ms ({} chunks)", t_qsub.elapsed().as_secs_f64() * 1000.0, n_chunks); }
     if timed { eprintln!("  quotient_commit: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0); }
 
     // --- Circle fold: fused with quotient (re-compute quotient per chunk) ---
@@ -666,19 +679,21 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     let mut current_log_size = log_eval_size; // 31
 
     enum FriLayerData {
-        HostData([Vec<u32>; 4], Vec<[u32; 8]>),
+        PinnedData([crate::device::PinnedBuffer<u32>; 4], usize, Vec<[u32; 8]>),
         GpuTree(MerkleTree, SecureColumn),
         GpuLean(SecureColumn, Vec<[u32; 8]>),
     }
     let mut fri_layer_data: Vec<FriLayerData> = Vec::new();
 
     let fri_alpha = channel.draw_felt();
+    let t_cftwid = Instant::now();
     let fold_domain = if log_eval_size <= 30 {
         Coset::half_coset(log_eval_size)
     } else {
         Coset::subgroup(log_eval_size)
     };
     let d_fold_twid = fri::compute_fold_twiddles_on_demand(&fold_domain, true);
+    if timed { unsafe { ffi::cuda_device_sync() }; eprintln!("  circle_fold_twiddles: {:.1}ms", t_cftwid.elapsed().as_secs_f64() * 1000.0); }
 
     let fold_chunk_size = chunk_size / 2; // 2^26 fold outputs per quotient chunk
     let _fold_chunk_log: u32 = quotient_chunk_log - 1;
@@ -692,11 +707,14 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     let mut fri_gpu = SecureColumn::zeros(n_fold_output);
 
     // Fused: re-compute quotient chunk → circle fold → drop quotient
+    let mut fused_quotient_ms = 0.0f64;
+    let mut fused_fold_ms = 0.0f64;
     for chunk_idx in 0..n_chunks {
         let q_offset = chunk_idx * chunk_size;
         let fold_offset = chunk_idx * fold_chunk_size;
 
         // Re-compute quotient for this chunk (GPU, ~0.5s)
+        let tq = Instant::now();
         let mut dq0 = DeviceBuffer::<u32>::alloc(chunk_size);
         let mut dq1 = DeviceBuffer::<u32>::alloc(chunk_size);
         let mut dq2 = DeviceBuffer::<u32>::alloc(chunk_size);
@@ -709,9 +727,11 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
                 q_offset as u32, chunk_size as u32, eval_size as u32,
             );
         }
+        if timed { unsafe { ffi::cuda_device_sync() }; fused_quotient_ms += tq.elapsed().as_secs_f64() * 1000.0; }
 
         // Circle fold this quotient chunk directly into fri_gpu
         // Quotient chunk has chunk_size elements. Fold pairs adjacent → fold_chunk_size outputs.
+        let tf = Instant::now();
         unsafe {
             ffi::cuda_fold_circle_into_line_soa(
                 fri_gpu.cols[0].as_mut_ptr().add(fold_offset),
@@ -725,13 +745,23 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
                 fold_chunk_size as u32,
             );
         }
+        if timed { unsafe { ffi::cuda_device_sync() }; fused_fold_ms += tf.elapsed().as_secs_f64() * 1000.0; }
         // Quotient chunk dropped — zero host transfer!
     }
     drop(d_fold_twid);
-    drop(d_eval_full); // free 8GB — eval data on host, VRAM freed for FRI arena
     unsafe { ffi::cuda_device_sync() };
+    // All GPU compute done with d_eval_full. Download to pinned host now.
+    // Synchronous — no contention since no compute is reading d_eval_full.
+    // With pinned destination, DMA runs at full PCIe bandwidth.
+    let t0_tdl = Instant::now();
+    d_eval_full.download_to_pinned(&mut eval_full_pinned);
+    let eval_full_host = eval_full_pinned.as_slice(eval_size);
+    if timed { eprintln!("  trace_download: {:.1}ms (pinned DMA)",
+        t0_tdl.elapsed().as_secs_f64() * 1000.0); }
+    drop(d_eval_full); // free 8GB — eval data on host, VRAM freed for FRI arena
 
     // Commit circle fold output
+    let tc = Instant::now();
     let (fri0_root, fri0_subtrees) = MerkleTree::commit_root_soa4_with_subtrees(
         &fri_gpu.cols[0], &fri_gpu.cols[1],
         &fri_gpu.cols[2], &fri_gpu.cols[3], log_eval_size - 1,
@@ -740,35 +770,63 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     channel.mix_digest(&fri0_root);
     current_log_size -= 1; // now 30
     if timed {
-        eprintln!("  fused_quotient_fold: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+        let commit_ms = tc.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("  fused_quotient_fold: {:.1}ms (quotient: {:.1}ms, circle_fold: {:.1}ms, commit: {:.1}ms)",
+            t0.elapsed().as_secs_f64() * 1000.0, fused_quotient_ms, fused_fold_ms, commit_ms);
     }
 
-    // --- GPU-resident line folds (no host round-trips!) ---
-    // VRAM budget: prev(16GB) + twid(4GB) + next(8GB) = 28GB for first fold.
-    // Prefetch deferred until after drop(prev) to avoid 32GB peak.
-
-    // Download circle fold output for decommitment (16GB — too large for GPU arena)
-    let fri0_host = [
-        fri_gpu.cols[0].to_host(), fri_gpu.cols[1].to_host(),
-        fri_gpu.cols[2].to_host(), fri_gpu.cols[3].to_host(),
-    ];
-    fri_layer_data.push(FriLayerData::HostData(fri0_host, fri0_subtrees));
+    // --- GPU-resident line folds ---
+    // Keep fri0 on GPU for tile-based decommit (~3MB vs 16GB download).
+    // GpuLean for ≤27, PinnedData for 28-29 (VRAM constrained by fri0 16GB).
+    let mut fri0_gpu_saved: Option<SecureColumn> = None;
+    let fri0_subtrees_saved = fri0_subtrees;
 
     // GPU-resident line folds: fold from fri_gpu, store results.
-    // Large layers download to host (VRAM headroom). Small layers clone to GPU.
+    // Large layers (log>=28) download to pinned host async while next fold computes.
+    // Small layers (log<=27) clone on GPU.
     let mut gpu_fold_active = true;
+    let mut total_twid_ms = 0.0f64;
+    let mut total_fold_ms = 0.0f64;
+    let mut total_commit_ms = 0.0f64;
+    let mut total_download_ms = 0.0f64;
+
+    // Async download state for FRI layers.
+    let fri_dl_stream = ffi::CudaStream::new();
+    let mut pending_download: Option<(
+        [crate::device::PinnedBuffer<u32>; 4], usize, Vec<[u32; 8]>,
+    )> = None;
+    // FRI pinned buffers allocated lazily per-layer (background alloc only for eval_full)
+
     while current_log_size > FRI_CPU_TAIL_LOG.max(3) {
         let ti = Instant::now();
         let fold_alpha = channel.draw_felt();
 
+        // If there's a pending async download from the previous iteration,
+        // we must sync before the fold drops the old fri_gpu (which the download reads from).
+        // The fold below will reassign fri_gpu, dropping the old one.
+        if pending_download.is_some() {
+            fri_dl_stream.sync();
+            let (pinned_data, pinned_len, subtrees) = pending_download.take().unwrap();
+            fri_layer_data.push(FriLayerData::PinnedData(pinned_data, pinned_len, subtrees));
+        }
+
+        let t_twid = Instant::now();
         let line_domain = Coset::half_coset(current_log_size);
         let d_twid = fri::compute_fold_twiddles_on_demand(&line_domain, false);
+        if timed { unsafe { ffi::cuda_device_sync() }; }
+        let twid_ms = t_twid.elapsed().as_secs_f64() * 1000.0;
+        total_twid_ms += twid_ms;
 
+        let t_fold = Instant::now();
         let folded = if gpu_fold_active {
             let result = fri::fold_line_with_twiddles(&fri_gpu, fold_alpha, &d_twid);
             drop(d_twid);
-            drop(fri_gpu);
-            fri_gpu = SecureColumn::alloc(0);
+            if fri0_gpu_saved.is_none() {
+                fri0_gpu_saved = Some(std::mem::replace(&mut fri_gpu, SecureColumn::alloc(0)));
+            } else {
+                drop(fri_gpu);
+                fri_gpu = SecureColumn::alloc(0);
+            }
             result
         } else {
             let src = match fri_layer_data.last().unwrap() {
@@ -779,8 +837,12 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
             drop(d_twid);
             result
         };
+        if timed { unsafe { ffi::cuda_device_sync() }; }
+        let fold_ms = t_fold.elapsed().as_secs_f64() * 1000.0;
+        total_fold_ms += fold_ms;
         current_log_size -= 1;
 
+        let t_commit = Instant::now();
         const FRI_LEAN_THRESHOLD_LOG: u32 = 18;
         if current_log_size >= FRI_LEAN_THRESHOLD_LOG {
             let (fri_root, subtrees) = MerkleTree::commit_root_soa4_with_subtrees(
@@ -789,7 +851,10 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
             );
             fri_commitments.push(fri_root);
             channel.mix_digest(&fri_root);
-            if current_log_size <= 29 {
+            if timed { let cm = t_commit.elapsed().as_secs_f64() * 1000.0; total_commit_ms += cm; }
+            let t_dl = Instant::now();
+            // GpuLean for ≤27 (fast D2D clone). Pinned DMA for 28-29 (VRAM headroom for fri0).
+            if current_log_size <= 27 {
                 fri_layer_data.push(FriLayerData::GpuLean(
                     SecureColumn {
                         cols: std::array::from_fn(|c| folded.cols[c].clone_device()),
@@ -798,12 +863,17 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
                     subtrees,
                 ));
             } else {
-                let host_data = [
-                    folded.cols[0].to_host(), folded.cols[1].to_host(),
-                    folded.cols[2].to_host(), folded.cols[3].to_host(),
-                ];
-                fri_layer_data.push(FriLayerData::HostData(host_data, subtrees));
+                let mut pinned_data: [crate::device::PinnedBuffer<u32>; 4] =
+                    std::array::from_fn(|_| crate::device::PinnedBuffer::<u32>::alloc(folded.len));
+                for c in 0..4 {
+                    folded.cols[c].download_into_async(
+                        pinned_data[c].as_mut_slice(folded.len),
+                        &fri_dl_stream,
+                    );
+                }
+                pending_download = Some((pinned_data, folded.len, subtrees));
             }
+            if timed { total_download_ms += t_dl.elapsed().as_secs_f64() * 1000.0; }
             fri_gpu = folded;
             gpu_fold_active = true;
         } else {
@@ -813,21 +883,38 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
             );
             fri_commitments.push(fri_tree.root());
             channel.mix_digest(&fri_tree.root());
+            if timed { total_commit_ms += t_commit.elapsed().as_secs_f64() * 1000.0; }
             fri_layer_data.push(FriLayerData::GpuTree(fri_tree, folded));
             gpu_fold_active = false;
         }
         if timed {
-            eprintln!("    fri line (log={}): {:.1}ms", current_log_size, ti.elapsed().as_secs_f64() * 1000.0);
+            eprintln!("    fri line (log={}): {:.1}ms (twid: {:.1}ms, fold: {:.1}ms)",
+                current_log_size, ti.elapsed().as_secs_f64() * 1000.0, twid_ms, fold_ms);
         }
+    }
+    // Flush any pending async download
+    if pending_download.is_some() {
+        fri_dl_stream.sync();
+        let (pinned_data, pinned_len, subtrees) = pending_download.take().unwrap();
+        fri_layer_data.push(FriLayerData::PinnedData(pinned_data, pinned_len, subtrees));
+    }
+    drop(fri_dl_stream);
+    if timed {
+        eprintln!("  fri_line_totals: twid={:.1}ms fold={:.1}ms commit={:.1}ms download={:.1}ms",
+            total_twid_ms, total_fold_ms, total_commit_ms, total_download_ms);
     }
     drop(fri_gpu);
 
     // CPU tail
     let mut cpu_eval = match fri_layer_data.last().unwrap() {
         FriLayerData::GpuTree(_, eval) | FriLayerData::GpuLean(eval, _) => eval.to_qm31(),
-        FriLayerData::HostData(host, _) => {
-            let nn = host[0].len();
-            (0..nn).map(|i| QM31::from_u32_array([host[0][i], host[1][i], host[2][i], host[3][i]])).collect()
+        FriLayerData::PinnedData(pinned, len, _) => {
+            let nn = *len;
+            let s0 = pinned[0].as_slice(nn);
+            let s1 = pinned[1].as_slice(nn);
+            let s2 = pinned[2].as_slice(nn);
+            let s3 = pinned[3].as_slice(nn);
+            (0..nn).map(|i| QM31::from_u32_array([s0[i], s1[i], s2[i], s3[i]])).collect()
         }
     };
 
@@ -862,24 +949,42 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
         .collect();
 
     // Decommit trace from host eval data
+    let td0 = Instant::now();
     let trace_decommitment = decommit_trace_gpu(&eval_full_host, &trace_subtree_roots, &query_indices);
+    if timed { eprintln!("    decommit_trace: {:.1}ms", td0.elapsed().as_secs_f64() * 1000.0); }
 
     // Decommit quotient: recompute from host eval data
+    let td1 = Instant::now();
     let quotient_decommitment = decommit_quotient_recompute(
         &eval_full_host, eval_size, alpha, &all_quotient_subtrees, &query_indices,
     );
+    if timed { eprintln!("    decommit_quotient: {:.1}ms", td1.elapsed().as_secs_f64() * 1000.0); }
 
-    // Decommit FRI layers
+    // Decommit FRI layer 0 from GPU-resident data (tile download, ~3MB)
+    let td2 = Instant::now();
     let mut fri_decommitments = Vec::new();
     let mut folded_indices: Vec<usize> = query_indices.iter().map(|&qi| qi / 2).collect();
+    if let Some(ref fri0_eval) = fri0_gpu_saved {
+        let decom = decommit_soa4_from_gpu_resident(fri0_eval, &fri0_subtrees_saved, &folded_indices);
+        fri_decommitments.push(decom);
+        folded_indices = folded_indices.iter().map(|&i| i / 2).collect();
+    }
+    if timed { eprintln!("    decommit_fri0_gpu: {:.1}ms", td2.elapsed().as_secs_f64() * 1000.0); }
+    drop(fri0_gpu_saved);
+
+    // Decommit remaining FRI layers
+    let td3 = Instant::now();
+    let mut layer_idx_decom = 0u32;
     for layer_data in fri_layer_data.drain(..) {
         match layer_data {
             FriLayerData::GpuTree(tree, eval) => {
                 let decom = decommit_fri_layer(&tree, &eval, &folded_indices);
                 fri_decommitments.push(decom);
             }
-            FriLayerData::HostData(host, subtrees) => {
-                let decom = decommit_soa4_gpu(&host, &subtrees, &folded_indices);
+            FriLayerData::PinnedData(ref pinned, ref len, ref subtrees) => {
+                let n = *len;
+                let slices: [&[u32]; 4] = std::array::from_fn(|c| pinned[c].as_slice(n));
+                let decom = decommit_soa4_gpu_slices(slices, subtrees, &folded_indices);
                 fri_decommitments.push(decom);
             }
             FriLayerData::GpuLean(ref eval, ref subtrees) => {
@@ -888,9 +993,12 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
             }
         }
         folded_indices = folded_indices.iter().map(|&i| i / 2).collect();
+        layer_idx_decom += 1;
     }
+    if timed { eprintln!("    decommit_fri_rest: {:.1}ms ({} layers)", td3.elapsed().as_secs_f64() * 1000.0, layer_idx_decom); }
 
     // Decommit CPU tail FRI layers
+    let td4 = Instant::now();
     for (cpu_vals, _root) in &cpu_fri_trees {
         let values: Vec<[u32; 4]> = folded_indices.iter().map(|&i| cpu_vals[i].to_u32_array()).collect();
         let sibling_indices: Vec<usize> = folded_indices.iter().map(|&i| i ^ 1).collect();
@@ -902,11 +1010,16 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
         });
         folded_indices = folded_indices.iter().map(|&i| i / 2).collect();
     }
+    if timed { eprintln!("    decommit_cpu_tail: {:.1}ms", td4.elapsed().as_secs_f64() * 1000.0); }
 
     if timed {
         eprintln!("  query_decommit: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
         eprintln!("  TOTAL: {:.1}ms", t_total.elapsed().as_secs_f64() * 1000.0);
     }
+
+    // Return pinned buffer to pool for reuse (next proof: 0ms alloc)
+    let _ = eval_full_host;
+    { let mut pool = EVAL_PINNED_POOL.lock().unwrap(); *pool = Some(eval_full_pinned); }
 
     StarkProof {
         trace_commitment,
@@ -1037,6 +1150,18 @@ fn decommit_soa4_gpu(
     subtree_roots: &[[u32; 8]],
     indices: &[usize],
 ) -> QueryDecommitment<[u32; 4]> {
+    decommit_soa4_gpu_slices(
+        [&host[0], &host[1], &host[2], &host[3]],
+        subtree_roots, indices,
+    )
+}
+
+/// Slice-based SoA4 decommitment — works with both Vec and PinnedBuffer data.
+fn decommit_soa4_gpu_slices(
+    host: [&[u32]; 4],
+    subtree_roots: &[[u32; 8]],
+    indices: &[usize],
+) -> QueryDecommitment<[u32; 4]> {
     let values: Vec<[u32; 4]> = indices
         .iter()
         .map(|&i| [host[0][i], host[1][i], host[2][i], host[3][i]])
@@ -1049,13 +1174,14 @@ fn decommit_soa4_gpu(
 
     let n = host[0].len();
     if n < 4096 {
-        let auth_paths = MerkleTree::cpu_merkle_auth_paths_soa4(host, indices);
-        let sibling_auth_paths = MerkleTree::cpu_merkle_auth_paths_soa4(host, &sibling_indices);
+        let vecs: [Vec<u32>; 4] = std::array::from_fn(|c| host[c].to_vec());
+        let auth_paths = MerkleTree::cpu_merkle_auth_paths_soa4(&vecs, indices);
+        let sibling_auth_paths = MerkleTree::cpu_merkle_auth_paths_soa4(&vecs, &sibling_indices);
         return QueryDecommitment { values, sibling_values, auth_paths, sibling_auth_paths };
     }
 
     let all_indices: Vec<usize> = indices.iter().chain(sibling_indices.iter()).copied().collect();
-    let tile_paths = gpu_tile_auth_paths_soa4(host, subtree_roots, &all_indices);
+    let tile_paths = gpu_tile_auth_paths_soa4_slices(host, subtree_roots, &all_indices);
     let (auth_paths, sibling_auth_paths) = tile_paths.split_at(indices.len());
 
     QueryDecommitment {
@@ -1360,7 +1486,7 @@ fn decommit_soa4_from_gpu_resident(
     use std::collections::BTreeSet;
 
     const TILE_SIZE: usize = 1024;
-    let n = gpu_cols.len;
+    let _n = gpu_cols.len;
 
     let sibling_indices: Vec<usize> = indices.iter().map(|&i| i ^ 1).collect();
     let needed_tiles: BTreeSet<usize> = indices.iter()
@@ -1372,10 +1498,9 @@ fn decommit_soa4_from_gpu_resident(
     let batch_size = n_needed * TILE_SIZE;
     let tile_indices: Vec<usize> = needed_tiles.iter().copied().collect();
 
-    // Allocate contiguous GPU buffers for needed tiles
+    // Allocate ONE contiguous GPU buffer per column and gather tiles via D2D
+    let t_d2d = Instant::now();
     let mut d_batch: [DeviceBuffer<u32>; 4] = std::array::from_fn(|_| DeviceBuffer::<u32>::alloc(batch_size));
-
-    // Queue all D2D copies
     for (slot, &tile_idx) in tile_indices.iter().enumerate() {
         let src_base = tile_idx * TILE_SIZE;
         let dst_base = slot * TILE_SIZE;
@@ -1390,11 +1515,14 @@ fn decommit_soa4_from_gpu_resident(
             }
         }
     }
-
-    // Single sync + batch download to host
     unsafe { ffi::cuda_device_sync() };
+    let _d2d_ms = t_d2d.elapsed().as_secs_f64() * 1000.0;
+
+    // Batch download to host
+    let t_dl = Instant::now();
     let host_batch: [Vec<u32>; 4] = std::array::from_fn(|c| d_batch[c].to_host());
     drop(d_batch);
+    let _dl_ms = t_dl.elapsed().as_secs_f64() * 1000.0;
 
     // Build index: tile_idx → slot in batch
     let tile_slot: std::collections::HashMap<usize, usize> = tile_indices.iter()
@@ -1409,17 +1537,60 @@ fn decommit_soa4_from_gpu_resident(
     let values: Vec<[u32; 4]> = indices.iter().map(|&i| get_val(i)).collect();
     let sibling_values: Vec<[u32; 4]> = sibling_indices.iter().map(|&i| get_val(i)).collect();
 
-    // Auth paths: targeted approach (CPU tile subtrees + CPU upper tree)
+    // Auth paths: per-tile subtrees on CPU + upper tree on GPU
+    let _t_auth = Instant::now();
     let all_indices: Vec<usize> = indices.iter().chain(sibling_indices.iter()).copied().collect();
-    let hash_leaf = |i: usize| -> [u32; 8] {
-        let slot = tile_slot[&(i / TILE_SIZE)];
-        let off = slot * TILE_SIZE + (i % TILE_SIZE);
-        MerkleTree::hash_leaf(&[host_batch[0][off], host_batch[1][off],
-                                host_batch[2][off], host_batch[3][off]])
-    };
-    let auth_paths_all = MerkleTree::targeted_auth_paths_with_tile_roots(
-        subtree_roots, n, &all_indices, &hash_leaf,
-    );
+
+    // Build per-tile subtrees on CPU in parallel (100 tiles × 2047 Blake2s hashes each)
+    const TILE_TREE_SIZE: usize = 2 * TILE_SIZE - 1;
+    let tile_keys: Vec<usize> = tile_slot.keys().copied().collect();
+    let tile_trees_vec: Vec<(usize, Vec<[u32; 8]>)> = std::thread::scope(|s| {
+        let handles: Vec<_> = tile_keys.iter().map(|&tile_idx| {
+            let slot = tile_slot[&tile_idx];
+            let hb = &host_batch;
+            s.spawn(move || {
+                let base = slot * TILE_SIZE;
+                let mut tree = vec![[0u32; 8]; TILE_TREE_SIZE];
+                for j in 0..TILE_SIZE {
+                    tree[TILE_SIZE - 1 + j] = MerkleTree::hash_leaf(&[
+                        hb[0][base + j], hb[1][base + j],
+                        hb[2][base + j], hb[3][base + j],
+                    ]);
+                }
+                for i in (0..TILE_SIZE - 1).rev() {
+                    tree[i] = MerkleTree::hash_pair(&tree[2 * i + 1], &tree[2 * i + 2]);
+                }
+                (tile_idx, tree)
+            })
+        }).collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let tile_trees_flat: std::collections::HashMap<usize, Vec<[u32; 8]>> =
+        tile_trees_vec.into_iter().collect();
+
+    // Build upper tree on GPU (fast even for 1M+ subtree roots)
+    let upper_layers = gpu_build_upper_tree(subtree_roots);
+
+    // Extract auth paths: intra-tile path (from flat tree) + upper tree path
+    let auth_paths_all: Vec<Vec<[u32; 8]>> = all_indices.iter().map(|&qi| {
+        let tile_idx = qi / TILE_SIZE;
+        let intra_idx = qi % TILE_SIZE;
+        let mut path = Vec::new();
+        let tree = &tile_trees_flat[&tile_idx];
+        // Walk from leaf to root in the flat tree (heap layout)
+        let mut node = TILE_SIZE - 1 + intra_idx; // leaf index in flat tree
+        while node > 0 {
+            let sibling = if node % 2 == 1 { node + 1 } else { node - 1 };
+            path.push(tree[sibling]);
+            node = (node - 1) / 2; // parent
+        }
+        let mut idx = tile_idx;
+        for layer in &upper_layers[..upper_layers.len() - 1] {
+            path.push(layer[idx ^ 1]);
+            idx /= 2;
+        }
+        path
+    }).collect();
 
     let (auth_paths, sibling_auth_paths) = auth_paths_all.split_at(indices.len());
     QueryDecommitment {
@@ -1713,6 +1884,11 @@ fn gpu_build_upper_tree(subtree_roots: &[[u32; 8]]) -> Vec<Vec<[u32; 8]>> {
         return vec![subtree_roots.to_vec()];
     }
 
+    // For small trees (≤8K roots), CPU is faster than GPU kernel launch overhead
+    if n <= 8192 {
+        return MerkleTree::build_cpu_tree_layers(subtree_roots.to_vec());
+    }
+
     // Upload subtree roots as flat u32 buffer
     let flat: Vec<u32> = subtree_roots.iter().flat_map(|h| h.iter().copied()).collect();
     let d_current = DeviceBuffer::from_host(&flat);
@@ -1805,9 +1981,9 @@ fn gpu_tile_auth_paths_single(
         .collect()
 }
 
-/// GPU-accelerated auth path extraction for SoA4 (QM31) data.
-fn gpu_tile_auth_paths_soa4(
-    host_cols: &[Vec<u32>; 4],
+/// Slice-based variant: builds per-tile subtrees on CPU, upper tree on GPU.
+fn gpu_tile_auth_paths_soa4_slices(
+    host_cols: [&[u32]; 4],
     subtree_roots: &[[u32; 8]],
     indices: &[usize],
 ) -> Vec<Vec<[u32; 8]>> {
@@ -1815,42 +1991,41 @@ fn gpu_tile_auth_paths_soa4(
 
     const TILE_SIZE: usize = 1024;
 
-    // Collect unique tiles needed
     let needed_tiles: BTreeSet<usize> = indices.iter().map(|&qi| qi / TILE_SIZE).collect();
 
-    // Build per-tile GPU Merkle trees
-    let mut tile_trees: HashMap<usize, MerkleTree> = HashMap::new();
+    // Build per-tile subtrees on CPU (fast: ~200 tiles × 1024 leaves)
+    let mut tile_subtrees: HashMap<usize, Vec<Vec<[u32; 8]>>> = HashMap::new();
     for &tile_idx in &needed_tiles {
         let base = tile_idx * TILE_SIZE;
-        let c0 = DeviceBuffer::from_host(&host_cols[0][base..base + TILE_SIZE]);
-        let c1 = DeviceBuffer::from_host(&host_cols[1][base..base + TILE_SIZE]);
-        let c2 = DeviceBuffer::from_host(&host_cols[2][base..base + TILE_SIZE]);
-        let c3 = DeviceBuffer::from_host(&host_cols[3][base..base + TILE_SIZE]);
-        let tree = MerkleTree::commit_soa4(&c0, &c1, &c2, &c3, 10);
-        tile_trees.insert(tile_idx, tree);
+        let leaf_hashes: Vec<[u32; 8]> = (0..TILE_SIZE)
+            .map(|j| MerkleTree::hash_leaf(&[
+                host_cols[0][base + j], host_cols[1][base + j],
+                host_cols[2][base + j], host_cols[3][base + j],
+            ]))
+            .collect();
+        tile_subtrees.insert(tile_idx, MerkleTree::build_cpu_tree_layers(leaf_hashes));
     }
 
-    // Upper tree from subtree roots on GPU
+    // Build upper tree on GPU
     let upper_layers = gpu_build_upper_tree(subtree_roots);
 
-    // Extract auth paths
     indices
         .iter()
         .map(|&qi| {
             let tile_idx = qi / TILE_SIZE;
             let intra_idx = qi % TILE_SIZE;
             let mut path = Vec::new();
-
-            let tree = &tile_trees[&tile_idx];
-            let intra_path = tree.auth_path(intra_idx);
-            path.extend_from_slice(&intra_path);
-
+            let subtree = &tile_subtrees[&tile_idx];
+            let mut idx = intra_idx;
+            for layer in &subtree[..subtree.len() - 1] {
+                path.push(layer[idx ^ 1]);
+                idx /= 2;
+            }
             let mut idx = tile_idx;
             for layer in &upper_layers[..upper_layers.len() - 1] {
                 path.push(layer[idx ^ 1]);
                 idx /= 2;
             }
-
             path
         })
         .collect()

@@ -57,11 +57,7 @@ fn cmd_prove(args: &[String]) {
     eprintln!("Proving Fibonacci STARK: log_n={log_n}, n={n}, a={a}, b={b}");
 
     let t0 = Instant::now();
-    let proof = if log_n <= 28 {
-        prover::prove_lean(M31(a), M31(b), log_n)
-    } else {
-        prover::prove_lean_timed(M31(a), M31(b), log_n)
-    };
+    let proof = prover::prove_lean_timed(M31(a), M31(b), log_n);
     let prove_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     // Verify before saving

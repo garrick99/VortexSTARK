@@ -166,6 +166,59 @@ impl<T> DeviceBuffer<T> {
         host
     }
 
+    /// Download GPU buffer to host using chunked pinned staging.
+    /// Uses a 256MB pinned buffer to avoid the cost of page-locking gigabytes of RAM.
+    /// For large buffers (>512MB), this is faster than both to_host() and to_host_fast().
+    pub fn to_host_chunked(&self) -> Vec<T>
+    where
+        T: Default + Clone,
+    {
+        self.to_host_via(&SHARED_STAGING)
+    }
+
+    /// Download GPU buffer to host using a shared pinned staging buffer.
+    /// The staging buffer is allocated on first use and reused across all transfers.
+    pub fn to_host_via(&self, staging: &StagingBuffer) -> Vec<T>
+    where
+        T: Default + Clone,
+    {
+        if self.len == 0 {
+            return Vec::new();
+        }
+        let elem_size = std::mem::size_of::<T>();
+        let stage_elems = staging.byte_len() / elem_size;
+        assert!(stage_elems > 0, "staging buffer too small for element type");
+
+        let mut host = Vec::<T>::with_capacity(self.len);
+        let mut offset = 0usize;
+        while offset < self.len {
+            let chunk = (self.len - offset).min(stage_elems);
+            let chunk_bytes = chunk * elem_size;
+            let guard = staging.lock();
+            let pinned_ptr = *guard;
+            let err = unsafe {
+                ffi::cudaMemcpy(
+                    pinned_ptr,
+                    (self.ptr as *const u8).add(offset * elem_size) as *const c_void,
+                    chunk_bytes,
+                    ffi::MEMCPY_D2H,
+                )
+            };
+            assert!(err == 0, "cudaMemcpy D2H staged failed: {err}");
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    pinned_ptr as *const T,
+                    host.as_mut_ptr().add(offset),
+                    chunk,
+                );
+            }
+            drop(guard);
+            offset += chunk;
+        }
+        unsafe { host.set_len(self.len) };
+        host
+    }
+
     /// Async upload: copy host data to an existing GPU buffer on a stream.
     /// Caller must sync the stream before reading from the buffer.
     pub fn upload_async(&mut self, data: &[T], stream: &crate::cuda::ffi::CudaStream) {
@@ -244,6 +297,31 @@ impl<T> DeviceBuffer<T> {
         self.len == 0
     }
 
+    /// Download GPU buffer directly into a PinnedBuffer (full DMA speed).
+    /// The PinnedBuffer must have capacity >= self.len.
+    pub fn download_to_pinned(&self, dst: &mut PinnedBuffer<T>) {
+        dst.ensure_capacity(self.len);
+        if self.len > 0 {
+            let bytes = self.len * std::mem::size_of::<T>();
+            let err = unsafe {
+                ffi::cudaMemcpy(
+                    dst.as_mut_ptr() as *mut c_void,
+                    self.ptr as *const c_void,
+                    bytes,
+                    ffi::MEMCPY_D2H,
+                )
+            };
+            assert!(err == 0, "cudaMemcpy D2H pinned failed: {err}");
+        }
+    }
+
+    /// Download GPU buffer into a new PinnedBuffer (full DMA speed, no staging).
+    pub fn to_pinned(&self) -> PinnedBuffer<T> {
+        let mut pb = PinnedBuffer::<T>::alloc(self.len);
+        self.download_to_pinned(&mut pb);
+        pb
+    }
+
     /// Copy device data into a new device buffer (D2D).
     pub fn clone_device(&self) -> Self {
         let new_buf = Self::alloc(self.len);
@@ -262,6 +340,68 @@ impl<T> DeviceBuffer<T> {
         new_buf
     }
 }
+
+/// Shared pinned staging buffer for high-throughput D2H transfers.
+/// Allocated once on first use, reused for all to_host_chunked() calls.
+/// Uses a mutex to allow thread-safe access (single transfer at a time).
+pub struct StagingBuffer {
+    inner: std::sync::Mutex<StagingInner>,
+}
+
+struct StagingInner {
+    ptr: *mut c_void,
+    bytes: usize,
+}
+
+unsafe impl Send for StagingInner {}
+
+impl StagingBuffer {
+    const STAGE_BYTES: usize = 256 * 1024 * 1024; // 256MB
+
+    pub const fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(StagingInner {
+                ptr: std::ptr::null_mut(),
+                bytes: 0,
+            }),
+        }
+    }
+
+    fn byte_len(&self) -> usize {
+        Self::STAGE_BYTES
+    }
+
+    /// Lock the staging buffer and return a pointer to pinned memory.
+    /// Allocates on first call.
+    fn lock(&self) -> StagingGuard<'_> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.ptr.is_null() {
+            let mut ptr: *mut c_void = std::ptr::null_mut();
+            let err = unsafe { ffi::cudaMallocHost(&mut ptr, Self::STAGE_BYTES) };
+            assert!(err == 0, "cudaMallocHost staging failed: {err}");
+            inner.ptr = ptr;
+            inner.bytes = Self::STAGE_BYTES;
+        }
+        StagingGuard {
+            ptr: inner.ptr,
+            _guard: inner,
+        }
+    }
+}
+
+struct StagingGuard<'a> {
+    ptr: *mut c_void,
+    _guard: std::sync::MutexGuard<'a, StagingInner>,
+}
+
+impl<'a> std::ops::Deref for StagingGuard<'a> {
+    type Target = *mut c_void;
+    fn deref(&self) -> &Self::Target {
+        &self.ptr
+    }
+}
+
+static SHARED_STAGING: StagingBuffer = StagingBuffer::new();
 
 /// Page-locked (pinned) host memory buffer.
 /// Enables DMA transfers (faster H2D/D2H) and is required for async memcpy.

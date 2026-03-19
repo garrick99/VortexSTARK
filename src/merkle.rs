@@ -751,7 +751,7 @@ impl MerkleTree {
     }
 
     /// Hash two sibling nodes into a parent.
-    fn hash_pair(left: &[u32; HASH_WORDS], right: &[u32; HASH_WORDS]) -> [u32; HASH_WORDS] {
+    pub fn hash_pair(left: &[u32; HASH_WORDS], right: &[u32; HASH_WORDS]) -> [u32; HASH_WORDS] {
         use crate::channel::blake2s_hash;
         let mut input = [0u8; 64];
         for (j, &w) in left.iter().enumerate() {
