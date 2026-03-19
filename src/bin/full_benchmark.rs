@@ -155,6 +155,6 @@ fn main() {
     println!("  Builtins:   Poseidon (GPU), Pedersen (CPU), Bitwise");
     println!("  Features:   LogUp memory consistency, range checks, 2-phase commitment");
     println!("  CLI:        stark_cli prove/verify (binary proof serialization)");
-    println!("  Gitea:      https://github.com/garrick99/VortexSTARK");
+    println!("  GitHub:     https://github.com/garrick99/VortexSTARK");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 }
