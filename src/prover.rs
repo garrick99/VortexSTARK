@@ -1002,7 +1002,9 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     // Decommit remaining FRI layers
     let td3 = Instant::now();
     let mut layer_idx_decom = 0u32;
+    let mut fri_layer_ms = Vec::new();
     for layer_data in fri_layer_data.drain(..) {
+        let tl = Instant::now();
         match layer_data {
             FriLayerData::GpuTree(tree, eval) => {
                 let decom = decommit_fri_layer(&tree, &eval, &folded_indices);
@@ -1019,10 +1021,21 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
                 fri_decommitments.push(decom);
             }
         }
+        fri_layer_ms.push(tl.elapsed().as_secs_f64() * 1000.0);
         folded_indices = folded_indices.iter().map(|&i| i / 2).collect();
         layer_idx_decom += 1;
     }
-    if timed { eprintln!("    decommit_fri_rest: {:.1}ms ({} layers)", td3.elapsed().as_secs_f64() * 1000.0, layer_idx_decom); }
+    if timed {
+        eprintln!("    decommit_fri_rest: {:.1}ms ({} layers)", td3.elapsed().as_secs_f64() * 1000.0, layer_idx_decom);
+        if !fri_layer_ms.is_empty() {
+            let top3: Vec<String> = {
+                let mut indexed: Vec<(usize, f64)> = fri_layer_ms.iter().enumerate().map(|(i,&ms)| (i,ms)).collect();
+                indexed.sort_by(|a,b| b.1.partial_cmp(&a.1).unwrap());
+                indexed.iter().take(5).map(|(i,ms)| format!("L{i}={ms:.1}ms")).collect()
+            };
+            eprintln!("      top layers: {}", top3.join(", "));
+        }
+    }
 
     // Decommit CPU tail FRI layers
     let td4 = Instant::now();
@@ -1139,10 +1152,18 @@ fn decommit_trace_gpu(
         return QueryDecommitment { values, sibling_values, auth_paths, sibling_auth_paths };
     }
 
-    // GPU path: upload only queried tiles, hash on GPU
+    // CPU targeted path: build only ~200 queried tile subtrees on CPU.
+    // Uses pre-computed tile roots from GPU commitment phase.
+    // Much faster than GPU per-tile approach (no H2D uploads, no kernel launches).
+    let subtree_roots_arr: Vec<[u32; 8]> = subtree_roots.to_vec();
+    let hash_leaf = |i: usize| -> [u32; 8] {
+        MerkleTree::hash_leaf(&[eval_host[i]])
+    };
     let all_indices: Vec<usize> = indices.iter().chain(sibling_indices.iter()).copied().collect();
-    let tile_paths = gpu_tile_auth_paths_single(eval_host, subtree_roots, &all_indices);
-    let (auth_paths, sibling_auth_paths) = tile_paths.split_at(indices.len());
+    let all_paths = MerkleTree::targeted_auth_paths_with_tile_roots(
+        &subtree_roots_arr, n, &all_indices, &hash_leaf,
+    );
+    let (auth_paths, sibling_auth_paths) = all_paths.split_at(indices.len());
 
     QueryDecommitment {
         values, sibling_values,
@@ -1207,9 +1228,18 @@ fn decommit_soa4_gpu_slices(
         return QueryDecommitment { values, sibling_values, auth_paths, sibling_auth_paths };
     }
 
+    // CPU targeted path: build only queried tile subtrees.
+    // Uses pre-computed tile roots from GPU commitment phase.
+    let subtree_roots_arr: Vec<[u32; 8]> = subtree_roots.to_vec();
+    let host_ref = host;
+    let hash_leaf = |i: usize| -> [u32; 8] {
+        MerkleTree::hash_leaf(&[host_ref[0][i], host_ref[1][i], host_ref[2][i], host_ref[3][i]])
+    };
     let all_indices: Vec<usize> = indices.iter().chain(sibling_indices.iter()).copied().collect();
-    let tile_paths = gpu_tile_auth_paths_soa4_slices(host, subtree_roots, &all_indices);
-    let (auth_paths, sibling_auth_paths) = tile_paths.split_at(indices.len());
+    let all_paths = MerkleTree::targeted_auth_paths_with_tile_roots(
+        &subtree_roots_arr, n, &all_indices, &hash_leaf,
+    );
+    let (auth_paths, sibling_auth_paths) = all_paths.split_at(indices.len());
 
     QueryDecommitment {
         values, sibling_values,
@@ -1525,31 +1555,32 @@ fn decommit_soa4_from_gpu_resident(
     let batch_size = n_needed * TILE_SIZE;
     let tile_indices: Vec<usize> = needed_tiles.iter().copied().collect();
 
-    // Allocate ONE contiguous GPU buffer per column and gather tiles via D2D
-    let t_d2d = Instant::now();
+    // Gather needed tiles from GPU → host via batched async D2D + single D2H.
+    // Use a CUDA stream to pipeline the D2D copies, then download once.
+    let stream = ffi::CudaStream::new();
     let mut d_batch: [DeviceBuffer<u32>; 4] = std::array::from_fn(|_| DeviceBuffer::<u32>::alloc(batch_size));
     for (slot, &tile_idx) in tile_indices.iter().enumerate() {
         let src_base = tile_idx * TILE_SIZE;
         let dst_base = slot * TILE_SIZE;
         for c in 0..4 {
             unsafe {
-                ffi::cudaMemcpy(
+                ffi::cudaMemcpyAsync(
                     d_batch[c].as_mut_ptr().add(dst_base) as *mut std::ffi::c_void,
                     gpu_cols.cols[c].as_ptr().add(src_base) as *const std::ffi::c_void,
                     TILE_SIZE * 4,
                     ffi::MEMCPY_D2D,
+                    stream.ptr,
                 );
             }
         }
     }
-    unsafe { ffi::cuda_device_sync() };
-    let _d2d_ms = t_d2d.elapsed().as_secs_f64() * 1000.0;
-
-    // Batch download to host
-    let t_dl = Instant::now();
-    let host_batch: [Vec<u32>; 4] = std::array::from_fn(|c| d_batch[c].to_host());
+    // Single batch download per column (awaits D2D completion on same stream)
+    let mut host_batch: [Vec<u32>; 4] = std::array::from_fn(|_| vec![0u32; batch_size]);
+    for c in 0..4 {
+        d_batch[c].download_into_async(&mut host_batch[c], &stream);
+    }
+    stream.sync();
     drop(d_batch);
-    let _dl_ms = t_dl.elapsed().as_secs_f64() * 1000.0;
 
     // Build index: tile_idx → slot in batch
     let tile_slot: std::collections::HashMap<usize, usize> = tile_indices.iter()

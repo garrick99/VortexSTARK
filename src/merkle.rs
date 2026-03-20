@@ -676,7 +676,7 @@ impl MerkleTree {
         tile_roots: &[[u32; HASH_WORDS]],
         _n_leaves: usize,
         indices: &[usize],
-        hash_leaf: &dyn Fn(usize) -> [u32; HASH_WORDS],
+        hash_leaf: &(dyn Fn(usize) -> [u32; HASH_WORDS] + Sync),
     ) -> Vec<Vec<[u32; HASH_WORDS]>> {
         use std::collections::HashMap;
 
@@ -688,15 +688,35 @@ impl MerkleTree {
             needed_tiles.insert(qi / TILE_SIZE);
         }
 
-        // Build only the needed subtrees on CPU
-        let mut tile_subtrees: HashMap<usize, Vec<Vec<[u32; HASH_WORDS]>>> = HashMap::new();
-        for &tile_idx in &needed_tiles {
-            let base = tile_idx * TILE_SIZE;
-            let leaf_hashes: Vec<[u32; HASH_WORDS]> = (base..base + TILE_SIZE)
-                .map(hash_leaf)
-                .collect();
-            tile_subtrees.insert(tile_idx, Self::build_cpu_tree_layers(leaf_hashes));
-        }
+        let needed_vec: Vec<usize> = needed_tiles.iter().copied().collect();
+
+        // Build needed subtrees in parallel across CPU threads
+        let tile_subtrees: HashMap<usize, Vec<Vec<[u32; HASH_WORDS]>>> = if needed_vec.len() > 4 {
+            let results: Vec<(usize, Vec<Vec<[u32; HASH_WORDS]>>)> =
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = needed_vec.iter().map(|&tile_idx| {
+                        s.spawn(move || {
+                            let base = tile_idx * TILE_SIZE;
+                            let leaf_hashes: Vec<[u32; HASH_WORDS]> = (base..base + TILE_SIZE)
+                                .map(hash_leaf)
+                                .collect();
+                            (tile_idx, Self::build_cpu_tree_layers(leaf_hashes))
+                        })
+                    }).collect();
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                });
+            results.into_iter().collect()
+        } else {
+            let mut map = HashMap::new();
+            for &tile_idx in &needed_vec {
+                let base = tile_idx * TILE_SIZE;
+                let leaf_hashes: Vec<[u32; HASH_WORDS]> = (base..base + TILE_SIZE)
+                    .map(hash_leaf)
+                    .collect();
+                map.insert(tile_idx, Self::build_cpu_tree_layers(leaf_hashes));
+            }
+            map
+        };
 
         // Build upper tree from ALL tile roots (already computed by GPU)
         let upper_layers = Self::build_cpu_tree_layers(tile_roots.to_vec());
