@@ -10,7 +10,7 @@
 //!   Sepolia: https://starknet-sepolia.public.blastapi.io
 
 use serde::{Deserialize, Serialize};
-use super::casm_loader::{CasmProgram, CasmFormat, CasmHint};
+use super::casm_loader::{CasmProgram, CasmFormat};
 
 /// Default public RPC endpoints.
 pub const MAINNET_RPC: &str = "https://rpc.starknet.lava.build";
