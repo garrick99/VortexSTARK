@@ -131,9 +131,9 @@ fn main() {
 
     // --- Print header ---
     println!();
-    println!("{:>8} {:>8} {:>6} {:>5} {:>6} {:>6} {:>8} {:>10} {:>6}",
-        "Time", "Proofs", "W", "°C", "GPU%", "MHz", "Workload", "Prove_ms", "OK");
-    println!("{}", "─".repeat(80));
+    println!("{:>8} {:>8} {:>6} {:>5} {:>6} {:>6} {:>8} {:>8} {:>10} {:>6}",
+        "Time", "Proofs", "W", "°C", "GPU%", "MHz", "VRAM_MB", "Workload", "Prove_ms", "OK");
+    println!("{}", "─".repeat(90));
 
     // --- Main proving loop ---
     let bench_start = Instant::now();
@@ -162,13 +162,13 @@ fn main() {
 
             // Get latest GPU sample
             let latest_gpu = gpu_samples.lock().unwrap().last().cloned();
-            let (power, temp, util, clock) = latest_gpu
-                .map(|s| (s.power_w, s.temp_c, s.util_pct, s.sm_clock_mhz))
-                .unwrap_or((0.0, 0, 0, 0));
+            let (power, temp, util, clock, vram) = latest_gpu
+                .map(|s| (s.power_w, s.temp_c, s.util_pct, s.sm_clock_mhz, s.mem_used_mb))
+                .unwrap_or((0.0, 0, 0, 0, 0));
 
             let status = if result.verified { "✓" } else { "✗" };
-            println!("{:>7}s {:>8} {:>5.1}W {:>4}°C {:>5}% {:>5} {:>8} {:>9.1}ms {:>5}",
-                elapsed, total_proofs, power, temp, util, clock,
+            println!("{:>7}s {:>8} {:>5.1}W {:>4}°C {:>5}% {:>5} {:>7}M {:>8} {:>9.1}ms {:>5}",
+                elapsed, total_proofs, power, temp, util, clock, vram,
                 result.workload, result.prove_ms, status);
 
             last_print = Instant::now();
@@ -218,6 +218,7 @@ fn main() {
         let powers: Vec<f64> = samples.iter().map(|s| s.power_w).collect();
         let temps: Vec<u32> = samples.iter().map(|s| s.temp_c).collect();
         let utils: Vec<u32> = samples.iter().map(|s| s.util_pct).collect();
+        let vrams: Vec<u32> = samples.iter().map(|s| s.mem_used_mb).collect();
 
         let avg_power = powers.iter().sum::<f64>() / powers.len() as f64;
         let max_power = powers.iter().cloned().fold(0.0f64, f64::max);
@@ -225,6 +226,9 @@ fn main() {
         let avg_temp = temps.iter().sum::<u32>() as f64 / temps.len() as f64;
         let max_temp = *temps.iter().max().unwrap_or(&0);
         let avg_util = utils.iter().sum::<u32>() as f64 / utils.len() as f64;
+        let avg_vram = vrams.iter().sum::<u32>() as f64 / vrams.len() as f64;
+        let max_vram = *vrams.iter().max().unwrap_or(&0);
+        let min_vram = *vrams.iter().min().unwrap_or(&0);
 
         println!("\n  GPU Power:");
         println!("    Average:    {avg_power:.1}W");
@@ -238,6 +242,11 @@ fn main() {
 
         println!("\n  GPU Utilization:");
         println!("    Average:    {avg_util:.1}%");
+
+        println!("\n  GPU VRAM:");
+        println!("    Average:    {avg_vram:.0} MB ({:.1} GB)", avg_vram / 1024.0);
+        println!("    Peak:       {max_vram} MB ({:.1} GB)", max_vram as f64 / 1024.0);
+        println!("    Min:        {min_vram} MB ({:.1} GB)", min_vram as f64 / 1024.0);
 
         // Throttle detection
         let throttle_samples = temps.iter().filter(|&&t| t >= 83).count();
