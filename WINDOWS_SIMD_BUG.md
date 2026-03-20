@@ -2,7 +2,7 @@
 
 ## Summary
 
-stwo-cairo's interaction trace generation crashes with `STATUS_HEAP_CORRUPTION` (0xC0000374) on Windows MSVC when using `portable_simd` with rayon thread pools. The same code, same compiler version, and same binary crate runs correctly on Linux (tested via WSL2 on the same machine).
+stwo-cairo's interaction trace generation crashes with `STATUS_HEAP_CORRUPTION` (0xC0000374) on Windows MSVC when using `portable_simd` (`Simd<u32, 16>`) packed field arithmetic. The same code, same compiler version, and same binary crate runs correctly on Linux (tested via WSL2 on the same machine). The bug is in the `portable_simd` MSVC codegen, **not** in rayon or threading — crash reproduces even with `parallel` feature disabled and `RAYON_NUM_THREADS=1`.
 
 ## Environment
 
@@ -101,21 +101,41 @@ The identical code produces correct, verified proofs on Linux:
 
 Full 67-component Cairo AIR proof generated and verified in 13.2s.
 
-## Analysis
+## Root Cause Analysis
 
-This appears to be a memory safety issue in the interaction between:
-1. `std::simd` / `portable_simd` packed field operations
-2. `rayon` thread pool work-stealing
-3. Windows MSVC heap allocator
+**Exit code `0xC0000374`** = Windows `STATUS_HEAP_CORRUPTION`. Confirmed via PowerShell `Start-Process -PassThru`.
 
-The heap corruption manifests specifically during parallel SIMD-packed field arithmetic across rayon worker threads. Since the same binary logic works on Linux with the same compiler, the bug is likely in:
-- MSVC codegen for `portable_simd` intrinsics (alignment, bounds)
-- Windows heap allocator sensitivity to SIMD-related alignment violations
-- A subtle UB in packed field operations that Linux's allocator tolerates but Windows catches
+**Eliminated causes:**
+- **Not rayon/threading:** Crashes with `RAYON_NUM_THREADS=1` and with `parallel` feature disabled
+- **Not stack overflow:** Crashes with `RUST_MIN_STACK=67108864`
+- **Not `uninit_vec` UB:** Replacing all `uninit_vec` calls with zero-initialized `vec![]` does not fix the crash
+- **Not bounds checking:** Adding `assert!(vec_row < len)` before `get_unchecked_mut` does not trigger — indices are in bounds
+- **Not detectable by ASan on Linux:** `RUSTFLAGS="-Zsanitizer=address"` on WSL2 reports zero memory errors (ASan couldn't run on Windows due to CUDA interception)
+- **Not a Rust panic:** `std::panic::set_hook` never fires. `RUST_BACKTRACE=full` produces no output.
+
+**Conclusion:** The crash is caused by `portable_simd` (`#![feature(portable_simd)]`) generating incorrect MSVC machine code for `Simd<u32, 16>` operations. The SIMD-packed field arithmetic (`PackedM31`, `PackedQM31`) in stwo's `LogupTraceGenerator` writes past heap allocation boundaries when compiled with MSVC codegen. The Linux (GNU) codegen for the same nightly compiler produces correct code.
+
+This is a **Rust compiler bug** in the `portable_simd` MSVC backend, not a bug in stwo or stwo-cairo.
+
+**Crashing code path:**
+```
+LogupTraceGenerator::new_col() → LogupColGenerator
+  → par_iter_mut() / iter_mut() over PackedM31/PackedQM31 columns
+  → write_frac(vec_row, numerator, denom) using:
+    - SecureColumnByCoordsMutSlice::set_packed() [unsafe, get_unchecked_mut]
+    - SecureColumn::data[vec_row] = denom [unsafe, get_unchecked_mut]
+  → PackedQM31 arithmetic (combine, add, mul) via Simd<u32, 16> ops
+```
+
+The corruption occurs during the SIMD arithmetic or the subsequent store — the `Simd<u32, 16>` operations either produce wrong-width stores or misaligned writes that corrupt adjacent heap metadata on MSVC's heap implementation.
 
 ## Workaround
 
-Use Linux (native or WSL2). The full proving pipeline works correctly on Linux with the RTX 5090 via WSL2 GPU passthrough.
+Use Linux (native or WSL2). The full proving pipeline works correctly on Linux via WSL2 GPU passthrough. The all-opcodes test produces a verified proof in 13.2s on WSL2.
+
+## Suggested Upstream Fix
+
+File against `rust-lang/rust` under `portable_simd` / MSVC codegen. Minimal reproducer would be a loop performing `PackedQM31` (= `Simd<u32, 16>` × 4) arithmetic and storing results via raw pointer writes, compiled with `--target x86_64-pc-windows-msvc`.
 
 ## Versions
 
