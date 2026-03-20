@@ -5,10 +5,11 @@ use std::ffi::c_void;
 use std::marker::PhantomData;
 
 /// Owning handle to a contiguous GPU allocation.
-/// Automatically freed on drop.
+/// Automatically freed on drop (unless `owns` is false for slice views).
 pub struct DeviceBuffer<T> {
     ptr: *mut T,
     len: usize,
+    owns: bool,
     _marker: PhantomData<T>,
 }
 
@@ -52,6 +53,7 @@ impl<T> DeviceBuffer<T> {
             return Self {
                 ptr: std::ptr::null_mut(),
                 len: 0,
+                owns: true,
                 _marker: PhantomData,
             };
         }
@@ -71,6 +73,7 @@ impl<T> DeviceBuffer<T> {
         Self {
             ptr: ptr as *mut T,
             len,
+            owns: true,
             _marker: PhantomData,
         }
     }
@@ -315,11 +318,46 @@ impl<T> DeviceBuffer<T> {
         }
     }
 
+    /// Async download GPU buffer into a PinnedBuffer on a CUDA stream.
+    /// Does NOT block — caller must sync the stream before reading dst.
+    pub fn download_to_pinned_async(&self, dst: &mut PinnedBuffer<T>, stream: &ffi::CudaStream) {
+        dst.ensure_capacity(self.len);
+        if self.len > 0 {
+            let bytes = self.len * std::mem::size_of::<T>();
+            let err = unsafe {
+                ffi::cudaMemcpyAsync(
+                    dst.as_mut_ptr() as *mut c_void,
+                    self.ptr as *const c_void,
+                    bytes,
+                    ffi::MEMCPY_D2H,
+                    stream.ptr,
+                )
+            };
+            assert!(err == 0, "cudaMemcpyAsync D2H pinned failed: {err}");
+        }
+    }
+
     /// Download GPU buffer into a new PinnedBuffer (full DMA speed, no staging).
     pub fn to_pinned(&self) -> PinnedBuffer<T> {
         let mut pb = PinnedBuffer::<T>::alloc(self.len);
         self.download_to_pinned(&mut pb);
         pb
+    }
+
+    /// Create a non-owning view into a sub-range of this buffer.
+    /// The returned DeviceBuffer does NOT free memory on drop.
+    /// Caller must ensure `self` outlives the returned view.
+    /// Create a non-owning view into a sub-range of this buffer.
+    /// The returned DeviceBuffer does NOT free memory on drop.
+    /// Caller must ensure `self` outlives the returned view.
+    pub fn slice(&self, offset: usize, len: usize) -> DeviceBuffer<T> {
+        assert!(offset + len <= self.len, "slice out of bounds: {}+{} > {}", offset, len, self.len);
+        DeviceBuffer {
+            ptr: unsafe { self.ptr.add(offset) },
+            len,
+            owns: false,
+            _marker: PhantomData,
+        }
     }
 
     /// Copy device data into a new device buffer (D2D).
@@ -487,7 +525,7 @@ impl<T> AsRef<DeviceBuffer<T>> for DeviceBuffer<T> {
 
 impl<T> Drop for DeviceBuffer<T> {
     fn drop(&mut self) {
-        if !self.ptr.is_null() {
+        if self.owns && !self.ptr.is_null() {
             if use_sync() {
                 unsafe { ffi::cudaFree(self.ptr as *mut c_void) };
             } else {

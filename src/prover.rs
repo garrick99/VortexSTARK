@@ -750,17 +750,15 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     }
     drop(d_fold_twid);
     unsafe { ffi::cuda_device_sync() };
-    // All GPU compute done with d_eval_full. Download to pinned host now.
-    // Synchronous — no contention since no compute is reading d_eval_full.
-    // With pinned destination, DMA runs at full PCIe bandwidth.
-    let t0_tdl = Instant::now();
-    d_eval_full.download_to_pinned(&mut eval_full_pinned);
-    let eval_full_host = eval_full_pinned.as_slice(eval_size);
-    if timed { eprintln!("  trace_download: {:.1}ms (pinned DMA)",
-        t0_tdl.elapsed().as_secs_f64() * 1000.0); }
-    drop(d_eval_full); // free 8GB — eval data on host, VRAM freed for FRI arena
 
-    // Commit circle fold output
+    // Start async trace download on a separate stream — overlaps with circle fold commit + FRI.
+    // d_eval_full is not read by any subsequent GPU kernel, so DMA can run concurrently.
+    let t0_tdl = Instant::now();
+    let eval_dl_stream = ffi::CudaStream::new();
+    d_eval_full.download_to_pinned_async(&mut eval_full_pinned, &eval_dl_stream);
+    if timed { eprintln!("  trace_download: launched async (pinned DMA)"); }
+
+    // Commit circle fold output — runs on default stream while trace downloads on eval_dl_stream
     let tc = Instant::now();
     let (fri0_root, fri0_subtrees) = MerkleTree::commit_root_soa4_with_subtrees(
         &fri_gpu.cols[0], &fri_gpu.cols[1],
@@ -947,6 +945,13 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     let query_indices: Vec<usize> = (0..N_QUERIES)
         .map(|_| channel.draw_number(eval_size))
         .collect();
+
+    // Wait for async trace download to complete (was launched before FRI)
+    eval_dl_stream.sync();
+    let eval_full_host = eval_full_pinned.as_slice(eval_size);
+    drop(d_eval_full); // free GPU buffer now that download is complete
+    if timed { eprintln!("  trace_download: {:.1}ms (async, overlapped with FRI)",
+        t0_tdl.elapsed().as_secs_f64() * 1000.0); }
 
     // Decommit trace from host eval data
     let td0 = Instant::now();
@@ -1925,8 +1930,8 @@ fn gpu_build_upper_tree(subtree_roots: &[[u32; 8]]) -> Vec<Vec<[u32; 8]>> {
 }
 
 /// GPU-accelerated auth path extraction for single-column data.
-/// Uploads only the ~200 queried tiles (1024 leaves each) to GPU,
-/// builds per-tile Merkle trees on GPU, and extracts auth paths.
+/// Batches all queried tiles into a single contiguous upload to GPU,
+/// builds all per-tile Merkle trees in one kernel, then extracts auth paths.
 /// Upper tree (subtree roots → final root) built on CPU (small).
 fn gpu_tile_auth_paths_single(
     host_col: &[u32],
@@ -1941,17 +1946,33 @@ fn gpu_tile_auth_paths_single(
 
     // Collect unique tiles needed
     let needed_tiles: BTreeSet<usize> = indices.iter().map(|&qi| qi / TILE_SIZE).collect();
+    let needed_vec: Vec<usize> = needed_tiles.iter().copied().collect();
+    let n_tiles_needed = needed_vec.len();
 
-    // Build per-tile GPU Merkle trees (only for queried tiles)
-    let mut tile_trees: HashMap<usize, MerkleTree> = HashMap::new();
-    for &tile_idx in &needed_tiles {
+    // Map tile_idx → position in batched buffer
+    let tile_pos: HashMap<usize, usize> = needed_vec.iter().enumerate()
+        .map(|(pos, &tile_idx)| (tile_idx, pos))
+        .collect();
+
+    // Batch all tiles into one contiguous buffer and upload once
+    let mut batched = Vec::with_capacity(n_tiles_needed * TILE_SIZE);
+    for &tile_idx in &needed_vec {
         let base = tile_idx * TILE_SIZE;
-        let tile_data: Vec<u32> = host_col[base..base + TILE_SIZE].to_vec();
-        let d_tile = DeviceBuffer::from_host(&tile_data);
+        batched.extend_from_slice(&host_col[base..base + TILE_SIZE]);
+    }
+    let d_batched = DeviceBuffer::from_host(&batched);
+    drop(batched);
+
+    // Build Merkle trees for all tiles in batch
+    let mut tile_trees: HashMap<usize, MerkleTree> = HashMap::with_capacity(n_tiles_needed);
+    for (pos, &tile_idx) in needed_vec.iter().enumerate() {
+        // Create a view into the batched device buffer for this tile
+        let d_tile = d_batched.slice(pos * TILE_SIZE, TILE_SIZE);
         let log_tile = 10; // log2(1024)
         let tree = MerkleTree::commit(std::slice::from_ref(&d_tile), log_tile);
         tile_trees.insert(tile_idx, tree);
     }
+    drop(d_batched);
 
     // Build upper tree on GPU using hash_nodes (subtree roots are already hashes)
     let upper_layers = gpu_build_upper_tree(subtree_roots);
