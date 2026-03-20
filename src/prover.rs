@@ -556,30 +556,41 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
         t_pa.elapsed().as_secs_f64() * 1000.0,
         (eval_size as f64 * 4.0) / (1024.0 * 1024.0 * 1024.0)); }
 
-    // --- Step 1: Generate trace ---
+    // --- Step 1: Generate trace + precompute twiddles concurrently ---
+    // CPU generates Fibonacci trace while GPU precomputes NTT twiddle factors.
     let t0 = Instant::now();
+
+    // Precompute twiddle caches on GPU (overlaps with CPU trace gen)
+    let trace_domain = Coset::half_coset(log_n);
+    let eval_domain = if log_eval_size <= 30 {
+        Coset::half_coset(log_eval_size)
+    } else {
+        Coset::subgroup(log_eval_size)
+    };
+    let trace_inv = InverseTwiddleCache::new(&trace_domain);
+    let eval_fwd = ForwardTwiddleCache::new(&eval_domain);
+
+    // CPU trace generation (runs while GPU twiddles compute)
     let bytes = n * std::mem::size_of::<u32>();
     let mut pinned_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
     let err = unsafe { ffi::cudaMallocHost(&mut pinned_ptr, bytes) };
     assert!(err == 0, "cudaMallocHost failed: {err}");
     let pinned_trace = pinned_ptr as *mut u32;
     unsafe { air::fibonacci_trace_parallel(a, b, log_n, pinned_trace) };
-    if timed { eprintln!("  trace_gen (cpu): {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0); }
+    if timed { eprintln!("  trace_gen+twiddles: {:.1}ms (overlapped)", t0.elapsed().as_secs_f64() * 1000.0); }
 
     let t0 = Instant::now();
     let mut d_coeffs = unsafe { DeviceBuffer::from_pinned(pinned_trace as *const u32, n) };
     if timed { unsafe { ffi::cuda_device_sync() }; eprintln!("  trace_upload: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0); }
     unsafe { ffi::cudaFreeHost(pinned_ptr) };
 
-    // --- Step 2: Interpolate on trace domain ---
+    // --- Step 2: Interpolate on trace domain (twiddles already precomputed) ---
     let t0 = Instant::now();
-    let trace_domain = Coset::half_coset(log_n);
-    let trace_inv = InverseTwiddleCache::new(&trace_domain);
     ntt::interpolate(&mut d_coeffs, &trace_inv);
     drop(trace_inv);
     if timed { unsafe { ffi::cuda_device_sync() }; eprintln!("  interpolate: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0); }
 
-    // --- Step 3: Zero-pad + full-group NTT on subgroup(31) ---
+    // --- Step 3: Zero-pad + full-group NTT (twiddles already precomputed) ---
     let t0 = Instant::now();
     let mut d_eval_full = DeviceBuffer::<u32>::alloc(eval_size);
     unsafe {
@@ -587,14 +598,6 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     }
     drop(d_coeffs);
 
-    // For log_n=30: eval domain is full circle group (subgroup(31), half_coset(31) doesn't exist)
-    // For log_n<30: standard half_coset(log_eval_size)
-    let eval_domain = if log_eval_size <= 30 {
-        Coset::half_coset(log_eval_size)
-    } else {
-        Coset::subgroup(log_eval_size)
-    };
-    let eval_fwd = ForwardTwiddleCache::new(&eval_domain);
     ntt::evaluate(&mut d_eval_full, &eval_fwd);
     drop(eval_fwd);
     unsafe { ffi::cuda_device_sync() };
@@ -793,7 +796,17 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     let mut pending_download: Option<(
         [crate::device::PinnedBuffer<u32>; 4], usize, Vec<[u32; 8]>,
     )> = None;
-    // FRI pinned buffers allocated lazily per-layer (background alloc only for eval_full)
+
+    // Twiddle prefetch: compute next layer's twiddles on a separate stream
+    // while current layer folds+commits on the default stream.
+    let twid_stream = ffi::CudaStream::new();
+    let mut prefetched_twid: Option<(DeviceBuffer<u32>, DeviceBuffer<u32>)> = None;
+
+    // Prefetch first line fold twiddle
+    if current_log_size > FRI_CPU_TAIL_LOG.max(3) {
+        let first_domain = Coset::half_coset(current_log_size);
+        prefetched_twid = Some(fri::compute_fold_twiddles_async(&first_domain, false, &twid_stream));
+    }
 
     while current_log_size > FRI_CPU_TAIL_LOG.max(3) {
         let ti = Instant::now();
@@ -808,12 +821,19 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
             fri_layer_data.push(FriLayerData::PinnedData(pinned_data, pinned_len, subtrees));
         }
 
+        // Wait for prefetched twiddle (was computing on twid_stream while prev layer committed)
         let t_twid = Instant::now();
-        let line_domain = Coset::half_coset(current_log_size);
-        let d_twid = fri::compute_fold_twiddles_on_demand(&line_domain, false);
-        if timed { unsafe { ffi::cuda_device_sync() }; }
+        twid_stream.sync();
+        let (_sources, d_twid) = prefetched_twid.take().unwrap();
         let twid_ms = t_twid.elapsed().as_secs_f64() * 1000.0;
         total_twid_ms += twid_ms;
+
+        // Start prefetching NEXT layer's twiddle (overlaps with this fold+commit)
+        let next_log = current_log_size - 1;
+        if next_log > FRI_CPU_TAIL_LOG.max(3) {
+            let next_domain = Coset::half_coset(next_log);
+            prefetched_twid = Some(fri::compute_fold_twiddles_async(&next_domain, false, &twid_stream));
+        }
 
         let t_fold = Instant::now();
         let folded = if gpu_fold_active {
@@ -897,6 +917,8 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
         fri_layer_data.push(FriLayerData::PinnedData(pinned_data, pinned_len, subtrees));
     }
     drop(fri_dl_stream);
+    drop(prefetched_twid);
+    drop(twid_stream);
     if timed {
         eprintln!("  fri_line_totals: twid={:.1}ms fold={:.1}ms commit={:.1}ms download={:.1}ms",
             total_twid_ms, total_fold_ms, total_commit_ms, total_download_ms);
