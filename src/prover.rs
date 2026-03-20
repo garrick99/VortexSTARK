@@ -1152,18 +1152,10 @@ fn decommit_trace_gpu(
         return QueryDecommitment { values, sibling_values, auth_paths, sibling_auth_paths };
     }
 
-    // CPU targeted path: build only ~200 queried tile subtrees on CPU.
-    // Uses pre-computed tile roots from GPU commitment phase.
-    // Much faster than GPU per-tile approach (no H2D uploads, no kernel launches).
-    let subtree_roots_arr: Vec<[u32; 8]> = subtree_roots.to_vec();
-    let hash_leaf = |i: usize| -> [u32; 8] {
-        MerkleTree::hash_leaf(&[eval_host[i]])
-    };
+    // GPU path: batch all queried tiles into single upload, build Merkle trees on GPU.
     let all_indices: Vec<usize> = indices.iter().chain(sibling_indices.iter()).copied().collect();
-    let all_paths = MerkleTree::targeted_auth_paths_with_tile_roots(
-        &subtree_roots_arr, n, &all_indices, &hash_leaf,
-    );
-    let (auth_paths, sibling_auth_paths) = all_paths.split_at(indices.len());
+    let tile_paths = gpu_tile_auth_paths_single(eval_host, subtree_roots, &all_indices);
+    let (auth_paths, sibling_auth_paths) = tile_paths.split_at(indices.len());
 
     QueryDecommitment {
         values, sibling_values,
@@ -1228,18 +1220,10 @@ fn decommit_soa4_gpu_slices(
         return QueryDecommitment { values, sibling_values, auth_paths, sibling_auth_paths };
     }
 
-    // CPU targeted path: build only queried tile subtrees.
-    // Uses pre-computed tile roots from GPU commitment phase.
-    let subtree_roots_arr: Vec<[u32; 8]> = subtree_roots.to_vec();
-    let host_ref = host;
-    let hash_leaf = |i: usize| -> [u32; 8] {
-        MerkleTree::hash_leaf(&[host_ref[0][i], host_ref[1][i], host_ref[2][i], host_ref[3][i]])
-    };
+    // GPU path: batch tiles, build Merkle trees on GPU.
     let all_indices: Vec<usize> = indices.iter().chain(sibling_indices.iter()).copied().collect();
-    let all_paths = MerkleTree::targeted_auth_paths_with_tile_roots(
-        &subtree_roots_arr, n, &all_indices, &hash_leaf,
-    );
-    let (auth_paths, sibling_auth_paths) = all_paths.split_at(indices.len());
+    let tile_paths = gpu_tile_auth_paths_soa4_slices(host, subtree_roots, &all_indices);
+    let (auth_paths, sibling_auth_paths) = tile_paths.split_at(indices.len());
 
     QueryDecommitment {
         values, sibling_values,
@@ -2067,18 +2051,39 @@ fn gpu_tile_auth_paths_soa4_slices(
 
     let needed_tiles: BTreeSet<usize> = indices.iter().map(|&qi| qi / TILE_SIZE).collect();
 
-    // Build per-tile subtrees on CPU (fast: ~200 tiles × 1024 leaves)
-    let mut tile_subtrees: HashMap<usize, Vec<Vec<[u32; 8]>>> = HashMap::new();
-    for &tile_idx in &needed_tiles {
-        let base = tile_idx * TILE_SIZE;
-        let leaf_hashes: Vec<[u32; 8]> = (0..TILE_SIZE)
-            .map(|j| MerkleTree::hash_leaf(&[
-                host_cols[0][base + j], host_cols[1][base + j],
-                host_cols[2][base + j], host_cols[3][base + j],
-            ]))
-            .collect();
-        tile_subtrees.insert(tile_idx, MerkleTree::build_cpu_tree_layers(leaf_hashes));
-    }
+    // Build per-tile subtrees on CPU in parallel (~200 tiles × 1024 leaves)
+    let needed_vec: Vec<usize> = needed_tiles.iter().copied().collect();
+    let tile_subtrees: HashMap<usize, Vec<Vec<[u32; 8]>>> = if needed_vec.len() > 4 {
+        std::thread::scope(|s| {
+            let handles: Vec<_> = needed_vec.iter().map(|&tile_idx| {
+                let cols = &host_cols;
+                s.spawn(move || {
+                    let base = tile_idx * TILE_SIZE;
+                    let leaf_hashes: Vec<[u32; 8]> = (0..TILE_SIZE)
+                        .map(|j| MerkleTree::hash_leaf(&[
+                            cols[0][base + j], cols[1][base + j],
+                            cols[2][base + j], cols[3][base + j],
+                        ]))
+                        .collect();
+                    (tile_idx, MerkleTree::build_cpu_tree_layers(leaf_hashes))
+                })
+            }).collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        })
+    } else {
+        let mut map = HashMap::new();
+        for &tile_idx in &needed_vec {
+            let base = tile_idx * TILE_SIZE;
+            let leaf_hashes: Vec<[u32; 8]> = (0..TILE_SIZE)
+                .map(|j| MerkleTree::hash_leaf(&[
+                    host_cols[0][base + j], host_cols[1][base + j],
+                    host_cols[2][base + j], host_cols[3][base + j],
+                ]))
+                .collect();
+            map.insert(tile_idx, MerkleTree::build_cpu_tree_layers(leaf_hashes));
+        }
+        map
+    };
 
     // Build upper tree on GPU
     let upper_layers = gpu_build_upper_tree(subtree_roots);
