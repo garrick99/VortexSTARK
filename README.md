@@ -59,8 +59,20 @@ Full modular arithmetic over the STARK prime (p = 2^251 + 17·2^192 + 1):
 ## CLI
 
 ```bash
-# Prove
+# Prove Fibonacci STARK
 stark_cli prove 24 1 1 -o proof.bin
+
+# Prove a CASM file (auto-detects steps)
+stark_cli prove-file program.casm -o proof.bin
+
+# Prove a contract from Starknet mainnet
+stark_cli prove-starknet --class-hash 0x029927c8af6b...
+
+# Inspect/disassemble a CASM file
+stark_cli inspect program.casm
+
+# Fetch Starknet block info
+stark_cli fetch-block --block 100000
 
 # Verify
 stark_cli verify proof.bin
@@ -69,19 +81,22 @@ stark_cli verify proof.bin
 stark_cli bench 28
 ```
 
+Accepts CASM JSON (Cairo 1 compiled) and Cairo 0 compiled JSON formats.
+Starknet RPC integration fetches contract CASM directly from mainnet/testnet.
+
 ## Building
 
 Requires: Rust 1.94+, CUDA 13.0, RTX 5090 (SM 12.0) or RTX 4090 (SM 8.9).
 
 ```bash
 cargo build --release
-cargo test -- --test-threads=1    # 142 tests
+cargo test -- --test-threads=1    # 148 tests
 cargo run --release --bin full_benchmark
 ```
 
 ## Tests
 
-142 tests covering:
+148 tests covering:
 - M31/CM31/QM31 field arithmetic
 - Circle NTT (forward, inverse, roundtrip, batched)
 - Merkle tree (commit, auth paths, tiled, SoA4)
@@ -93,6 +108,7 @@ cargo run --release --bin full_benchmark
 - Bitwise (AND/XOR/OR, trace)
 - GPU constraint eval (bytecode VM, warp-cooperative kernels)
 - GPU leaf hashing (Blake2s, buffered chunks)
+- CASM loader (hex parsing, step detection, disassembly)
 
 ## License
 

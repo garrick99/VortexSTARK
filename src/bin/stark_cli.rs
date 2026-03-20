@@ -1,56 +1,140 @@
-/// VortexSTARK CLI: prove and verify Fibonacci STARK proofs.
+/// VortexSTARK CLI: prove, verify, inspect Cairo programs and Fibonacci STARKs.
 ///
 /// Usage:
-///   stark_cli prove <log_n> [a] [b] [-o proof.bin]
+///   stark_cli prove <log_n> [a] [b] [-o proof.bin]        — Fibonacci STARK
+///   stark_cli prove-file <program.casm> [-o proof.bin]     — prove a CASM/Cairo0 file
+///   stark_cli prove-starknet --class-hash <0x...>          — prove from Starknet RPC
+///   stark_cli inspect <program.casm>                       — disassemble a CASM file
+///   stark_cli fetch-block [--block <id>]                   — fetch Starknet block info
 ///   stark_cli verify <proof.bin>
 ///   stark_cli bench <log_n>
 
+use clap::{Parser, Subcommand};
 use vortexstark::cuda::ffi;
 use vortexstark::field::M31;
 use vortexstark::prover::{self, StarkProof, QueryDecommitment};
 use vortexstark::verifier;
 use vortexstark::field::QM31;
+use vortexstark::cairo_air::casm_loader;
+use vortexstark::cairo_air::starknet_rpc;
 use std::io::{Read, Write, BufWriter, BufReader};
+use std::path::PathBuf;
 use std::time::Instant;
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage:");
-        eprintln!("  stark_cli prove <log_n> [a] [b] [-o proof.bin]");
-        eprintln!("  stark_cli verify <proof.bin>");
-        eprintln!("  stark_cli bench <log_n>");
-        std::process::exit(1);
-    }
+#[derive(Parser)]
+#[command(name = "stark_cli", about = "VortexSTARK: GPU-native Circle STARK prover")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
 
-    match args[1].as_str() {
-        "prove" => cmd_prove(&args[2..]),
-        "verify" => cmd_verify(&args[2..]),
-        "bench" => cmd_bench(&args[2..]),
-        _ => {
-            eprintln!("Unknown command: {}", args[1]);
-            std::process::exit(1);
+#[derive(Subcommand)]
+enum Commands {
+    /// Prove a Fibonacci STARK
+    Prove {
+        /// Log2 of trace size
+        log_n: u32,
+        /// First Fibonacci input (default: 1)
+        #[arg(default_value = "1")]
+        a: u32,
+        /// Second Fibonacci input (default: 1)
+        #[arg(default_value = "1")]
+        b: u32,
+        /// Output proof file
+        #[arg(short, long, default_value = "proof.bin")]
+        output: String,
+    },
+
+    /// Prove a CASM or Cairo 0 program from file
+    ProveFile {
+        /// Path to .casm or compiled Cairo 0 JSON file
+        program: PathBuf,
+        /// Output proof file
+        #[arg(short, long, default_value = "proof.bin")]
+        output: String,
+        /// Maximum execution steps (auto-detect if omitted)
+        #[arg(long)]
+        steps: Option<usize>,
+        /// Log2 of trace size (auto from steps if omitted)
+        #[arg(long)]
+        log_n: Option<u32>,
+        /// Entry point offset (uses first External entry point if omitted)
+        #[arg(long)]
+        entry_point: Option<u64>,
+    },
+
+    /// Prove a contract from Starknet RPC
+    ProveStarknet {
+        /// Contract class hash (0x...)
+        #[arg(long)]
+        class_hash: String,
+        /// Starknet RPC endpoint URL
+        #[arg(long, default_value = starknet_rpc::MAINNET_RPC)]
+        rpc: String,
+        /// Output proof file
+        #[arg(short, long, default_value = "proof.bin")]
+        output: String,
+        /// Maximum execution steps
+        #[arg(long, default_value = "1000000")]
+        steps: usize,
+    },
+
+    /// Inspect/disassemble a CASM file
+    Inspect {
+        /// Path to .casm or compiled Cairo 0 JSON file
+        program: PathBuf,
+        /// Max instructions to disassemble
+        #[arg(long, default_value = "50")]
+        max: usize,
+    },
+
+    /// Fetch and display a Starknet block
+    FetchBlock {
+        /// Block number (uses "latest" if omitted)
+        #[arg(long)]
+        block: Option<u64>,
+        /// Starknet RPC endpoint URL
+        #[arg(long, default_value = starknet_rpc::MAINNET_RPC)]
+        rpc: String,
+        /// Also fetch CASM for deploy transactions
+        #[arg(long)]
+        fetch_classes: bool,
+    },
+
+    /// Verify a proof file
+    Verify {
+        /// Path to proof file
+        proof: String,
+    },
+
+    /// Benchmark Fibonacci STARK proving
+    Bench {
+        /// Log2 of trace size
+        log_n: u32,
+    },
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Prove { log_n, a, b, output } => cmd_prove(log_n, a, b, &output),
+        Commands::ProveFile { program, output, steps, log_n, entry_point } => {
+            cmd_prove_file(&program, &output, steps, log_n, entry_point);
         }
+        Commands::ProveStarknet { class_hash, rpc, output, steps } => {
+            cmd_prove_starknet(&class_hash, &rpc, &output, steps);
+        }
+        Commands::Inspect { program, max } => cmd_inspect(&program, max),
+        Commands::FetchBlock { block, rpc, fetch_classes } => {
+            cmd_fetch_block(block, &rpc, fetch_classes);
+        }
+        Commands::Verify { proof } => cmd_verify(&proof),
+        Commands::Bench { log_n } => cmd_bench(log_n),
     }
 }
 
-fn cmd_prove(args: &[String]) {
-    if args.is_empty() {
-        eprintln!("Usage: stark_cli prove <log_n> [a] [b] [-o proof.bin]");
-        std::process::exit(1);
-    }
-
-    let log_n: u32 = args[0].parse().expect("invalid log_n");
-    let a = args.get(1).map(|s| s.parse::<u32>().expect("invalid a")).unwrap_or(1);
-    let b = args.get(2).map(|s| s.parse::<u32>().expect("invalid b")).unwrap_or(1);
-
-    let mut output_path = "proof.bin".to_string();
-    for i in 0..args.len() {
-        if args[i] == "-o" && i + 1 < args.len() {
-            output_path = args[i + 1].clone();
-        }
-    }
-
+fn cmd_prove(log_n: u32, a: u32, b: u32, output: &str) {
     ffi::init_memory_pool();
 
     let n: u64 = 1u64 << log_n;
@@ -60,7 +144,6 @@ fn cmd_prove(args: &[String]) {
     let proof = prover::prove_lean_timed(M31(a), M31(b), log_n);
     let prove_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-    // Verify before saving
     let t1 = Instant::now();
     match verifier::verify(&proof) {
         Ok(()) => {
@@ -75,27 +158,176 @@ fn cmd_prove(args: &[String]) {
         }
     }
 
-    // Serialize and save
     let t2 = Instant::now();
     let bytes = serialize_proof(&proof);
     let proof_size = bytes.len();
-    let file = std::fs::File::create(&output_path).expect("cannot create output file");
+    let file = std::fs::File::create(output).expect("cannot create output file");
     let mut w = BufWriter::new(file);
     w.write_all(&bytes).expect("write failed");
     w.flush().expect("flush failed");
     let write_ms = t2.elapsed().as_secs_f64() * 1000.0;
 
     eprintln!("  proof size: {} bytes ({:.1} KB)", proof_size, proof_size as f64 / 1024.0);
-    eprintln!("  written to: {output_path} ({write_ms:.1}ms)");
+    eprintln!("  written to: {output} ({write_ms:.1}ms)");
 }
 
-fn cmd_verify(args: &[String]) {
-    if args.is_empty() {
-        eprintln!("Usage: stark_cli verify <proof.bin>");
+fn cmd_prove_file(path: &PathBuf, output: &str, max_steps: Option<usize>, log_n_override: Option<u32>, entry_point_override: Option<u64>) {
+    eprintln!("Loading program: {}", path.display());
+
+    let mut program = casm_loader::load_program(path)
+        .unwrap_or_else(|e| { eprintln!("ERROR: {e}"); std::process::exit(1); });
+
+    if let Some(ep) = entry_point_override {
+        program.entry_point = ep;
+    }
+
+    casm_loader::print_summary(&program);
+
+    // Detect execution steps
+    let default_max = 1 << 20; // 1M steps max for auto-detection
+    let n_steps = max_steps.unwrap_or_else(|| {
+        eprintln!("Auto-detecting execution steps (max {default_max})...");
+        let steps = casm_loader::detect_steps(&program, default_max);
+        eprintln!("  Detected: {steps} steps");
+        steps
+    });
+
+    if n_steps == 0 {
+        eprintln!("ERROR: program executed 0 steps");
         std::process::exit(1);
     }
 
-    let path = &args[0];
+    // Compute log_n (next power of 2)
+    let log_n = log_n_override.unwrap_or_else(|| {
+        let mut l = 0u32;
+        while (1usize << l) < n_steps { l += 1; }
+        l.max(4) // minimum log_n=4 for FRI
+    });
+
+    eprintln!("Proving Cairo STARK: {n_steps} steps, log_n={log_n}");
+    ffi::init_memory_pool();
+
+    let t0 = Instant::now();
+    let proof = vortexstark::cairo_air::prover::cairo_prove(&program.bytecode, n_steps, log_n);
+    let prove_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    eprintln!("  prove: {prove_ms:.1}ms");
+    eprintln!("  program hash: {:08x}{:08x}...",
+        proof.public_inputs.program_hash[0],
+        proof.public_inputs.program_hash[1]);
+
+    // Serialize Cairo proof
+    let bytes = serialize_cairo_proof(&proof);
+    let proof_size = bytes.len();
+    let file = std::fs::File::create(output).expect("cannot create output file");
+    let mut w = BufWriter::new(file);
+    w.write_all(&bytes).expect("write failed");
+    w.flush().expect("flush failed");
+
+    eprintln!("  proof size: {} bytes ({:.1} KB)", proof_size, proof_size as f64 / 1024.0);
+    eprintln!("  written to: {output}");
+}
+
+fn cmd_prove_starknet(class_hash: &str, rpc_url: &str, output: &str, max_steps: usize) {
+    eprintln!("Fetching CASM from Starknet RPC...");
+    eprintln!("  RPC:        {rpc_url}");
+    eprintln!("  Class hash: {class_hash}");
+
+    let rt = tokio::runtime::Runtime::new().expect("cannot create tokio runtime");
+    let program = rt.block_on(async {
+        let client = starknet_rpc::StarknetClient::new(rpc_url);
+        client.get_compiled_casm(class_hash).await
+    }).unwrap_or_else(|e| { eprintln!("ERROR: {e}"); std::process::exit(1); });
+
+    casm_loader::print_summary(&program);
+
+    // Detect steps
+    eprintln!("Auto-detecting execution steps (max {max_steps})...");
+    let n_steps = casm_loader::detect_steps(&program, max_steps);
+    eprintln!("  Detected: {n_steps} steps");
+
+    if n_steps == 0 {
+        eprintln!("ERROR: program executed 0 steps (may require hints or calldata)");
+        std::process::exit(1);
+    }
+
+    let mut log_n = 0u32;
+    while (1usize << log_n) < n_steps { log_n += 1; }
+    log_n = log_n.max(4);
+
+    eprintln!("Proving Cairo STARK: {n_steps} steps, log_n={log_n}");
+    ffi::init_memory_pool();
+
+    let t0 = Instant::now();
+    let proof = vortexstark::cairo_air::prover::cairo_prove(&program.bytecode, n_steps, log_n);
+    let prove_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    eprintln!("  prove: {prove_ms:.1}ms");
+
+    let bytes = serialize_cairo_proof(&proof);
+    let proof_size = bytes.len();
+    let file = std::fs::File::create(output).expect("cannot create output file");
+    let mut w = BufWriter::new(file);
+    w.write_all(&bytes).expect("write failed");
+    w.flush().expect("flush failed");
+
+    eprintln!("  proof size: {} bytes ({:.1} KB)", proof_size, proof_size as f64 / 1024.0);
+    eprintln!("  written to: {output}");
+}
+
+fn cmd_inspect(path: &PathBuf, max_instructions: usize) {
+    let program = casm_loader::load_program(path)
+        .unwrap_or_else(|e| { eprintln!("ERROR: {e}"); std::process::exit(1); });
+
+    casm_loader::print_summary(&program);
+    eprintln!("\nDisassembly:");
+    casm_loader::disassemble(&program, max_instructions);
+}
+
+fn cmd_fetch_block(block_num: Option<u64>, rpc_url: &str, fetch_classes: bool) {
+    let rt = tokio::runtime::Runtime::new().expect("cannot create tokio runtime");
+    rt.block_on(async {
+        let client = starknet_rpc::StarknetClient::new(rpc_url);
+
+        let block_id = match block_num {
+            Some(n) => starknet_rpc::BlockId::number(n),
+            None => starknet_rpc::BlockId::latest(),
+        };
+
+        let block = client.get_block_with_txs(&block_id).await
+            .unwrap_or_else(|e| { eprintln!("ERROR: {e}"); std::process::exit(1); });
+
+        starknet_rpc::print_block_summary(&block);
+
+        if fetch_classes {
+            // Collect unique class hashes from deploy transactions
+            let class_hashes: Vec<String> = block.transactions.iter()
+                .filter_map(|tx| tx.class_hash.clone())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+
+            if class_hashes.is_empty() {
+                eprintln!("\nNo deploy transactions with class hashes in this block.");
+                return;
+            }
+
+            eprintln!("\nFetching CASM for {} unique classes...", class_hashes.len());
+            for ch in &class_hashes {
+                match client.get_compiled_casm(ch).await {
+                    Ok(program) => {
+                        casm_loader::print_summary(&program);
+                    }
+                    Err(e) => {
+                        eprintln!("  {}: ERROR: {e}", &ch[..18.min(ch.len())]);
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn cmd_verify(path: &str) {
     let mut file = BufReader::new(std::fs::File::open(path).expect("cannot open proof file"));
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).expect("read failed");
@@ -123,13 +355,7 @@ fn cmd_verify(args: &[String]) {
     }
 }
 
-fn cmd_bench(args: &[String]) {
-    if args.is_empty() {
-        eprintln!("Usage: stark_cli bench <log_n>");
-        std::process::exit(1);
-    }
-
-    let log_n: u32 = args[0].parse().expect("invalid log_n");
+fn cmd_bench(log_n: u32) {
     ffi::init_memory_pool();
 
     let n: u64 = 1u64 << log_n;
@@ -160,14 +386,7 @@ fn cmd_bench(args: &[String]) {
     }
 }
 
-// --- Proof serialization (simple binary format) ---
-// All values are little-endian u32. Format:
-// [magic: u32] [version: u32] [log_n: u32] [a: u32] [b: u32]
-// [trace_commitment: 8×u32] [quotient_commitment: 8×u32]
-// [n_fri_layers: u32] [fri_commitments: n_fri_layers × 8×u32]
-// [n_last_layer: u32] [fri_last_layer: n_last_layer × 4×u32]
-// [n_queries: u32] [query_indices: n_queries × u32]
-// [trace_decommitment] [quotient_decommitment] [fri_decommitments × n_fri_layers]
+// --- Fibonacci proof serialization ---
 
 const MAGIC: u32 = 0x4B52_414B; // "KRAK"
 const VERSION: u32 = 1;
@@ -177,9 +396,7 @@ fn write_u32(w: &mut Vec<u8>, v: u32) {
 }
 
 fn write_u32_slice(w: &mut Vec<u8>, s: &[u32]) {
-    for &v in s {
-        write_u32(w, v);
-    }
+    for &v in s { write_u32(w, v); }
 }
 
 fn write_decommitment_u32(w: &mut Vec<u8>, d: &QueryDecommitment<u32>) {
@@ -189,15 +406,11 @@ fn write_decommitment_u32(w: &mut Vec<u8>, d: &QueryDecommitment<u32>) {
     write_u32_slice(w, &d.sibling_values);
     for path in &d.auth_paths {
         write_u32(w, path.len() as u32);
-        for hash in path {
-            write_u32_slice(w, hash);
-        }
+        for hash in path { write_u32_slice(w, hash); }
     }
     for path in &d.sibling_auth_paths {
         write_u32(w, path.len() as u32);
-        for hash in path {
-            write_u32_slice(w, hash);
-        }
+        for hash in path { write_u32_slice(w, hash); }
     }
 }
 
@@ -241,12 +454,49 @@ fn serialize_proof(proof: &StarkProof) -> Vec<u8> {
     write_decommitment_4(&mut w, &proof.quotient_decommitment);
 
     write_u32(&mut w, proof.fri_decommitments.len() as u32);
-    for d in &proof.fri_decommitments {
-        write_decommitment_4(&mut w, d);
-    }
+    for d in &proof.fri_decommitments { write_decommitment_4(&mut w, d); }
 
     w
 }
+
+// --- Cairo proof serialization (minimal) ---
+
+const CAIRO_MAGIC: u32 = 0x4341_4952; // "CAIR"
+const CAIRO_VERSION: u32 = 1;
+
+fn serialize_cairo_proof(proof: &vortexstark::cairo_air::prover::CairoProof) -> Vec<u8> {
+    let mut w = Vec::new();
+    write_u32(&mut w, CAIRO_MAGIC);
+    write_u32(&mut w, CAIRO_VERSION);
+    write_u32(&mut w, proof.log_trace_size);
+    write_u32(&mut w, proof.public_inputs.initial_pc);
+    write_u32(&mut w, proof.public_inputs.initial_ap);
+    write_u32(&mut w, proof.public_inputs.n_steps as u32);
+    write_u32_slice(&mut w, &proof.public_inputs.program_hash);
+    write_u32_slice(&mut w, &proof.trace_commitment);
+    write_u32_slice(&mut w, &proof.interaction_commitment);
+    write_u32_slice(&mut w, &proof.quotient_commitment);
+
+    write_u32(&mut w, proof.fri_commitments.len() as u32);
+    for c in &proof.fri_commitments { write_u32_slice(&mut w, c); }
+
+    write_u32(&mut w, proof.fri_last_layer.len() as u32);
+    for v in &proof.fri_last_layer {
+        write_u32_slice(&mut w, &v.to_u32_array());
+    }
+
+    write_u32(&mut w, proof.query_indices.len() as u32);
+    for &qi in &proof.query_indices { write_u32(&mut w, qi as u32); }
+
+    write_decommitment_4(&mut w, &proof.quotient_decommitment);
+
+    write_u32(&mut w, proof.fri_decommitments.len() as u32);
+    for d in &proof.fri_decommitments { write_decommitment_4(&mut w, d); }
+
+    w
+}
+
+// --- Fibonacci proof deserialization ---
 
 fn read_u32(r: &mut &[u8]) -> u32 {
     let (bytes, rest) = r.split_at(4);
