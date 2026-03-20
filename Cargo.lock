@@ -1112,7 +1112,7 @@ dependencies = [
 [[package]]
 name = "stwo"
 version = "2.1.0"
-source = "git+http://github.com/garrick/stwo-fork.git?branch=cuda-backend#12c996e1808a50a304139c7744b44a875dd6339d"
+source = "git+https://github.com/garrick99/stwo-fork.git?branch=cuda-backend#dc0813592f34eabf490b34980a2cf8e7ca29dd62"
 dependencies = [
  "blake2",
  "blake3",
@@ -1139,7 +1139,7 @@ dependencies = [
 [[package]]
 name = "stwo-constraint-framework"
 version = "2.1.0"
-source = "git+http://github.com/garrick/stwo-fork.git?branch=cuda-backend#12c996e1808a50a304139c7744b44a875dd6339d"
+source = "git+https://github.com/garrick99/stwo-fork.git?branch=cuda-backend#dc0813592f34eabf490b34980a2cf8e7ca29dd62"
 dependencies = [
  "hashbrown 0.16.1",
  "itertools 0.12.1",

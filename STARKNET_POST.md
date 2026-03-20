@@ -1,8 +1,8 @@
-# VortexSTARK: GPU-Native Circle STARK Prover — 6.5s for 1 Billion Elements on a Single RTX 5090
+# VortexSTARK: GPU-Native Circle STARK Prover — 7.0s for 1 Billion Elements on a Single RTX 5090
 
 ## TL;DR
 
-I built a GPU-native Circle STARK prover that generates verified proofs for 1 billion trace elements in **6.5 seconds** on a single NVIDIA RTX 5090. The field stack (M31/CM31/QM31) and Circle STARK protocol match stwo exactly. Everything runs on GPU — NTT, FRI, Merkle commitments, constraint evaluation, grinding — zero CPU fallbacks in the proving pipeline.
+I built a GPU-native Circle STARK prover that generates verified proofs for 1 billion trace elements in **7.0 seconds** on a single NVIDIA RTX 5090. The field stack (M31/CM31/QM31) and Circle STARK protocol match stwo exactly. Everything runs on GPU — NTT, FRI, Merkle commitments, constraint evaluation, grinding — zero CPU fallbacks in the proving pipeline.
 
 The stwo `CudaBackend` integration is **complete** — the full stwo-cairo AIR (all 67 Cairo components) runs through GPU-accelerated constraint evaluation. Every test passes, every proof verifies.
 
@@ -19,9 +19,9 @@ Single RTX 5090 (Blackwell, SM_120), Fibonacci AIR, 100-bit security:
 | 2^24 | 16M | 217ms | 2.3 KB |
 | 2^26 | 67M | 471ms | 2.7 KB |
 | 2^28 | 268M | 1.5s | 3.1 KB |
-| 2^30 | 1.07B | **6.5s** | 3.4 KB |
+| 2^30 | 1.07B | **7.0s** | 3.4 KB |
 
-Steady-state throughput: **9.1 proofs/minute** at 1B elements. All proofs verified.
+Steady-state throughput: **~8.6 proofs/minute** at 1B elements (amortized). All proofs verified.
 
 ### stwo-cairo Full Proving Pipeline (GPU CudaBackend)
 

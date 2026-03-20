@@ -314,6 +314,6 @@ Register cap test:  128 regs → 221K/sec (same), 96 regs → 221K/sec (same)
 
 ### Test Suite
 ```
-115 tests, all passing
+142 tests, all passing
 Includes: 10K GPU vs CPU Pedersen regression test
 ```

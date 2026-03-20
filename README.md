@@ -9,7 +9,7 @@ FIBONACCI STARK (proven + verified, 100-bit security)
   log_n=24 │   16.8M elements │    390ms prove │  6.4ms verify ✓
   log_n=28 │    268M elements │   2.68s prove  │ 11.9ms verify ✓
   log_n=29 │    537M elements │   4.39s prove  │  9.5ms verify ✓
-  log_n=30 │  1.07B elements  │   9.10s prove  │ 14.2ms verify ✓
+  log_n=30 │  1.07B elements  │   7.0s  prove  │ 14.2ms verify ✓ (amortized)
 
 POSEIDON (8 columns, x^5 S-box, 22 full rounds, MDS)
   log_n=28 │  12.2M hashes │  1.4s  (34.7M hashes/sec GPU trace gen)
@@ -17,6 +17,7 @@ POSEIDON (8 columns, x^5 S-box, 22 full rounds, MDS)
 CAIRO VM (27 columns, 20 constraints, LogUp memory consistency)
   log_n=24 │  16.8M steps │  453M elements │   818ms (sub-second!)
   log_n=26 │    67M steps │  1.8B elements │   3.5s
+  log_n=27 │   134M steps │  3.6B elements │   7.3s (per-column VRAM streaming)
 ```
 
 ## Architecture
@@ -43,7 +44,7 @@ Complete core AIR for the Cairo instruction set:
 | Builtin | Status | Throughput |
 |---------|--------|-----------|
 | Poseidon | GPU kernel, proven | 34.7M hashes/sec |
-| Pedersen | CPU EC arithmetic, correct | 60 hashes/sec |
+| Pedersen | GPU kernel, proven (windowed 4-bit EC, Montgomery Jacobian) | 37.7M hashes/sec |
 | Bitwise | Trace + constraints | AND/XOR/OR on 252-bit |
 
 ## Stark252 Field
@@ -74,13 +75,13 @@ Requires: Rust 1.94+, CUDA 13.0, RTX 5090 (SM 12.0) or RTX 4090 (SM 8.9).
 
 ```bash
 cargo build --release
-cargo test -- --test-threads=1    # 113 tests
+cargo test -- --test-threads=1    # 142 tests
 cargo run --release --bin full_benchmark
 ```
 
 ## Tests
 
-113 tests covering:
+142 tests covering:
 - M31/CM31/QM31 field arithmetic
 - Circle NTT (forward, inverse, roundtrip, batched)
 - Merkle tree (commit, auth paths, tiled, SoA4)
@@ -88,8 +89,10 @@ cargo run --release --bin full_benchmark
 - STARK prover + verifier (multiple sizes, tamper detection)
 - Cairo VM (decoder, executor, Fibonacci, constraints, LogUp, range checks)
 - Poseidon (permutation, trace, GPU trace match)
-- Pedersen (Stark252 field, EC ops, hash)
+- Pedersen (Stark252 field, EC ops, hash, GPU vs CPU correctness)
 - Bitwise (AND/XOR/OR, trace)
+- GPU constraint eval (bytecode VM, warp-cooperative kernels)
+- GPU leaf hashing (Blake2s, buffered chunks)
 
 ## License
 
