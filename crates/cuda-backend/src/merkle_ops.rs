@@ -75,7 +75,7 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
         // Fix col_indices: we need absolute indices into the columns array.
         // Rebuild cleanly:
         schedule.clear();
-        let mut abs_idx = 0usize;
+        let _abs_idx = 0usize;
         let mut i = 0;
         while i < columns.len() {
             let log_size = columns[i].len().ilog2();
@@ -206,7 +206,6 @@ mod poseidon_merkle {
     use starknet_ff::FieldElement as FieldElement252;
 
     use super::CudaBackend;
-    use super::CudaColumn;
 
     impl MerkleOpsLifted<Poseidon252MerkleHasher> for CudaBackend {
         fn build_leaves(
@@ -236,6 +235,7 @@ mod poseidon_merkle {
 // The old non-lifted VCS path is not used by stwo-cairo.
 
 /// GPU leaf hashing: hash column values into leaf nodes.
+#[allow(dead_code)]
 fn commit_leaves_gpu(
     n: usize,
     columns: &[&CudaColumn<BaseField>],
@@ -263,6 +263,7 @@ fn commit_leaves_gpu(
 }
 
 /// GPU merge: hash pairs of children into parent nodes.
+#[allow(dead_code)]
 fn commit_merge_gpu(
     n: usize,
     prev_layer: &CudaColumn<Blake2sHash>,

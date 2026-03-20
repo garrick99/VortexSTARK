@@ -10,10 +10,7 @@
 
 use std::iter::zip;
 
-use itertools::Itertools;
 use tracing::{span, Level};
-
-use stwo::core::circle::CirclePoint;
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::pcs::quotients::{column_line_coeffs, ColumnSampleBatch};

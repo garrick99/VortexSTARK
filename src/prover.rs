@@ -1986,11 +1986,6 @@ fn gpu_tile_auth_paths_single(
     let needed_vec: Vec<usize> = needed_tiles.iter().copied().collect();
     let n_tiles_needed = needed_vec.len();
 
-    // Map tile_idx → position in batched buffer
-    let tile_pos: HashMap<usize, usize> = needed_vec.iter().enumerate()
-        .map(|(pos, &tile_idx)| (tile_idx, pos))
-        .collect();
-
     // Batch all tiles into one contiguous buffer and upload once
     let mut batched = Vec::with_capacity(n_tiles_needed * TILE_SIZE);
     for &tile_idx in &needed_vec {

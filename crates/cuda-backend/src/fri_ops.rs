@@ -3,9 +3,7 @@
 //! Fold twiddles computed on CPU from stwo's domain iteration (matching
 //! the CPU FRI exactly), uploaded as flat arrays for GPU kernels.
 
-use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
-use stwo::core::fields::FieldExpOps;
 use stwo::core::utils::bit_reverse_index;
 use stwo::prover::secure_column::SecureColumnByCoords;
 use stwo::prover::backend::{Column, CpuBackend};
