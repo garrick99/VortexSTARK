@@ -25,19 +25,27 @@ GPU-native Circle STARK prover with end-to-end proof generation and verification
 | Poseidon trace gen | 12.2M hashes | 1.4s | — |
 | Pedersen GPU batch | 1M hashes | 26.5ms | — |
 
-### Not yet adversarially complete
+### Adversarial soundness (constraint coverage)
 
-These are documented gaps in the constraint system. The prover produces correct proofs for honest executions, but a malicious prover could exploit these to forge proofs:
+31-column trace, 30 transition constraints. The following are now enforced:
 
-- **JNZ fall-through**: When `dst=0` (conditional not taken), `next_pc` is unconstrained
-- **Instruction decomposition**: No constraint linking flag columns to the actual instruction word
-- **Operand address constraints**: No constraint verifying dst/op0/op1 addresses match register + offset
-- **Flag mutual exclusivity**: No constraint enforcing at most one op1 source, one PC update mode, etc.
+- **Operand address verification**: dst_addr, op0_addr, op1_addr constrained against register + offset - bias
+- **JNZ fall-through**: dst_inv auxiliary column, fall-through constrained to pc + inst_size when dst=0
+- **JNZ inverse consistency**: dst * dst_inv = 1 enforced when jnz and dst != 0
+- **Op1 source exclusivity**: pairwise products of op1_imm, op1_fp, op1_ap all constrained to zero
+- **PC update exclusivity**: pairwise products of jump_abs, jump_rel, jnz constrained to zero
+- **Opcode exclusivity**: pairwise products of call, ret, assert constrained to zero
+- **Flag binary**: all 15 flags constrained to {0, 1}
+- **LogUp memory consistency**: execution sum + table sum cancellation with final value bound into Fiat-Shamir
+
+### Remaining limitations
+
+- **Instruction decomposition**: No polynomial constraint linking flag columns to the instruction word (M31 encoding loses 1 bit at the 2^31 boundary; LogUp checks inst_lo consistency)
 - **Range checks**: Implemented and tested, but not yet wired into the prover pipeline
 - **Hint execution**: Not implemented — limits provable programs to straight-line arithmetic and simple loops
 - **Full Starknet programs**: Requires hints, high-address builtin memory segments, and full felt252 support
 
-Production readiness is self-rated at **50%**. See [SOUNDNESS.md](SOUNDNESS.md) for the full analysis.
+Production readiness is self-rated at **75%**. See [SOUNDNESS.md](SOUNDNESS.md) for the full analysis.
 
 ## Architecture
 
@@ -52,8 +60,8 @@ Production readiness is self-rated at **50%**. See [SOUNDNESS.md](SOUNDNESS.md) 
 
 - **Instruction decoder**: 15 flags, 3 biased offsets, full Cairo encoding
 - **VM executor**: add, mul, jump, jnz, call, ret, assert_eq (26ns/step fused)
-- **27-column trace**: registers(3), instruction(2), flags(15), operands(7)
-- **20 transition constraints** evaluated on GPU (single CUDA kernel) and independently by verifier
+- **31-column trace**: registers(3), instruction(2), flags(15), operands(7), offsets(3), dst_inv(1)
+- **30 transition constraints** evaluated on GPU (single CUDA kernel) and independently by verifier
 - **LogUp memory consistency**: permutation argument with execution + table sum cancellation
 - **Range checks**: 16-bit offset validation via LogUp bus (implemented, wiring in progress)
 
@@ -95,22 +103,21 @@ cargo run --release --bin full_benchmark
 
 If you can craft a malformed trace that the verifier accepts, that is a real bug. Open an issue.
 
-### Known weak points (expected to fail under adversarial input)
+### Known remaining weak points
 
-These are documented constraint gaps. A sufficiently motivated adversary can likely exploit them to forge proofs for specific program patterns:
-
-- **JNZ fall-through**: Set `pc_jnz=1, dst=0` and `next_pc` to any value — constraint contributes zero
-- **Instruction decomposition**: Commit flag columns that don't match the instruction word — no constraint links them
-- **Operand addresses**: Commit arbitrary `dst_addr/op0_addr/op1_addr` unrelated to registers + offsets
-- **Flag exclusivity**: Set `op1_imm=1, op1_fp=1, op1_ap=1` simultaneously — no constraint prevents it
-- **Range checks**: Offsets outside [0, 2^16) are not rejected by the prover (code exists, not wired)
+- **Instruction decomposition**: No polynomial constraint linking flag columns to the instruction word. M31 field (2^31 ≡ 1) loses 1 bit of the 63-bit instruction at the split boundary. LogUp verifies inst_lo consistency but not inst_hi.
+- **Range checks**: Offset validation implemented and unit-tested, but not yet wired into the prover pipeline.
+- **Merkle domain separation**: Leaf and internal node hashing both use raw Blake2s. Implicit separation via input length (4-byte leaves vs 64-byte nodes), but not explicit prefix.
 
 ### Expected to hold (guarantees today)
 
 These should **not** break. If they do, that's a real soundness bug:
 
 - Honest prover produces proofs that verify for Fibonacci, add, mul, call/ret, and mixed programs
-- Verifier independently evaluates all 20 constraints at query points and rejects any mismatch
+- Verifier independently evaluates all 30 constraints at query points and rejects any mismatch
+- Operand addresses verified against register + offset for all three operands (dst, op0, op1)
+- JNZ fall-through constrained: dst_inv auxiliary column forces next_pc = pc + inst_size when dst = 0
+- Flag exclusivity enforced: op1 source, PC update mode, and opcode are pairwise mutually exclusive
 - Tampering any committed value (trace, quotient, FRI, commitment) is detected
 - LogUp final-value enforcement: corrupting the memory consistency sum breaks FRI verification
 - FRI fold equations: algebraic consistency checked at every query across all layers
