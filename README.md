@@ -91,6 +91,49 @@ cargo run --release --bin full_benchmark
 
 148 tests covering: M31/CM31/QM31 field arithmetic, Circle NTT, Merkle tree (commit, auth paths, tiled, SoA4), FRI (fold, circle fold, deterministic), STARK prover + verifier (multiple sizes, tamper detection), Cairo VM (decoder, executor, Fibonacci, constraints, LogUp, range checks), Poseidon, Pedersen (Stark252 field, EC ops, GPU vs CPU), Bitwise, GPU constraint eval (bytecode VM, warp-cooperative), GPU leaf hashing (Blake2s), CASM loader.
 
+## Break This System
+
+If you can craft a malformed trace that the verifier accepts, that is a real bug. Open an issue.
+
+### Known weak points (expected to fail under adversarial input)
+
+These are documented constraint gaps. A sufficiently motivated adversary can likely exploit them to forge proofs for specific program patterns:
+
+- **JNZ fall-through**: Set `pc_jnz=1, dst=0` and `next_pc` to any value — constraint contributes zero
+- **Instruction decomposition**: Commit flag columns that don't match the instruction word — no constraint links them
+- **Operand addresses**: Commit arbitrary `dst_addr/op0_addr/op1_addr` unrelated to registers + offsets
+- **Flag exclusivity**: Set `op1_imm=1, op1_fp=1, op1_ap=1` simultaneously — no constraint prevents it
+- **Range checks**: Offsets outside [0, 2^16) are not rejected by the prover (code exists, not wired)
+
+### Expected to hold (guarantees today)
+
+These should **not** break. If they do, that's a real soundness bug:
+
+- Honest prover produces proofs that verify for Fibonacci, add, mul, call/ret, and mixed programs
+- Verifier independently evaluates all 20 constraints at query points and rejects any mismatch
+- Tampering any committed value (trace, quotient, FRI, commitment) is detected
+- LogUp final-value enforcement: corrupting the memory consistency sum breaks FRI verification
+- FRI fold equations: algebraic consistency checked at every query across all layers
+- Merkle auth paths: data integrity verified for trace, quotient, and all FRI layers
+- Fiat-Shamir transcript: any mutation to public inputs, commitments, or challenges cascades into rejection
+
+### Tamper tests (all passing)
+
+| Test | What it tampers | Result |
+|------|----------------|--------|
+| `test_tamper_flag_binary` | Set flag to non-binary value | REJECTED |
+| `test_tamper_result_computation` | Corrupt `res` column | REJECTED |
+| `test_tamper_pc_update` | Corrupt `next_pc` | REJECTED |
+| `test_tamper_ap_update` | Corrupt `next_ap` | REJECTED |
+| `test_tamper_fp_update` | Corrupt `next_fp` | REJECTED |
+| `test_tamper_assert_eq` | Corrupt `dst != res` | REJECTED |
+| `test_tamper_logup_final_sum` | Corrupt LogUp sum | REJECTED |
+| `test_tamper_rc_final_sum` | Corrupt range check sum | REJECTED |
+| `test_cairo_tampered_program_hash` | Corrupt program hash | REJECTED |
+| `test_cairo_prove_verify_tampered_quotient` | Corrupt quotient value | REJECTED |
+| `test_cairo_prove_verify_tampered_fri` | Corrupt FRI value | REJECTED |
+| `test_tamper_ec_trace` | Corrupt EC trace commitment | REJECTED |
+
 ## License
 
 Business Source License 1.1 ([LICENSE](LICENSE)). Non-production use permitted. Converts to Apache License 2.0 on 2029-03-20. Contact for commercial licensing.
