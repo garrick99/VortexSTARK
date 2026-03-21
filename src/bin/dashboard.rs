@@ -211,6 +211,9 @@ fn gpu_pedersen_compare(n: usize, tx: &broadcast::Sender<WsMessage>) {
     let gpu_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let gpu_rate = n as f64 / (gpu_ms / 1000.0);
 
+    // Release GPU pool before CPU benchmark
+    vortexstark::cuda::ffi::vram_release(256 * 1024 * 1024);
+
     // CPU benchmark (multi-threaded)
     let n_threads = std::thread::available_parallelism().map_or(1, |p| p.get());
     let t1 = Instant::now();
