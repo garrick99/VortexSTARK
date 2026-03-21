@@ -7,7 +7,7 @@ GPU-native Circle STARK prover with end-to-end proof generation and verification
 ### End-to-end proven and verified on hardware
 
 - **Fibonacci STARK**: Full prove → verify pipeline, 100-bit conjectured security, 12 tamper-detection tests
-- **Cairo VM STARK**: 27-column trace, 20 transition constraints, verifier independently evaluates all constraints at query points
+- **Cairo VM STARK**: 31-column trace, 31 transition constraints, verifier independently evaluates all constraints at query points
 - **LogUp memory consistency**: Execution sum + memory table sum cancellation, final value bound into Fiat-Shamir
 - **Pedersen hash**: GPU windowed EC scalar multiplication, 37.7M hashes/sec, verified against CPU reference
 - **Poseidon hash**: GPU trace generation, 34.7M hashes/sec
@@ -27,7 +27,7 @@ GPU-native Circle STARK prover with end-to-end proof generation and verification
 
 ### Adversarial soundness (constraint coverage)
 
-31-column trace, 30 transition constraints. The following are now enforced:
+31-column trace, 31 transition constraints. The following are now enforced:
 
 - **Operand address verification**: dst_addr, op0_addr, op1_addr constrained against register + offset - bias
 - **JNZ fall-through**: dst_inv auxiliary column, fall-through constrained to pc + inst_size when dst=0
@@ -36,16 +36,17 @@ GPU-native Circle STARK prover with end-to-end proof generation and verification
 - **PC update exclusivity**: pairwise products of jump_abs, jump_rel, jnz constrained to zero
 - **Opcode exclusivity**: pairwise products of call, ret, assert constrained to zero
 - **Flag binary**: all 15 flags constrained to {0, 1}
+- **Instruction decomposition**: all 63 bits verified — inst_lo + inst_hi ≡ off0 + off1·2^16 + off2·2^32 + flags·2^48 (mod P)
 - **LogUp memory consistency**: execution sum + table sum cancellation with final value bound into Fiat-Shamir
+- **Range check argument**: all 16-bit offsets verified via LogUp against precomputed table, wired into prover with z_rc challenge
+- **Merkle domain separation**: internal nodes use Blake2s personalization (h[6] ^= 0x01), preventing leaf/node confusion
 
 ### Remaining limitations
 
-- **Instruction decomposition**: No polynomial constraint linking flag columns to the instruction word (M31 encoding loses 1 bit at the 2^31 boundary; LogUp checks inst_lo consistency)
-- **Range checks**: Implemented and tested, but not yet wired into the prover pipeline
 - **Hint execution**: Not implemented — limits provable programs to straight-line arithmetic and simple loops
 - **Full Starknet programs**: Requires hints, high-address builtin memory segments, and full felt252 support
 
-Production readiness is self-rated at **75%**. See [SOUNDNESS.md](SOUNDNESS.md) for the full analysis.
+See [SOUNDNESS.md](SOUNDNESS.md) for the full constraint-by-constraint analysis.
 
 ## Architecture
 
@@ -61,9 +62,10 @@ Production readiness is self-rated at **75%**. See [SOUNDNESS.md](SOUNDNESS.md) 
 - **Instruction decoder**: 15 flags, 3 biased offsets, full Cairo encoding
 - **VM executor**: add, mul, jump, jnz, call, ret, assert_eq (26ns/step fused)
 - **31-column trace**: registers(3), instruction(2), flags(15), operands(7), offsets(3), dst_inv(1)
-- **30 transition constraints** evaluated on GPU (single CUDA kernel) and independently by verifier
+- **31 transition constraints** evaluated on GPU (single CUDA kernel) and independently by verifier
 - **LogUp memory consistency**: permutation argument with execution + table sum cancellation
-- **Range checks**: 16-bit offset validation via LogUp bus (implemented, wiring in progress)
+- **Range check argument**: 16-bit offset validation via LogUp bus, wired into prover pipeline
+- **Instruction decomposition**: algebraic constraint tying inst_lo/inst_hi to offsets and flags
 
 ## Builtins
 
@@ -91,13 +93,13 @@ Requires: Rust nightly (1.89+), CUDA 13.0+, RTX 5090 (SM 12.0) or RTX 4090 (SM 8
 
 ```bash
 cargo build --release
-cargo test -- --test-threads=1    # 148 tests
+cargo test -- --test-threads=1    # 149 tests
 cargo run --release --bin full_benchmark
 ```
 
 ## Tests
 
-148 tests covering: M31/CM31/QM31 field arithmetic, Circle NTT, Merkle tree (commit, auth paths, tiled, SoA4), FRI (fold, circle fold, deterministic), STARK prover + verifier (multiple sizes, tamper detection), Cairo VM (decoder, executor, Fibonacci, constraints, LogUp, range checks), Poseidon, Pedersen (Stark252 field, EC ops, GPU vs CPU), Bitwise, GPU constraint eval (bytecode VM, warp-cooperative), GPU leaf hashing (Blake2s), CASM loader.
+149 tests covering: M31/CM31/QM31 field arithmetic, Circle NTT, Merkle tree (commit, auth paths, tiled, SoA4), FRI (fold, circle fold, deterministic), STARK prover + verifier (multiple sizes, tamper detection), Cairo VM (decoder, executor, Fibonacci, constraints, LogUp, range checks, instruction decomposition), Poseidon, Pedersen (Stark252 field, EC ops, GPU vs CPU), Bitwise, GPU constraint eval (bytecode VM, warp-cooperative), GPU leaf hashing (Blake2s, domain separation), CASM loader.
 
 ## Break This System
 
@@ -105,16 +107,15 @@ If you can craft a malformed trace that the verifier accepts, that is a real bug
 
 ### Known remaining weak points
 
-- **Instruction decomposition**: No polynomial constraint linking flag columns to the instruction word. M31 field (2^31 ≡ 1) loses 1 bit of the 63-bit instruction at the split boundary. LogUp verifies inst_lo consistency but not inst_hi.
-- **Range checks**: Offset validation implemented and unit-tested, but not yet wired into the prover pipeline.
-- **Merkle domain separation**: Leaf and internal node hashing both use raw Blake2s. Implicit separation via input length (4-byte leaves vs 64-byte nodes), but not explicit prefix.
+- **Hint execution**: Not implemented — limits provable programs to straight-line arithmetic and simple loops
+- **Full Starknet programs**: Requires hints, high-address builtin memory segments, and full felt252 support
 
 ### Expected to hold (guarantees today)
 
 These should **not** break. If they do, that's a real soundness bug:
 
 - Honest prover produces proofs that verify for Fibonacci, add, mul, call/ret, and mixed programs
-- Verifier independently evaluates all 30 constraints at query points and rejects any mismatch
+- Verifier independently evaluates all 31 constraints at query points and rejects any mismatch
 - Operand addresses verified against register + offset for all three operands (dst, op0, op1)
 - JNZ fall-through constrained: dst_inv auxiliary column forces next_pc = pc + inst_size when dst = 0
 - Flag exclusivity enforced: op1 source, PC update mode, and opcode are pairwise mutually exclusive

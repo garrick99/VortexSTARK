@@ -253,11 +253,25 @@ pub fn eval_transition_constraints(
     // 29: Opcode mutual exclusivity
     constraints.push(opcode_call * opcode_ret + opcode_call * opcode_assert + opcode_ret * opcode_assert);
 
+    // 30: Instruction decomposition
+    // inst_lo + inst_hi * 2^31 = off0 + off1 * 2^16 + off2 * 2^32 + sum(flag_i * 2^(48+i))
+    // In M31 (P = 2^31 - 1): 2^31 ≡ 1, 2^32 ≡ 2, 2^(48+i) ≡ 2^(17+i), 2^62 ≡ 1
+    let inst_lo = val(COL_INST_LO, row);
+    let inst_hi = val(COL_INST_HI, row);
+    let mut rhs = off0 + off1 * M31(1 << 16) + off2 * M31(2); // off2 * 2^32 ≡ off2 * 2
+    // Flag contributions: flag_i * 2^(48+i) ≡ flag_i * 2^(17+i) for i=0..13, flag_14 * 2^62 ≡ flag_14
+    for i in 0..14 {
+        rhs = rhs + f(i) * M31(1u32 << (17 + i));
+    }
+    rhs = rhs + f(14) * M31(1); // 2^62 mod P = 1
+    // LHS: inst_lo + inst_hi (since 2^31 ≡ 1 mod P)
+    constraints.push(inst_lo + inst_hi - rhs);
+
     constraints
 }
 
 /// Number of transition constraints.
-pub const N_CONSTRAINTS: usize = 15 + 1 + 1 + 1 + 1 + 1 + 10; // 30
+pub const N_CONSTRAINTS: usize = 15 + 1 + 1 + 1 + 1 + 1 + 10 + 1; // 31
 
 #[cfg(test)]
 mod tests {

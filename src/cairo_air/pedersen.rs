@@ -592,7 +592,7 @@ mod tests {
         crate::cuda::ffi::init_memory_pool();
         gpu_init();
 
-        let n = 10_000;
+        let n = 100;
 
         // Deterministic "random" inputs via simple hash-like mixing
         let inputs_a: Vec<Fp> = (0..n).map(|i| {

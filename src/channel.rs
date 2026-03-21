@@ -81,8 +81,21 @@ impl Channel {
     }
 }
 
+/// Blake2s hash with domain separation for internal Merkle nodes.
+/// Identical to `blake2s_hash` except h[6] is XORed with 0x01 (personalization).
+pub(crate) fn blake2s_hash_node(input: &[u8]) -> [u8; 32] {
+    blake2s_hash_domain(input, 0x01)
+}
+
 /// Minimal Blake2s hash (single block, up to 64 bytes input).
+/// Used for leaf hashing and Fiat-Shamir (domain = 0x00, no personalization change).
 pub(crate) fn blake2s_hash(input: &[u8]) -> [u8; 32] {
+    blake2s_hash_domain(input, 0x00)
+}
+
+/// Blake2s hash with domain separation via personalization byte.
+/// `domain` is XORed into h[6] (first byte of Blake2s personalization field).
+fn blake2s_hash_domain(input: &[u8], domain: u8) -> [u8; 32] {
     const IV: [u32; 8] = [
         0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
         0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
@@ -130,6 +143,7 @@ pub(crate) fn blake2s_hash(input: &[u8]) -> [u8; 32] {
 
     let mut h = IV;
     h[0] ^= 0x01010020; // digest_length=32, fanout=1, depth=1
+    h[6] ^= domain as u32; // domain separation (personalization byte)
 
     let mut v = [0u32; 16];
     v[..8].copy_from_slice(&h);

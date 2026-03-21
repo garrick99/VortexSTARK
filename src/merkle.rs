@@ -497,7 +497,7 @@ impl MerkleTree {
         mut index: usize,
         path: &[[u32; HASH_WORDS]],
     ) -> bool {
-        use crate::channel::blake2s_hash;
+        use crate::channel::blake2s_hash_node;
         let mut current = *leaf_hash;
 
         for sibling in path {
@@ -518,7 +518,7 @@ impl MerkleTree {
                     input[32 + i * 4..32 + i * 4 + 4].copy_from_slice(&w.to_le_bytes());
                 }
             }
-            let hash_bytes = blake2s_hash(&input);
+            let hash_bytes = blake2s_hash_node(&input);
             for i in 0..HASH_WORDS {
                 current[i] = u32::from_le_bytes([
                     hash_bytes[i * 4],
@@ -770,9 +770,9 @@ impl MerkleTree {
         hashes[0]
     }
 
-    /// Hash two sibling nodes into a parent.
+    /// Hash two sibling nodes into a parent (internal node domain separation).
     pub fn hash_pair(left: &[u32; HASH_WORDS], right: &[u32; HASH_WORDS]) -> [u32; HASH_WORDS] {
-        use crate::channel::blake2s_hash;
+        use crate::channel::blake2s_hash_node;
         let mut input = [0u8; 64];
         for (j, &w) in left.iter().enumerate() {
             input[j * 4..j * 4 + 4].copy_from_slice(&w.to_le_bytes());
@@ -780,7 +780,7 @@ impl MerkleTree {
         for (j, &w) in right.iter().enumerate() {
             input[32 + j * 4..32 + j * 4 + 4].copy_from_slice(&w.to_le_bytes());
         }
-        let h = blake2s_hash(&input);
+        let h = blake2s_hash_node(&input);
         let mut out = [0u32; HASH_WORDS];
         for k in 0..HASH_WORDS {
             out[k] = u32::from_le_bytes([h[k * 4], h[k * 4 + 1], h[k * 4 + 2], h[k * 4 + 3]]);

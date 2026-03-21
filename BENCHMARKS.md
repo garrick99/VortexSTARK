@@ -289,7 +289,7 @@ log_n   Hashes          Time
 ```
 - GPU trace generation: 34.7M hashes/sec
 
-### Cairo VM STARK (27 columns, 20 constraints, LogUp + range checks)
+### Cairo VM STARK (31 columns, 31 constraints, LogUp + range checks)
 ```
 log_n   Steps           Elements        Time
 ──────────────────────────────────────────────
@@ -314,6 +314,64 @@ Register cap test:  128 regs → 221K/sec (same), 96 regs → 221K/sec (same)
 
 ### Test Suite
 ```
-142 tests, all passing
+149 tests, all passing
 Includes: 10K GPU vs CPU Pedersen regression test
+```
+
+---
+
+## CHECKPOINT: Full System Benchmark — Clean RTX 5090 (2026-03-21)
+
+### Hardware / Toolkit
+```
+GPU:          NVIDIA GeForce RTX 5090 (32607 MiB GDDR7, SM 12.0 Blackwell)
+Driver:       595.79
+CUDA:         13.2
+Rust:         stable
+CPU:          Intel Core Ultra 9 285K
+RAM:          64 GB DDR5
+OS:           Windows 11
+VRAM at start: 0 MB (clean system)
+```
+
+### Fibonacci STARK (1 column, degree-1 constraint)
+```
+log_n=20 |      1,048,576 elements | prove:   107.6ms | verify:  4.6ms | ✓
+log_n=24 |     16,777,216 elements | prove:   211.9ms | verify:  6.4ms | ✓
+log_n=28 |    268,435,456 elements | prove:  1545.4ms | verify:  8.4ms | ✓
+log_n=29 |    536,870,912 elements | prove:  3671.4ms | verify:  8.9ms | ✓
+log_n=30 |  1,073,741,824 elements | prove:  9468.2ms | verify:  9.4ms | ✓
+```
+
+### Cairo VM STARK (31 columns, 31 constraints, LogUp + range checks)
+Full end-to-end cairo_prove() + cairo_verify() — not raw kernel timing.
+```
+log_n=20 |      1,048,576 steps | prove:  1007.4ms | verify:  0.4ms | ✓
+log_n=24 |     16,777,216 steps | prove:  7988.4ms | verify:  0.5ms | ✓
+log_n=26 |     67,108,864 steps | prove: 31967.1ms | verify:  0.5ms | ✓
+```
+
+### Poseidon Trace+NTT Throughput (8 columns, degree-5 S-box)
+```
+log_n=20 |     47,662 hashes | trace:   1ms | NTT:    3ms | total:   4.3ms | 11.0M hash/s
+log_n=24 |    762,600 hashes | trace:  25ms | NTT:   83ms | total: 115.2ms |  6.6M hash/s
+log_n=28 | 12,201,611 hashes | trace: 414ms | NTT: 1222ms | total:  1798ms |  6.8M hash/s
+```
+
+### Pedersen Hash (CPU, STARK curve EC)
+```
+100 hashes: 1662ms (16.6ms/hash, 60 hashes/sec)
+```
+
+### Bug Fixed This Session
+```
+cudaDeviceSetLimit(cudaLimitStackSize, 65536) removed from pedersen_gpu.cu.
+Was pre-allocating ~21 GB of stack space on RTX 5090 (170 SMs × 2048 threads × 64KB).
+Actual SM_120 kernel stack usage: 32 bytes (trace), 32 bytes (batch), 112 bytes (ec_trace).
+Fix: removed all 4 calls — CUDA default (1KB) is sufficient.
+```
+
+### Test Suite
+```
+149 tests, all passing (single-threaded)
 ```

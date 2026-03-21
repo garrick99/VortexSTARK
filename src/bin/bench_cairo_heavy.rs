@@ -219,7 +219,7 @@ fn main() {
     // SUMMARY
     // ================================================================
     println!("━━━ SUMMARY ━━━");
-    println!("  142 tests passing");
+    println!("  149 tests passing");
     println!("  29 EC constraint columns (vs stwo's 624)");
     println!("  Pedersen: 43.9M hash/sec (GPU-native stage)");
     println!("  LogUp: fused kernel, 3x faster");

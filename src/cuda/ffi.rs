@@ -76,24 +76,35 @@ pub fn vram_query() -> (usize, usize) {
     (free, total)
 }
 
-/// VRAM safety check. Prints current usage and aborts if another process
-/// is already using significant VRAM (>512 MB).
-/// Call before init_memory_pool() to avoid competing for GPU memory.
+/// VRAM safety check via nvidia-smi. Must be called before CUDA context init
+/// (before detect_wsl2_and_configure) so readings reflect external processes only.
 pub fn vram_preflight_check() {
+    let output = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.used,memory.free,memory.total", "--format=csv,noheader,nounits"])
+        .output();
+
+    if let Ok(out) = output {
+        let s = String::from_utf8_lossy(&out.stdout);
+        let parts: Vec<&str> = s.trim().split(',').collect();
+        if parts.len() == 3 {
+            let used_mb: usize = parts[0].trim().parse().unwrap_or(0);
+            let free_mb: usize = parts[1].trim().parse().unwrap_or(0);
+            let total_mb: usize = parts[2].trim().parse().unwrap_or(0);
+            eprintln!("[VRAM] {used_mb} MB used / {total_mb} MB total ({free_mb} MB free)");
+            if used_mb > 512 {
+                eprintln!("[VRAM] WARNING: {used_mb} MB already in use by another process.");
+                eprintln!("[VRAM] Another GPU workload may be running.");
+                eprintln!("[VRAM] VortexSTARK needs up to 28 GB for large proofs (log_n>=27).");
+                eprintln!("[VRAM] Proceeding, but large proofs may OOM. Stop other GPU processes first.");
+            }
+            return;
+        }
+    }
+    // Fallback to cudaMemGetInfo if nvidia-smi unavailable (note: requires active CUDA context)
     let (free, total) = vram_query();
     let used = total - free;
-    let free_mb = free / (1024 * 1024);
-    let total_mb = total / (1024 * 1024);
-    let used_mb = used / (1024 * 1024);
-
-    eprintln!("[VRAM] {used_mb} MB used / {total_mb} MB total ({free_mb} MB free)");
-
-    if used_mb > 512 {
-        eprintln!("[VRAM] WARNING: {used_mb} MB already in use by another process.");
-        eprintln!("[VRAM] Another GPU workload may be running.");
-        eprintln!("[VRAM] VortexSTARK needs up to 28 GB for large proofs (log_n>=27).");
-        eprintln!("[VRAM] Proceeding, but large proofs may OOM. Stop other GPU processes first.");
-    }
+    eprintln!("[VRAM] {} MB used / {} MB total ({} MB free)",
+        used / (1024*1024), total / (1024*1024), free / (1024*1024));
 }
 
 /// Flush the CUDA memory pool back to the OS. Call after each job completes
@@ -121,6 +132,9 @@ pub fn vram_release(keep_bytes: usize) {
 /// up to that limit for fast reuse, but anything beyond 2 GB is returned
 /// to the OS between jobs so other processes can share the GPU.
 pub fn init_memory_pool() {
+    // Check VRAM before CUDA context is initialized (nvidia-smi sees only external processes)
+    vram_preflight_check();
+
     // Detect WSL2 and switch to sync malloc if needed
     crate::device::buffer::detect_wsl2_and_configure();
 
@@ -139,8 +153,6 @@ pub fn init_memory_pool() {
         }
         eprintln!("[CUDA] GPU sanity check passed");
     }
-
-    vram_preflight_check();
 
     // Skip pool configuration on WSL2 (not using async alloc)
     if crate::device::buffer::use_sync() {
@@ -165,8 +177,9 @@ pub fn init_memory_pool() {
 /// Initialize with greedy pool (never releases memory). Use only for
 /// back-to-back benchmarks where you know nothing else needs the GPU.
 pub fn init_memory_pool_greedy() {
-    crate::device::buffer::detect_wsl2_and_configure();
+    // Check VRAM before CUDA context is initialized (nvidia-smi sees only external processes)
     vram_preflight_check();
+    crate::device::buffer::detect_wsl2_and_configure();
 
     if crate::device::buffer::use_sync() {
         return;

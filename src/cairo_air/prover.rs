@@ -23,16 +23,17 @@ use crate::fri::{self, SecureColumn};
 use crate::merkle::MerkleTree;
 use crate::ntt::{self, ForwardTwiddleCache, InverseTwiddleCache};
 use crate::prover::{QueryDecommitment, N_QUERIES, BLOWUP_BITS};
-use super::trace::{N_COLS, N_CONSTRAINTS, COL_PC, COL_INST_LO, COL_INST_HI,
+use super::trace::{N_COLS, N_CONSTRAINTS, COL_PC, COL_INST_LO,
     COL_DST_ADDR, COL_DST, COL_OP0_ADDR, COL_OP0, COL_OP1_ADDR, COL_OP1};
+use super::range_check::{extract_offsets, compute_rc_interaction_trace, compute_rc_table_sum};
 
 /// Columns the LogUp kernel reads (memory address/value pairs).
 const LOGUP_COLS: [usize; 8] = [COL_PC, COL_INST_LO, COL_DST_ADDR, COL_DST,
     COL_OP0_ADDR, COL_OP0, COL_OP1_ADDR, COL_OP1];
 
-/// Columns NOT read by the quotient kernel (instruction encoding only).
-/// Address columns (DST_ADDR, OP0_ADDR, OP1_ADDR) are now used by soundness constraints.
-const QUOTIENT_UNUSED_COLS: [usize; 2] = [COL_INST_LO, COL_INST_HI];
+/// Columns NOT read by the quotient kernel.
+/// inst_lo and inst_hi are now used by constraint 30 (instruction decomposition).
+const QUOTIENT_UNUSED_COLS: [usize; 0] = [];
 use super::vm::Memory;
 use super::ec_constraint;
 
@@ -210,9 +211,9 @@ pub fn cairo_prove_cached(
     let columns = super::vm::execute_to_columns(&mut mem, n_steps, log_n);
     let _vm_ms = t_phase1.elapsed().as_secs_f64() * 1000.0;
 
-    // Memory table and range check extraction are expensive (BTreeMap over n_steps×4 entries).
-    // The LogUp/RC final sums are bound into Fiat-Shamir — the verifier doesn't need
-    // independent verification. Skip extraction to avoid the 16s bottleneck at log_n=26.
+    // Extract range check offsets from raw trace before NTT destroys it.
+    // This is O(n_steps) bit manipulation — fast even at log_n=26.
+    let (rc_offsets, rc_counts) = extract_offsets(&columns, n_steps);
 
     let t_ntt = std::time::Instant::now();
     let mut d_eval_cols: Vec<DeviceBuffer<u32>> = Vec::with_capacity(N_COLS);
@@ -294,6 +295,7 @@ pub fn cairo_prove_cached(
     // ---- Phase 2: Fused LogUp interaction ----
     let z_mem = channel.draw_felt();
     let alpha_mem = channel.draw_felt();
+    let z_rc = channel.draw_felt();
     let z_arr = z_mem.to_u32_array();
     let alpha_arr = alpha_mem.to_u32_array();
 
@@ -336,10 +338,12 @@ pub fn cairo_prove_cached(
         val
     };
 
-    // LogUp + RC final sums: the GPU computes them on the eval domain.
-    // They're bound into Fiat-Shamir — tampering breaks FRI.
-    // Set RC final sum to match logup (both on eval domain).
-    let rc_final_sum = logup_final_sum; // both bound via Fiat-Shamir
+    // Range check: compute actual LogUp sum over offsets on the trace domain.
+    let (_, rc_exec_sum) = compute_rc_interaction_trace(&rc_offsets, n_steps, z_rc);
+    let rc_table_sum = compute_rc_table_sum(&rc_counts, z_rc);
+    assert_eq!(rc_exec_sum + rc_table_sum, QM31::ZERO,
+        "range check LogUp sums don't cancel — offset out of range");
+    let rc_final_sum = rc_exec_sum.to_u32_array();
 
     let interaction_commitment = MerkleTree::commit_root_soa4(
         &d_logup0, &d_logup1, &d_logup2, &d_logup3, log_eval_size,
@@ -550,6 +554,7 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
 
     let _z_mem = channel.draw_felt();
     let _alpha_mem = channel.draw_felt();
+    let _z_rc = channel.draw_felt();
 
     // Verify EC trace commitment is bound into Fiat-Shamir
     if let Some(ref ec_commit) = proof.ec_trace_commitment {
@@ -687,14 +692,14 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
     }
 
     // ---- FIX #1: Verify constraint evaluation at query points ----
-    // The verifier independently evaluates the 30 Cairo constraints and checks
+    // The verifier independently evaluates the 31 Cairo constraints and checks
     // they match the quotient values. This closes the critical soundness gap.
     let constraint_alphas = constraint_alphas_drawn;
     for (q, &qi) in proof.query_indices.iter().enumerate() {
         let row = &proof.trace_values_at_queries[q];
         let next = &proof.trace_values_at_queries_next[q];
 
-        // Evaluate all 30 constraints (same logic as cuda_cairo_quotient kernel)
+        // Evaluate all 31 constraints (same logic as cuda_cairo_quotient kernel)
         let mut constraint_sum = QM31::ZERO;
         let mut ci = 0;
 
@@ -857,7 +862,26 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
             constraint_sum = constraint_sum + constraint_alphas[ci] * c;
             ci += 1;
         }
-        let _ = ci; // all 30 constraints evaluated
+
+        // Constraint 30: Instruction decomposition
+        // inst_lo + inst_hi * 2^31 = off0 + off1*2^16 + off2*2^32 + sum(flag_i * 2^(48+i))
+        // In M31: 2^31 ≡ 1, 2^32 ≡ 2, 2^(48+i) ≡ 2^(17+i), 2^62 ≡ 1
+        {
+            let inst_lo = M31(row[3]);
+            let inst_hi = M31(row[4]);
+            let off0 = M31(row[27]);
+            let off1 = M31(row[28]);
+            let off2 = M31(row[29]);
+            let mut rhs = off0 + off1 * M31(1 << 16) + off2 * M31(2);
+            for i in 0..14u32 {
+                rhs = rhs + M31(row[5 + i as usize]) * M31(1u32 << (17 + i));
+            }
+            rhs = rhs + M31(row[19]) * M31(1); // flag14 * 2^62 ≡ flag14
+            let c = inst_lo + inst_hi - rhs;
+            constraint_sum = constraint_sum + constraint_alphas[ci] * c;
+            ci += 1;
+        }
+        let _ = ci; // all 31 constraints evaluated
 
         // The GPU quotient kernel outputs the raw alpha-weighted constraint sum
         // (no zerofier division). So the committed quotient value at this point
@@ -1466,6 +1490,21 @@ mod tests {
         proof.rc_final_sum[0] ^= 1; // corrupt range check final sum
         let result = cairo_verify(&proof);
         assert!(result.is_err(), "Tampered RC final sum should fail");
+    }
+
+    #[test]
+    fn test_rc_final_sum_is_real() {
+        // Verify range check wiring produces a distinct sum (not a copy of LogUp)
+        ffi::init_memory_pool();
+        let program = build_fib_program(64);
+        let proof = cairo_prove(&program, 64, 6);
+        assert_ne!(proof.rc_final_sum, proof.logup_final_sum,
+            "RC final sum should differ from LogUp — placeholder not replaced?");
+        assert_ne!(proof.rc_final_sum, [0; 4],
+            "RC final sum should be non-zero for a non-trivial trace");
+        // Full proof must still verify
+        let result = cairo_verify(&proof);
+        assert!(result.is_ok(), "Proof with real RC final sum should verify: {:?}", result);
     }
 
     #[test]

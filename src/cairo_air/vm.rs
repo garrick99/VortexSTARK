@@ -123,10 +123,15 @@ pub fn execute_to_columns(memory: &mut Memory, n_steps: usize, log_n: u32) -> Ve
 
     #[inline(always)]
     fn to_m31(v: u64) -> u32 {
-        let lo = (v & 0x7FFF_FFFF) as u32;
-        let hi = (v >> 31) as u32;
-        let r = lo + hi;
-        if r >= P { r - P } else { r }
+        // Reduce v mod P = 2^31 - 1 using the identity: 2^31 ≡ 1 (mod P).
+        // For v up to 2^63, two rounds suffice: first fold 64→32 bits, then 32→31.
+        let lo = (v & 0x7FFF_FFFF) as u64;
+        let hi = v >> 31;
+        let r = lo + hi; // at most ~2^32, fits in u64
+        let lo2 = (r & 0x7FFF_FFFF) as u32;
+        let hi2 = (r >> 31) as u32;
+        let s = lo2 + hi2; // at most 2^31 + 1, fits in u32
+        if s >= P { s - P } else { s }
     }
 
     // Detect if the program has a dominant instruction (common in benchmarks).
@@ -324,10 +329,15 @@ pub fn execute_to_columns_into(
 
     #[inline(always)]
     fn to_m31(v: u64) -> u32 {
-        let lo = (v & 0x7FFF_FFFF) as u32;
-        let hi = (v >> 31) as u32;
-        let r = lo + hi;
-        if r >= P { r - P } else { r }
+        // Reduce v mod P = 2^31 - 1 using the identity: 2^31 ≡ 1 (mod P).
+        // For v up to 2^63, two rounds suffice: first fold 64→32 bits, then 32→31.
+        let lo = (v & 0x7FFF_FFFF) as u64;
+        let hi = v >> 31;
+        let r = lo + hi; // at most ~2^32, fits in u64
+        let lo2 = (r & 0x7FFF_FFFF) as u32;
+        let hi2 = (r >> 31) as u32;
+        let s = lo2 + hi2; // at most 2^31 + 1, fits in u32
+        if s >= P { s - P } else { s }
     }
 
     for i in 0..n_steps {

@@ -2138,7 +2138,7 @@ fn gpu_tile_auth_paths_soa4_slices(
 
 /// Build CPU Merkle tree from QM31 values and extract auth paths at given indices.
 fn cpu_merkle_auth_paths(values: &[QM31], indices: &[usize]) -> Vec<Vec<[u32; 8]>> {
-    use crate::channel::blake2s_hash;
+    use crate::channel::{blake2s_hash, blake2s_hash_node};
 
     let n = values.len();
     assert!(n.is_power_of_two() && n >= 1);
@@ -2175,7 +2175,7 @@ fn cpu_merkle_auth_paths(values: &[QM31], indices: &[usize]) -> Vec<Vec<[u32; 8]
                 for (j, &w) in prev[2 * i + 1].iter().enumerate() {
                     input[32 + j * 4..32 + j * 4 + 4].copy_from_slice(&w.to_le_bytes());
                 }
-                let h = blake2s_hash(&input);
+                let h = blake2s_hash_node(&input);
                 let mut out = [0u32; 8];
                 for k in 0..8 {
                     out[k] = u32::from_le_bytes([h[k*4], h[k*4+1], h[k*4+2], h[k*4+3]]);

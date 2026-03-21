@@ -551,7 +551,6 @@ void cuda_pedersen_ec_trace(
     uint64_t* ec_trace, uint32_t* ec_ops,
     uint32_t n, cudaStream_t stream
 ) {
-    cudaDeviceSetLimit(cudaLimitStackSize, 65536);
     uint32_t threads = 32; // fewer threads — each writes 622 rows
     uint32_t blocks = (n + threads - 1) / threads;
     pedersen_ec_trace_kernel<<<blocks, threads, 0, stream>>>(
@@ -639,7 +638,6 @@ void cuda_pedersen_trace(
     uint32_t n,
     cudaStream_t stream
 ) {
-    cudaDeviceSetLimit(cudaLimitStackSize, 65536);
     uint32_t threads = 128;
     uint32_t blocks = (n + threads - 1) / threads;
     pedersen_trace_kernel<<<blocks, threads, 0, stream>>>(
@@ -690,7 +688,6 @@ void cuda_pedersen_hash_batch(
     uint64_t* out_zz, // UNUSED — kept for FFI compat, will be removed
     uint32_t n
 ) {
-    cudaDeviceSetLimit(cudaLimitStackSize, 65536);
     uint32_t threads = 128;
     uint32_t blocks = (n + threads - 1) / threads;
     pedersen_batch_kernel<<<blocks, threads>>>(inputs_a, inputs_b, out_x, n);
@@ -705,7 +702,6 @@ void cuda_pedersen_hash_batch_stream(
     uint32_t n,
     cudaStream_t stream
 ) {
-    cudaDeviceSetLimit(cudaLimitStackSize, 65536);
     uint32_t threads = 128;
     uint32_t blocks = (n + threads - 1) / threads;
     pedersen_batch_kernel<<<blocks, threads, 0, stream>>>(inputs_a, inputs_b, out_x, n);

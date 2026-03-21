@@ -1,6 +1,6 @@
 // GPU constraint evaluation for Cairo VM AIR.
 //
-// 31 trace columns, 30 transition constraints.
+// 31 trace columns, 31 transition constraints.
 // Each thread evaluates all constraints for one row, combining with
 // alpha coefficients into a single QM31 quotient value.
 //
@@ -17,7 +17,9 @@
 
 #define CAIRO_N_COLS 31
 #define CAIRO_N_FLAGS 15
-#define CAIRO_N_CONSTRAINTS 30
+#define CAIRO_N_CONSTRAINTS 31
+#define COL_INST_LO 3
+#define COL_INST_HI 4
 #define COL_PC 0
 #define COL_AP 1
 #define COL_FP 2
@@ -283,6 +285,27 @@ __global__ void cairo_quotient_kernel(
         quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
     }
 
+    // Constraint 30: Instruction decomposition
+    // inst_lo + inst_hi * 2^31 = off0 + off1 * 2^16 + off2 * 2^32 + sum(flag_i * 2^(48+i))
+    // In M31: 2^31 ≡ 1, 2^32 ≡ 2, 2^(48+i) ≡ 2^(17+i), 2^62 ≡ 1
+    {
+        uint32_t inst_lo_v = trace_cols[COL_INST_LO][i];
+        uint32_t inst_hi_v = trace_cols[COL_INST_HI][i];
+        // RHS = off0 + off1 * 2^16 + off2 * 2
+        uint32_t rhs = m31_add(m31_add(off0, m31_mul(off1, (1u << 16))), m31_mul(off2, 2));
+        // Add flag contributions: flag_i * 2^(17+i) for i=0..13
+        for (int fi = 0; fi < 14; fi++) {
+            rhs = m31_add(rhs, m31_mul(flags[fi], (1u << (17 + fi))));
+        }
+        // flag_14 * 2^62 ≡ flag_14 * 1
+        rhs = m31_add(rhs, flags[14]);
+        // LHS = inst_lo + inst_hi (since 2^31 ≡ 1)
+        uint32_t lhs = m31_add(inst_lo_v, inst_hi_v);
+        uint32_t c = m31_sub(lhs, rhs);
+        QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+        quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
+    }
+
     out0[i] = quotient.v[0];
     out1[i] = quotient.v[1];
     out2[i] = quotient.v[2];
@@ -460,6 +483,21 @@ __global__ void cairo_quotient_chunk_kernel(
                 m31_mul(f_call, f_ret),
                 m31_mul(f_call, f_assert)),
                 m31_mul(f_ret, f_assert));
+            QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+            quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
+        }
+
+        // Constraint 30: Instruction decomposition
+        {
+            uint32_t inst_lo_v = trace_cols[COL_INST_LO][i];
+            uint32_t inst_hi_v = trace_cols[COL_INST_HI][i];
+            uint32_t rhs = m31_add(m31_add(off0_v, m31_mul(off1_v, (1u << 16))), m31_mul(off2_v, 2));
+            for (int fi = 0; fi < 14; fi++) {
+                rhs = m31_add(rhs, m31_mul(flags[fi], (1u << (17 + fi))));
+            }
+            rhs = m31_add(rhs, flags[14]);
+            uint32_t lhs = m31_add(inst_lo_v, inst_hi_v);
+            uint32_t c = m31_sub(lhs, rhs);
             QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
             quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
         }

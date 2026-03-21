@@ -28,6 +28,10 @@ path = "src/bin/stark_cli.rs"
 name = "sustained_bench"
 path = "src/bin/sustained_bench.rs"
 
+[[bin]]
+name = "full_benchmark"
+path = "src/bin/full_benchmark.rs"
+
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }

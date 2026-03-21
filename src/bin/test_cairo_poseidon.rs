@@ -130,7 +130,7 @@ fn main() {
         let mut channel = Channel::new();
         channel.mix_digest(&commitment);
 
-        // Quotient: VM constraints (using first 27 columns)
+        // Quotient: VM constraints (31 columns, 31 constraints)
         let n_constraints = trace::N_CONSTRAINTS;
         let alpha_coeffs: Vec<QM31> = (0..n_constraints).map(|_| channel.draw_felt()).collect();
         let alpha_flat: Vec<u32> = alpha_coeffs.iter().flat_map(|a| a.to_u32_array()).collect();

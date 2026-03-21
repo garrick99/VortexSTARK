@@ -1,7 +1,13 @@
 // Blake2s hashing for Merkle tree commitments.
 // Uses shared blake2s_compress from include/blake2s.cuh.
+//
+// Domain separation: leaf hashes use h6=IV6, internal nodes use h6=IV6^1.
+// This prevents second-preimage attacks where a leaf is confused with a node.
 
 #include "include/blake2s.cuh"
+
+// Domain-separated IV6 for internal node hashing (personalization byte 0x01).
+#define IV6_NODE (IV6 ^ 1u)
 
 // Hash leaf: n_cols M31 values → 32-byte Blake2s hash
 __global__ void merkle_hash_leaves_kernel(
@@ -64,7 +70,7 @@ __global__ void merkle_hash_nodes_kernel(
     const uint32_t* right = &children[i * 16 + 8];
 
     uint32_t h0=IV0^0x01010020, h1=IV1, h2=IV2, h3=IV3;
-    uint32_t h4=IV4, h5=IV5, h6=IV6, h7=IV7;
+    uint32_t h4=IV4, h5=IV5, h6=IV6_NODE, h7=IV7;
 
     blake2s_compress(h0,h1,h2,h3,h4,h5,h6,h7,
                      left[0],left[1],left[2],left[3],
@@ -117,9 +123,9 @@ __global__ void merkle_commit_small_soa4_kernel(
                          0,0,0,0, 0,0,0,0, 0,0,0,0,
                          16, 0xFFFFFFFF);
 
-        // Merge: hash the two leaf hashes
+        // Merge: hash the two leaf hashes (internal node domain)
         uint32_t ph0=IV0^0x01010020, ph1=IV1, ph2=IV2, ph3=IV3;
-        uint32_t ph4=IV4, ph5=IV5, ph6=IV6, ph7=IV7;
+        uint32_t ph4=IV4, ph5=IV5, ph6=IV6_NODE, ph7=IV7;
         blake2s_compress(ph0,ph1,ph2,ph3,ph4,ph5,ph6,ph7,
                          lh0,lh1,lh2,lh3,lh4,lh5,lh6,lh7,
                          rh0,rh1,rh2,rh3,rh4,rh5,rh6,rh7,
@@ -152,7 +158,7 @@ __global__ void merkle_commit_small_soa4_kernel(
 
         if (tid < half) {
             uint32_t h0=IV0^0x01010020, h1=IV1, h2=IV2, h3=IV3;
-            uint32_t h4=IV4, h5=IV5, h6=IV6, h7=IV7;
+            uint32_t h4=IV4, h5=IV5, h6=IV6_NODE, h7=IV7;
             blake2s_compress(h0,h1,h2,h3,h4,h5,h6,h7,
                              l0,l1,l2,l3,l4,l5,l6,l7,
                              r0,r1,r2,r3,r4,r5,r6,r7,
@@ -207,9 +213,9 @@ __global__ void merkle_hash_leaves_and_merge_soa4_kernel(
                      0,0,0,0, 0,0,0,0, 0,0,0,0,
                      16, 0xFFFFFFFF);
 
-    // Hash the two leaf hashes together (64 bytes = 16 words input)
+    // Hash the two leaf hashes together (internal node domain)
     uint32_t ph0=IV0^0x01010020, ph1=IV1, ph2=IV2, ph3=IV3;
-    uint32_t ph4=IV4, ph5=IV5, ph6=IV6, ph7=IV7;
+    uint32_t ph4=IV4, ph5=IV5, ph6=IV6_NODE, ph7=IV7;
     blake2s_compress(ph0,ph1,ph2,ph3,ph4,ph5,ph6,ph7,
                      lh0,lh1,lh2,lh3,lh4,lh5,lh6,lh7,
                      rh0,rh1,rh2,rh3,rh4,rh5,rh6,rh7,
@@ -258,7 +264,7 @@ __global__ void merkle_reduce_to_root_kernel(
 
         if (tid < half) {
             uint32_t h0=IV0^0x01010020, h1=IV1, h2=IV2, h3=IV3;
-            uint32_t h4=IV4, h5=IV5, h6=IV6, h7=IV7;
+            uint32_t h4=IV4, h5=IV5, h6=IV6_NODE, h7=IV7;
             blake2s_compress(h0,h1,h2,h3,h4,h5,h6,h7,
                              l0,l1,l2,l3,l4,l5,l6,l7,
                              r0,r1,r2,r3,r4,r5,r6,r7,
@@ -318,9 +324,9 @@ __global__ void merkle_tiled_soa4_kernel(
                          0,0,0,0, 0,0,0,0, 0,0,0,0,
                          16, 0xFFFFFFFF);
 
-        // Merge: hash both leaf hashes
+        // Merge: hash both leaf hashes (internal node domain)
         uint32_t ph0=IV0^0x01010020, ph1=IV1, ph2=IV2, ph3=IV3;
-        uint32_t ph4=IV4, ph5=IV5, ph6=IV6, ph7=IV7;
+        uint32_t ph4=IV4, ph5=IV5, ph6=IV6_NODE, ph7=IV7;
         blake2s_compress(ph0,ph1,ph2,ph3,ph4,ph5,ph6,ph7,
                          lh0,lh1,lh2,lh3,lh4,lh5,lh6,lh7,
                          rh0,rh1,rh2,rh3,rh4,rh5,rh6,rh7,
@@ -354,7 +360,7 @@ __global__ void merkle_tiled_soa4_kernel(
 
         if (tid < half) {
             uint32_t h0=IV0^0x01010020, h1=IV1, h2=IV2, h3=IV3;
-            uint32_t h4=IV4, h5=IV5, h6=IV6, h7=IV7;
+            uint32_t h4=IV4, h5=IV5, h6=IV6_NODE, h7=IV7;
             blake2s_compress(h0,h1,h2,h3,h4,h5,h6,h7,
                              l0,l1,l2,l3,l4,l5,l6,l7,
                              r0,r1,r2,r3,r4,r5,r6,r7,
@@ -454,9 +460,9 @@ __global__ void merkle_tiled_generic_kernel(
                          m8,m9,m10,m11,m12,m13,m14,m15,
                          n_cols * 4, 0xFFFFFFFF);
 
-        // Merge: hash both leaf hashes
+        // Merge: hash both leaf hashes (internal node domain)
         uint32_t ph0=IV0^0x01010020, ph1=IV1, ph2=IV2, ph3=IV3;
-        uint32_t ph4=IV4, ph5=IV5, ph6=IV6, ph7=IV7;
+        uint32_t ph4=IV4, ph5=IV5, ph6=IV6_NODE, ph7=IV7;
         blake2s_compress(ph0,ph1,ph2,ph3,ph4,ph5,ph6,ph7,
                          lh0,lh1,lh2,lh3,lh4,lh5,lh6,lh7,
                          rh0,rh1,rh2,rh3,rh4,rh5,rh6,rh7,
@@ -486,7 +492,7 @@ __global__ void merkle_tiled_generic_kernel(
 
         if (tid < half) {
             uint32_t h0=IV0^0x01010020, h1=IV1, h2=IV2, h3=IV3;
-            uint32_t h4=IV4, h5=IV5, h6=IV6, h7=IV7;
+            uint32_t h4=IV4, h5=IV5, h6=IV6_NODE, h7=IV7;
             blake2s_compress(h0,h1,h2,h3,h4,h5,h6,h7,
                              l0,l1,l2,l3,l4,l5,l6,l7,
                              r0,r1,r2,r3,r4,r5,r6,r7,

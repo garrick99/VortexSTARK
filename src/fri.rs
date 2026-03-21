@@ -282,7 +282,7 @@ pub fn fold_line_cpu(
 /// CPU Merkle root for QM31 SoA4 data. Returns 8-word Blake2s root.
 /// Produces the same hashes as the GPU Merkle kernels.
 pub fn merkle_root_cpu(values: &[QM31]) -> [u32; 8] {
-    use crate::channel::blake2s_hash;
+    use crate::channel::{blake2s_hash, blake2s_hash_node};
 
     let n = values.len();
     assert!(n.is_power_of_two() && n >= 1);
@@ -303,7 +303,7 @@ pub fn merkle_root_cpu(values: &[QM31]) -> [u32; 8] {
         })
         .collect();
 
-    // Hash nodes bottom-up
+    // Hash nodes bottom-up (internal node domain separation)
     while hashes.len() > 1 {
         let parent_count = hashes.len() / 2;
         hashes = (0..parent_count)
@@ -311,7 +311,7 @@ pub fn merkle_root_cpu(values: &[QM31]) -> [u32; 8] {
                 let mut input = [0u8; 64];
                 input[..32].copy_from_slice(&hashes[2 * i]);
                 input[32..64].copy_from_slice(&hashes[2 * i + 1]);
-                blake2s_hash(&input)
+                blake2s_hash_node(&input)
             })
             .collect();
     }
