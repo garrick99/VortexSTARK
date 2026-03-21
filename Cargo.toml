@@ -13,7 +13,7 @@ name = "vortexstark"
 path = "src/lib.rs"
 
 [[bin]]
-name = "kraken-bench"
+name = "vortex-bench"
 path = "src/bin/bench.rs"
 
 [[bin]]

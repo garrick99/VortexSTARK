@@ -80,7 +80,7 @@ fn main() {
     }
 
     // Link objects into static library
-    let lib_name = "kraken_cuda";
+    let lib_name = "vortex_cuda";
     if is_windows {
         let lib_path = out_dir.join(format!("{lib_name}.lib"));
         let mut args = vec![format!("/OUT:{}", lib_path.display())];
