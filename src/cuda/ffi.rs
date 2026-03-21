@@ -90,9 +90,9 @@ pub fn vram_preflight_check() {
 
     if used_mb > 512 {
         eprintln!("[VRAM] WARNING: {used_mb} MB already in use by another process.");
-        eprintln!("[VRAM] Another GPU workload may be running (PrimePulse, training, etc).");
+        eprintln!("[VRAM] Another GPU workload may be running.");
         eprintln!("[VRAM] VortexSTARK needs up to 28 GB for large proofs (log_n>=27).");
-        eprintln!("[VRAM] Proceeding, but large proofs may OOM. Kill other GPU processes first.");
+        eprintln!("[VRAM] Proceeding, but large proofs may OOM. Stop other GPU processes first.");
     }
 }
 

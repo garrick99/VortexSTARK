@@ -79,9 +79,10 @@ td.mono { font-size:13px; }
   <div class="panel">
     <h2>Live Proof Demo</h2>
     <div class="controls">
-      <select id="proof-type">
+      <select id="proof-type" onchange="onProofTypeChange()">
         <option value="fibonacci">Fibonacci STARK</option>
         <option value="cairo">Cairo VM STARK</option>
+        <option value="pedersen">Pedersen CPU vs GPU</option>
       </select>
       <select id="log-n">
         <option value="16">log_n=16 (65K)</option>
@@ -91,6 +92,11 @@ td.mono { font-size:13px; }
         <option value="26">log_n=26 (67M)</option>
         <option value="28">log_n=28 (268M)</option>
         <option value="30">log_n=30 (1.07B)</option>
+      </select>
+      <select id="ped-n" style="display:none">
+        <option value="1000">1K hashes</option>
+        <option value="10000" selected>10K hashes</option>
+        <option value="100000">100K hashes</option>
       </select>
       <button class="primary" id="btn-prove" onclick="startProve()">Prove</button>
       <span id="prove-status"></span>
@@ -122,18 +128,7 @@ td.mono { font-size:13px; }
       <div class="gauge-label"><span>Temperature</span><span id="temp-text">--C</span></div>
       <div class="gauge-track"><div class="gauge-fill" id="temp-fill" style="width:0%;background:var(--green)"></div></div>
     </div>
-    <div style="margin-top:20px;">
-      <h2>Pedersen: CPU vs GPU</h2>
-      <div class="controls">
-        <select id="ped-n">
-          <option value="1000">1K hashes</option>
-          <option value="10000" selected>10K hashes</option>
-          <option value="100000">100K hashes</option>
-        </select>
-        <button class="primary" id="btn-ped" onclick="startPedersen()">Compare</button>
-      </div>
-      <div id="ped-result"></div>
-    </div>
+    <div id="ped-result" style="margin-top:20px;"></div>
   </div>
 
   <!-- Bottom row: Benchmark History -->
@@ -213,13 +208,12 @@ function handleMessage(msg) {
       break;
     case 'pedersen_compare':
       showPedersen(msg);
-      document.getElementById('btn-ped').disabled = false;
+      document.getElementById('btn-prove').disabled = false;
       break;
     case 'error':
       log(`ERROR  ${msg.message}`, 'red');
       document.getElementById('prove-status').innerHTML = `<span class="status fail">ERROR</span>`;
       document.getElementById('btn-prove').disabled = false;
-      document.getElementById('btn-ped').disabled = false;
       break;
   }
 }
@@ -291,29 +285,36 @@ function fmtRate(r) {
   return r.toFixed(0);
 }
 
+function onProofTypeChange() {
+  const pt = document.getElementById('proof-type').value;
+  document.getElementById('log-n').style.display = pt === 'pedersen' ? 'none' : '';
+  document.getElementById('ped-n').style.display = pt === 'pedersen' ? '' : 'none';
+  document.getElementById('btn-prove').textContent = pt === 'pedersen' ? 'Compare' : 'Prove';
+}
+
 function startProve() {
   const proofType = document.getElementById('proof-type').value;
-  const logN = parseInt(document.getElementById('log-n').value);
   document.getElementById('btn-prove').disabled = true;
   document.getElementById('phase-body').innerHTML = '';
   document.getElementById('prove-result').innerHTML = '';
   maxPhaseMs = 0;
-  fetch('/api/prove', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({proof_type: proofType, log_n: logN})
-  }).catch(e => log('Fetch error: ' + e));
-}
 
-function startPedersen() {
-  const n = parseInt(document.getElementById('ped-n').value);
-  document.getElementById('btn-ped').disabled = true;
-  document.getElementById('ped-result').innerHTML = '<span class="status running">RUNNING...</span>';
-  fetch('/api/pedersen-compare', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({n: n})
-  }).catch(e => log('Fetch error: ' + e));
+  if (proofType === 'pedersen') {
+    const n = parseInt(document.getElementById('ped-n').value);
+    document.getElementById('ped-result').innerHTML = '<span class="status running">RUNNING...</span>';
+    fetch('/api/pedersen-compare', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({n: n})
+    }).catch(e => log('Fetch error: ' + e));
+  } else {
+    const logN = parseInt(document.getElementById('log-n').value);
+    fetch('/api/prove', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({proof_type: proofType, log_n: logN})
+    }).catch(e => log('Fetch error: ' + e));
+  }
 }
 
 connect();
