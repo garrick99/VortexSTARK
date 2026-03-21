@@ -47,13 +47,6 @@ td.mono { font-size:13px; }
 .gauge-fill.vram { background:var(--accent); }
 .gauge-fill.util { background:var(--green); }
 .gauge-fill.power { background:var(--orange); }
-.compare-bar { display:flex; align-items:center; gap:10px; margin:8px 0; }
-.compare-bar .label { width:120px; font-size:12px; color:var(--dim); text-align:right; }
-.compare-bar .bar { height:24px; border-radius:3px; transition:width .6s ease; min-width:4px; }
-.compare-bar .bar.cpu { background:var(--orange); }
-.compare-bar .bar.gpu { background:var(--green); }
-.compare-bar .rate { font-size:12px; color:var(--text); min-width:100px; }
-.speedup-num { font-size:28px; font-weight:700; color:var(--green); text-align:center; margin:12px 0; }
 .log { background:var(--bg); border:1px solid var(--border); border-radius:4px; padding:10px; font-size:11px; color:var(--dim); max-height:150px; overflow-y:auto; margin-top:12px; white-space:pre; line-height:1.6; }
 .bottom-row { grid-column:1/-1; display:grid; grid-template-columns:1fr 1fr; gap:16px; }
 @media(max-width:900px) { .bottom-row { grid-template-columns:1fr; } }
@@ -128,23 +121,31 @@ td.mono { font-size:13px; }
       <div class="gauge-label"><span>Temperature</span><span id="temp-text">--C</span></div>
       <div class="gauge-track"><div class="gauge-fill" id="temp-fill" style="width:0%;background:var(--green)"></div></div>
     </div>
-    <div id="ped-result" style="margin-top:20px;"></div>
   </div>
 
   <!-- Bottom row: Benchmark History -->
   <div class="bottom-row">
     <div class="panel">
-      <h2>Fibonacci STARK Benchmarks</h2>
+      <h2>Fibonacci STARK</h2>
       <table>
         <thead><tr><th>log_n</th><th>Elements</th><th>Prove</th><th>Verify</th><th>Status</th></tr></thead>
         <tbody id="fib-bench"></tbody>
       </table>
     </div>
     <div class="panel">
-      <h2>Cairo VM STARK Benchmarks</h2>
+      <h2>Cairo VM STARK</h2>
       <table>
         <thead><tr><th>log_n</th><th>Steps</th><th>Prove</th><th>Verify</th><th>Status</th></tr></thead>
         <tbody id="cairo-bench"></tbody>
+      </table>
+    </div>
+  </div>
+  <div class="bottom-row">
+    <div class="panel" style="grid-column:1/-1;">
+      <h2>Pedersen Hash: CPU vs GPU</h2>
+      <table>
+        <thead><tr><th>Hashes</th><th>CPU Time</th><th>GPU Time</th><th>CPU Rate</th><th>GPU Rate</th><th>Speedup</th></tr></thead>
+        <tbody id="ped-bench"></tbody>
       </table>
     </div>
   </div>
@@ -217,6 +218,7 @@ function handleMessage(msg) {
       document.getElementById('btn-prove').disabled = false;
       break;
     case 'pedersen_compare':
+      document.getElementById('prove-status').innerHTML = '';
       showPedersen(msg);
       document.getElementById('btn-prove').disabled = false;
       break;
@@ -272,13 +274,23 @@ function addBenchRow(msg) {
 }
 
 function showPedersen(msg) {
-  const maxRate = Math.max(msg.cpu_rate, msg.gpu_rate);
-  const cpuW = Math.max(1, msg.cpu_rate / maxRate * 100);
-  const gpuW = Math.max(1, msg.gpu_rate / maxRate * 100);
-  document.getElementById('ped-result').innerHTML =
-    `<div class="speedup-num">${fmtNum(Math.round(msg.speedup))}x speedup</div>`+
-    `<div class="compare-bar"><div class="label">CPU (${msg.cpu_threads}T)</div><div class="bar cpu" style="width:${cpuW}%"></div><div class="rate">${fmtRate(msg.cpu_rate)}/s</div></div>`+
-    `<div class="compare-bar"><div class="label">GPU (${gpuName})</div><div class="bar gpu" style="width:${gpuW}%"></div><div class="rate">${fmtRate(msg.gpu_rate)}/s</div></div>`;
+  const cpuMs = msg.n / msg.cpu_rate * 1000;
+  const gpuMs = msg.n / msg.gpu_rate * 1000;
+  // Phase table
+  addPhase(`CPU (${msg.cpu_threads}T)`, cpuMs);
+  addPhase(`GPU (${gpuName})`, gpuMs);
+  // Result line (same area as prove results)
+  document.getElementById('prove-result').innerHTML =
+    `<span class="status ok">${fmtNum(Math.round(msg.speedup))}x SPEEDUP</span> &nbsp; `+
+    `CPU: <b>${fmtRate(msg.cpu_rate)}/s</b> &nbsp; GPU: <b>${fmtRate(msg.gpu_rate)}/s</b>`;
+  // Event log
+  log(`PEDERSEN  ${fmtNum(msg.n)} hashes  CPU ${fmtRate(msg.cpu_rate)}/s  GPU ${fmtRate(msg.gpu_rate)}/s  ${Math.round(msg.speedup)}x`, 'green');
+  // Benchmark table
+  const tbody = document.getElementById('ped-bench');
+  const tr = document.createElement('tr');
+  tr.className = 'fade-in';
+  tr.innerHTML = `<td>${fmtNum(msg.n)}</td><td class="mono">${fmtMs(cpuMs)}</td><td class="mono">${fmtMs(gpuMs)}</td><td class="mono">${fmtRate(msg.cpu_rate)}/s</td><td class="mono">${fmtRate(msg.gpu_rate)}/s</td><td><span class="status ok">${fmtNum(Math.round(msg.speedup))}x</span></td>`;
+  tbody.appendChild(tr);
 }
 
 function fmtMs(ms) {
@@ -336,7 +348,8 @@ function startProve() {
 
   if (proofType === 'pedersen') {
     const n = parseInt(document.getElementById('ped-n').value);
-    document.getElementById('ped-result').innerHTML = '<span class="status running">RUNNING...</span>';
+    document.getElementById('prove-status').innerHTML = '<span class="status running">COMPARING...</span>';
+    log(`PEDERSEN  ${fmtNum(n)} hashes  starting...`, 'accent');
     fetch('/api/pedersen-compare', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
