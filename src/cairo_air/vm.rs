@@ -191,6 +191,13 @@ pub fn execute_to_columns(memory: &mut Memory, n_steps: usize, log_n: u32) -> Ve
             cols[COL_OP1][i] = to_m31(op1);
             cols[COL_RES][i] = to_m31(res);
 
+            // New columns: raw offsets and dst_inv
+            cols[COL_OFF0][i] = (encoded & 0xFFFF) as u32;
+            cols[COL_OFF1][i] = ((encoded >> 16) & 0xFFFF) as u32;
+            cols[COL_OFF2][i] = ((encoded >> 32) & 0xFFFF) as u32;
+            let dst_val_for_inv = to_m31(res);
+            cols[COL_DST_INV][i] = if dst_val_for_inv == 0 { 0 } else { crate::field::M31(dst_val_for_inv).inverse().0 };
+
             state.pc += 1;
             state.ap += 1;
             continue;
@@ -279,6 +286,13 @@ pub fn execute_to_columns(memory: &mut Memory, n_steps: usize, log_n: u32) -> Ve
         cols[COL_OP1_ADDR][i] = to_m31(op1_addr);
         cols[COL_OP1][i] = to_m31(op1);
         cols[COL_RES][i] = to_m31(res);
+
+        // New columns: raw offsets and dst_inv
+        cols[COL_OFF0][i] = (encoded & 0xFFFF) as u32;
+        cols[COL_OFF1][i] = ((encoded >> 16) & 0xFFFF) as u32;
+        cols[COL_OFF2][i] = ((encoded >> 32) & 0xFFFF) as u32;
+        let dst_m31 = to_m31(dst);
+        cols[COL_DST_INV][i] = if dst_m31 == 0 { 0 } else { crate::field::M31(dst_m31).inverse().0 };
 
         state = CairoState { pc: next_pc, ap: next_ap, fp: next_fp };
     }
@@ -398,6 +412,13 @@ pub fn execute_to_columns_into(
         cols[COL_OP1_ADDR][i] = to_m31(op1_addr);
         cols[COL_OP1][i] = to_m31(op1);
         cols[COL_RES][i] = to_m31(res);
+
+        // New columns: raw offsets and dst_inv
+        cols[COL_OFF0][i] = (encoded & 0xFFFF) as u32;
+        cols[COL_OFF1][i] = ((encoded >> 16) & 0xFFFF) as u32;
+        cols[COL_OFF2][i] = ((encoded >> 32) & 0xFFFF) as u32;
+        let dst_m31 = to_m31(dst);
+        cols[COL_DST_INV][i] = if dst_m31 == 0 { 0 } else { crate::field::M31(dst_m31).inverse().0 };
 
         state = CairoState { pc: next_pc, ap: next_ap, fp: next_fp };
     }

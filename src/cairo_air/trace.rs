@@ -25,13 +25,19 @@
 //!   25: op1
 //!   26: res
 //!
-//! Total: 27 columns
+//! Offsets & inverse (4):
+//!   27: off0 (raw 16-bit offset from instruction)
+//!   28: off1
+//!   29: off2
+//!   30: dst_inv (M31 inverse of dst, 0 if dst=0)
+//!
+//! Total: 31 columns
 
 use crate::field::m31::P;
 use super::vm::TraceRow;
 
 /// Number of trace columns.
-pub const N_COLS: usize = 27;
+pub const N_COLS: usize = 31;
 
 /// Column indices.
 pub const COL_PC: usize = 0;
@@ -48,6 +54,10 @@ pub const COL_OP0: usize = 23;
 pub const COL_OP1_ADDR: usize = 24;
 pub const COL_OP1: usize = 25;
 pub const COL_RES: usize = 26;
+pub const COL_OFF0: usize = 27;
+pub const COL_OFF1: usize = 28;
+pub const COL_OFF2: usize = 29;
+pub const COL_DST_INV: usize = 30;
 
 /// Convert execution trace to columnar M31 format.
 /// Returns N_COLS vectors, each of length `trace.len()`, padded to power of 2.
@@ -85,6 +95,14 @@ pub fn trace_to_columns(trace: &[TraceRow], log_n: u32) -> Vec<Vec<u32>> {
         cols[COL_OP1_ADDR][i] = to_m31(row.op1_addr);
         cols[COL_OP1][i] = to_m31(row.op1);
         cols[COL_RES][i] = to_m31(row.res);
+
+        // New columns: raw offsets from instruction encoding
+        cols[COL_OFF0][i] = (row.instruction & 0xFFFF) as u32;
+        cols[COL_OFF1][i] = ((row.instruction >> 16) & 0xFFFF) as u32;
+        cols[COL_OFF2][i] = ((row.instruction >> 32) & 0xFFFF) as u32;
+        // dst_inv: M31 inverse of dst (0 if dst is 0)
+        let dst_m31 = to_m31(row.dst);
+        cols[COL_DST_INV][i] = if dst_m31 == 0 { 0 } else { crate::field::M31(dst_m31).inverse().0 };
     }
 
     cols
@@ -127,11 +145,11 @@ pub fn eval_transition_constraints(
 
     // Flag values
     let f = |i: usize| -> M31 { val(COL_FLAGS_START + i, row) };
-    let _dst_reg = f(0);
-    let _op0_reg = f(1);
-    let _op1_imm = f(2);
-    let _op1_fp = f(3);
-    let _op1_ap = f(4);
+    let dst_reg = f(0);
+    let op0_reg = f(1);
+    let op1_imm = f(2);
+    let op1_fp = f(3);
+    let op1_ap = f(4);
     let res_add = f(5);
     let res_mul = f(6);
     let pc_jump_abs = f(7);
@@ -163,7 +181,7 @@ pub fn eval_transition_constraints(
     //            + pc_jump_rel * (pc + res)
     //            + pc_jnz * (pc + jnz_target)
     // Simplified: instruction_size = 1 + op1_imm
-    let inst_size = one + _op1_imm;
+    let inst_size = one + op1_imm;
     let pc_default = pc + inst_size;
     let pc_regular = (one - pc_jump_abs - pc_jump_rel - pc_jnz) * pc_default;
     let pc_abs = pc_jump_abs * res;
@@ -195,11 +213,51 @@ pub fn eval_transition_constraints(
     // 6. Assert_eq: dst = res (when opcode_assert is set)
     constraints.push(opcode_assert * (dst - res));
 
+    // --- New soundness constraints (20-29) ---
+    let off0 = val(COL_OFF0, row);
+    let off1 = val(COL_OFF1, row);
+    let off2 = val(COL_OFF2, row);
+    let dst_inv = val(COL_DST_INV, row);
+
+    // 20: dst_addr = (1-dst_reg)*ap + dst_reg*fp + off0 - 0x8000
+    let dst_addr_col = val(COL_DST_ADDR, row);
+    let expected_dst_addr = (one - dst_reg) * ap + dst_reg * fp + off0 - M31(0x8000);
+    constraints.push(dst_addr_col - expected_dst_addr);
+
+    // 21: op0_addr = (1-op0_reg)*ap + op0_reg*fp + off1 - 0x8000
+    let op0_addr_col = val(COL_OP0_ADDR, row);
+    let expected_op0_addr = (one - op0_reg) * ap + op0_reg * fp + off1 - M31(0x8000);
+    constraints.push(op0_addr_col - expected_op0_addr);
+
+    // 22: op1_addr verification
+    let op1_addr_col = val(COL_OP1_ADDR, row);
+    let op1_default = one - op1_imm - op1_fp - op1_ap;
+    let op1_base = op1_imm * pc + op1_fp * fp + op1_ap * ap + op1_default * M31(op0.0);
+    let expected_op1_addr = op1_base + off2 - M31(0x8000);
+    constraints.push(op1_addr_col - expected_op1_addr);
+
+    // 23: JNZ fall-through: when jnz and dst=0, next_pc must be pc+inst_size
+    constraints.push(pc_jnz * (one - dst * dst_inv) * (next_pc - pc - inst_size));
+
+    // 24: JNZ inverse consistency: if jnz and dst!=0, dst*dst_inv must be 1
+    constraints.push(pc_jnz * dst * (one - dst * dst_inv));
+
+    // 25-27: Op1 source mutual exclusivity (pairwise products = 0)
+    constraints.push(op1_imm * op1_fp);
+    constraints.push(op1_imm * op1_ap);
+    constraints.push(op1_fp * op1_ap);
+
+    // 28: PC update mutual exclusivity
+    constraints.push(pc_jump_abs * pc_jump_rel + pc_jump_abs * pc_jnz + pc_jump_rel * pc_jnz);
+
+    // 29: Opcode mutual exclusivity
+    constraints.push(opcode_call * opcode_ret + opcode_call * opcode_assert + opcode_ret * opcode_assert);
+
     constraints
 }
 
 /// Number of transition constraints.
-pub const N_CONSTRAINTS: usize = 15 + 1 + 1 + 1 + 1 + 1; // 20
+pub const N_CONSTRAINTS: usize = 15 + 1 + 1 + 1 + 1 + 1 + 10; // 30
 
 #[cfg(test)]
 mod tests {

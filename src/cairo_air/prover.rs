@@ -1,7 +1,7 @@
 //! End-to-end Cairo STARK prover and verifier.
 //!
 //! Produces a complete proof of Cairo program execution:
-//! 1. VM execution → 27-column trace
+//! 1. VM execution → 31-column trace
 //! 2. Optional GPU Pedersen builtin → 27 more columns
 //! 3. NTT + Merkle commitment
 //! 4. Fiat-Shamir challenges
@@ -30,10 +30,9 @@ use super::trace::{N_COLS, N_CONSTRAINTS, COL_PC, COL_INST_LO, COL_INST_HI,
 const LOGUP_COLS: [usize; 8] = [COL_PC, COL_INST_LO, COL_DST_ADDR, COL_DST,
     COL_OP0_ADDR, COL_OP0, COL_OP1_ADDR, COL_OP1];
 
-/// Columns NOT read by the quotient kernel (address cols + instruction encoding).
-/// Freeing these before quotient allocation saves ~5 GiB VRAM.
-const QUOTIENT_UNUSED_COLS: [usize; 5] = [COL_INST_LO, COL_INST_HI, COL_DST_ADDR,
-    COL_OP0_ADDR, COL_OP1_ADDR];
+/// Columns NOT read by the quotient kernel (instruction encoding only).
+/// Address columns (DST_ADDR, OP0_ADDR, OP1_ADDR) are now used by soundness constraints.
+const QUOTIENT_UNUSED_COLS: [usize; 2] = [COL_INST_LO, COL_INST_HI];
 use super::vm::Memory;
 use super::ec_constraint;
 
@@ -58,7 +57,7 @@ pub struct CairoProof {
     pub log_trace_size: u32,
     /// Public inputs (verified by both prover and verifier)
     pub public_inputs: CairoPublicInputs,
-    /// Merkle root: VM trace (27 columns)
+    /// Merkle root: VM trace (31 columns)
     pub trace_commitment: [u32; 8],
     /// Merkle root: LogUp interaction trace (4 QM31 columns)
     pub interaction_commitment: [u32; 8],
@@ -75,7 +74,7 @@ pub struct CairoProof {
     pub fri_last_layer: Vec<QM31>,
     /// Query indices
     pub query_indices: Vec<usize>,
-    /// Trace values at query points (27 M31 values per query)
+    /// Trace values at query points (31 M31 values per query)
     pub trace_values_at_queries: Vec<[u32; N_COLS]>,
     /// Trace values at query+1 points (for next-row constraints)
     pub trace_values_at_queries_next: Vec<[u32; N_COLS]>,
@@ -360,9 +359,9 @@ pub fn cairo_prove_cached(
     let constraint_alphas: Vec<QM31> = (0..N_CONSTRAINTS).map(|_| channel.draw_felt()).collect();
     let alpha_flat: Vec<u32> = constraint_alphas.iter().flat_map(|a| a.to_u32_array()).collect();
 
-    // Re-upload only the 22 columns the quotient kernel actually reads.
-    // The 5 unused columns (INST_LO, INST_HI, DST_ADDR, OP0_ADDR, OP1_ADDR)
-    // get a dummy pointer — the kernel never dereferences them.
+    // Re-upload only the 29 columns the quotient kernel actually reads.
+    // The 2 unused columns (INST_LO, INST_HI) get a dummy pointer —
+    // the kernel never dereferences them.
     let unused_set: std::collections::HashSet<usize> = QUOTIENT_UNUSED_COLS.iter().copied().collect();
     let mut d_quot_cols: Vec<DeviceBuffer<u32>> = Vec::with_capacity(N_COLS);
     let d_dummy = DeviceBuffer::<u32>::alloc(1); // 4-byte valid pointer for unused slots
@@ -688,14 +687,14 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
     }
 
     // ---- FIX #1: Verify constraint evaluation at query points ----
-    // The verifier independently evaluates the 20 Cairo constraints and checks
+    // The verifier independently evaluates the 30 Cairo constraints and checks
     // they match the quotient values. This closes the critical soundness gap.
     let constraint_alphas = constraint_alphas_drawn;
     for (q, &qi) in proof.query_indices.iter().enumerate() {
         let row = &proof.trace_values_at_queries[q];
         let next = &proof.trace_values_at_queries_next[q];
 
-        // Evaluate all 20 constraints (same logic as cuda_cairo_quotient kernel)
+        // Evaluate all 30 constraints (same logic as cuda_cairo_quotient kernel)
         let mut constraint_sum = QM31::ZERO;
         let mut ci = 0;
 
@@ -766,7 +765,99 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
             constraint_sum = constraint_sum + constraint_alphas[ci] * c;
             ci += 1;
         }
-        let _ = ci; // all 20 constraints evaluated
+
+        // --- New soundness constraints 20-29 ---
+
+        // Constraint 20: dst_addr verification
+        {
+            let dst_reg = M31(row[5]);
+            let off0 = M31(row[27]);
+            let dst_addr_val = M31(row[20]);
+            let one = M31(1);
+            let expected = (one - dst_reg) * ap + dst_reg * fp + off0 - M31(0x8000);
+            let c = dst_addr_val - expected;
+            constraint_sum = constraint_sum + constraint_alphas[ci] * c;
+            ci += 1;
+        }
+
+        // Constraint 21: op0_addr verification
+        {
+            let op0_reg = M31(row[6]);
+            let off1 = M31(row[28]);
+            let op0_addr_val = M31(row[22]);
+            let one = M31(1);
+            let expected = (one - op0_reg) * ap + op0_reg * fp + off1 - M31(0x8000);
+            let c = op0_addr_val - expected;
+            constraint_sum = constraint_sum + constraint_alphas[ci] * c;
+            ci += 1;
+        }
+
+        // Constraint 22: op1_addr verification
+        {
+            let op1_imm_f = M31(row[7]);
+            let op1_fp_f = M31(row[8]);
+            let op1_ap_f = M31(row[9]);
+            let off2 = M31(row[29]);
+            let op1_addr_val = M31(row[24]);
+            let one = M31(1);
+            let op1_default = one - op1_imm_f - op1_fp_f - op1_ap_f;
+            let base = op1_imm_f * pc + op1_fp_f * fp + op1_ap_f * ap + op1_default * op0;
+            let expected = base + off2 - M31(0x8000);
+            let c = op1_addr_val - expected;
+            constraint_sum = constraint_sum + constraint_alphas[ci] * c;
+            ci += 1;
+        }
+
+        // Constraint 23: JNZ fall-through
+        {
+            let dst_inv = M31(row[30]);
+            let one = M31(1);
+            let inst_size = one + f_op1_imm;
+            let c = f_pc_jnz * (one - dst * dst_inv) * (next_pc - pc - inst_size);
+            constraint_sum = constraint_sum + constraint_alphas[ci] * c;
+            ci += 1;
+        }
+
+        // Constraint 24: JNZ inverse consistency
+        {
+            let dst_inv = M31(row[30]);
+            let one = M31(1);
+            let c = f_pc_jnz * dst * (one - dst * dst_inv);
+            constraint_sum = constraint_sum + constraint_alphas[ci] * c;
+            ci += 1;
+        }
+
+        // Constraints 25-27: Op1 source exclusivity
+        {
+            let c = f_op1_imm * M31(row[8]); // op1_imm * op1_fp
+            constraint_sum = constraint_sum + constraint_alphas[ci] * c;
+            ci += 1;
+        }
+        {
+            let c = f_op1_imm * M31(row[9]); // op1_imm * op1_ap
+            constraint_sum = constraint_sum + constraint_alphas[ci] * c;
+            ci += 1;
+        }
+        {
+            let c = M31(row[8]) * M31(row[9]); // op1_fp * op1_ap
+            constraint_sum = constraint_sum + constraint_alphas[ci] * c;
+            ci += 1;
+        }
+
+        // Constraint 28: PC update exclusivity
+        {
+            let c = f_pc_jump_abs * f_pc_jump_rel + f_pc_jump_abs * f_pc_jnz + f_pc_jump_rel * f_pc_jnz;
+            constraint_sum = constraint_sum + constraint_alphas[ci] * c;
+            ci += 1;
+        }
+
+        // Constraint 29: Opcode exclusivity
+        {
+            let c = f_call * f_ret + f_call * f_assert + f_ret * f_assert;
+            constraint_sum = constraint_sum + constraint_alphas[ci] * c;
+            ci += 1;
+        }
+        let _ = ci; // all 30 constraints evaluated
 
         // The GPU quotient kernel outputs the raw alpha-weighted constraint sum
         // (no zerofier division). So the committed quotient value at this point

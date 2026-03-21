@@ -1,6 +1,6 @@
 // GPU constraint evaluation for Cairo VM AIR.
 //
-// 27 trace columns, 20 transition constraints.
+// 31 trace columns, 30 transition constraints.
 // Each thread evaluates all constraints for one row, combining with
 // alpha coefficients into a single QM31 quotient value.
 //
@@ -15,9 +15,9 @@
 
 #include "include/qm31.cuh"
 
-#define CAIRO_N_COLS 27
+#define CAIRO_N_COLS 31
 #define CAIRO_N_FLAGS 15
-#define CAIRO_N_CONSTRAINTS 20
+#define CAIRO_N_CONSTRAINTS 30
 #define COL_PC 0
 #define COL_AP 1
 #define COL_FP 2
@@ -26,9 +26,16 @@
 #define COL_OP1 25
 #define COL_RES 26
 #define COL_FLAGS 5
+#define COL_OFF0 27
+#define COL_OFF1 28
+#define COL_OFF2 29
+#define COL_DST_INV 30
+#define COL_DST_ADDR 20
+#define COL_OP0_ADDR 22
+#define COL_OP1_ADDR 24
 
 __global__ void cairo_quotient_kernel(
-    const uint32_t* const* __restrict__ trace_cols,  // [27] column pointers
+    const uint32_t* const* __restrict__ trace_cols,  // [31] column pointers
     uint32_t* __restrict__ out0, uint32_t* __restrict__ out1,
     uint32_t* __restrict__ out2, uint32_t* __restrict__ out3,
     const uint32_t* __restrict__ alpha_coeffs,  // [N_CONSTRAINTS * 4] QM31 coefficients
@@ -177,6 +184,105 @@ __global__ void cairo_quotient_kernel(
         ci++;
     }
 
+    // --- New soundness constraints 20-29 ---
+    // Load new columns
+    uint32_t off0 = trace_cols[COL_OFF0][i];
+    uint32_t off1 = trace_cols[COL_OFF1][i];
+    uint32_t off2 = trace_cols[COL_OFF2][i];
+    uint32_t dst_inv = trace_cols[COL_DST_INV][i];
+    uint32_t dst_addr = trace_cols[COL_DST_ADDR][i];
+    uint32_t op0_addr = trace_cols[COL_OP0_ADDR][i];
+    uint32_t op1_addr = trace_cols[COL_OP1_ADDR][i];
+    uint32_t f_dst_reg = flags[0];
+    uint32_t f_op0_reg = flags[1];
+    uint32_t f_op1_fp = flags[3];
+    uint32_t f_op1_ap = flags[4];
+
+    uint32_t BIAS = 0x8000;
+
+    // Constraint 20: dst_addr verification
+    {
+        uint32_t base = m31_add(m31_mul(m31_sub(1, f_dst_reg), ap), m31_mul(f_dst_reg, fp));
+        uint32_t expected = m31_sub(m31_add(base, off0), BIAS);
+        uint32_t c = m31_sub(dst_addr, expected);
+        QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+        quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
+    }
+
+    // Constraint 21: op0_addr verification
+    {
+        uint32_t base = m31_add(m31_mul(m31_sub(1, f_op0_reg), ap), m31_mul(f_op0_reg, fp));
+        uint32_t expected = m31_sub(m31_add(base, off1), BIAS);
+        uint32_t c = m31_sub(op0_addr, expected);
+        QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+        quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
+    }
+
+    // Constraint 22: op1_addr verification
+    {
+        uint32_t op1_default = m31_sub(m31_sub(m31_sub(1, f_op1_imm), f_op1_fp), f_op1_ap);
+        uint32_t base = m31_add(m31_add(m31_add(
+            m31_mul(f_op1_imm, pc), m31_mul(f_op1_fp, fp)),
+            m31_mul(f_op1_ap, ap)), m31_mul(op1_default, op0));
+        uint32_t expected = m31_sub(m31_add(base, off2), BIAS);
+        uint32_t c = m31_sub(op1_addr, expected);
+        QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+        quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
+    }
+
+    // Constraint 23: JNZ fall-through
+    {
+        uint32_t inst_size_c = m31_add(1, f_op1_imm);
+        uint32_t dst_x_inv = m31_mul(dst, dst_inv);
+        uint32_t c = m31_mul(f_pc_jnz, m31_mul(m31_sub(1, dst_x_inv), m31_sub(next_pc, m31_add(pc, inst_size_c))));
+        QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+        quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
+    }
+
+    // Constraint 24: JNZ inverse consistency
+    {
+        uint32_t c = m31_mul(f_pc_jnz, m31_mul(dst, m31_sub(1, m31_mul(dst, dst_inv))));
+        QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+        quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
+    }
+
+    // Constraint 25-27: Op1 source exclusivity
+    {
+        uint32_t c = m31_mul(f_op1_imm, f_op1_fp);
+        QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+        quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
+    }
+    {
+        uint32_t c = m31_mul(f_op1_imm, f_op1_ap);
+        QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+        quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
+    }
+    {
+        uint32_t c = m31_mul(f_op1_fp, f_op1_ap);
+        QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+        quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
+    }
+
+    // Constraint 28: PC update exclusivity
+    {
+        uint32_t c = m31_add(m31_add(
+            m31_mul(f_pc_jump_abs, f_pc_jump_rel),
+            m31_mul(f_pc_jump_abs, f_pc_jnz)),
+            m31_mul(f_pc_jump_rel, f_pc_jnz));
+        QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+        quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
+    }
+
+    // Constraint 29: Opcode exclusivity
+    {
+        uint32_t c = m31_add(m31_add(
+            m31_mul(f_call, f_ret),
+            m31_mul(f_call, f_assert)),
+            m31_mul(f_ret, f_assert));
+        QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+        quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
+    }
+
     out0[i] = quotient.v[0];
     out1[i] = quotient.v[1];
     out2[i] = quotient.v[2];
@@ -265,6 +371,98 @@ __global__ void cairo_quotient_chunk_kernel(
         uint32_t c = m31_mul(f_assert, m31_sub(dst, res));
         QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
         quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
+    }
+
+    // --- New soundness constraints 20-29 (chunk kernel) ---
+    {
+        uint32_t off0_v = trace_cols[COL_OFF0][i];
+        uint32_t off1_v = trace_cols[COL_OFF1][i];
+        uint32_t off2_v = trace_cols[COL_OFF2][i];
+        uint32_t dst_inv_v = trace_cols[COL_DST_INV][i];
+        uint32_t dst_addr_v = trace_cols[COL_DST_ADDR][i];
+        uint32_t op0_addr_v = trace_cols[COL_OP0_ADDR][i];
+        uint32_t op1_addr_v = trace_cols[COL_OP1_ADDR][i];
+        uint32_t f_dst_reg = flags[0];
+        uint32_t f_op0_reg = flags[1];
+        uint32_t f_op1_fp_v = flags[3];
+        uint32_t f_op1_ap_v = flags[4];
+        uint32_t BIAS = 0x8000;
+
+        // Constraint 20: dst_addr
+        {
+            uint32_t base = m31_add(m31_mul(m31_sub(1, f_dst_reg), ap), m31_mul(f_dst_reg, fp));
+            uint32_t expected = m31_sub(m31_add(base, off0_v), BIAS);
+            uint32_t c = m31_sub(dst_addr_v, expected);
+            QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+            quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
+        }
+        // Constraint 21: op0_addr
+        {
+            uint32_t base = m31_add(m31_mul(m31_sub(1, f_op0_reg), ap), m31_mul(f_op0_reg, fp));
+            uint32_t expected = m31_sub(m31_add(base, off1_v), BIAS);
+            uint32_t c = m31_sub(op0_addr_v, expected);
+            QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+            quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
+        }
+        // Constraint 22: op1_addr
+        {
+            uint32_t op1_default = m31_sub(m31_sub(m31_sub(1, f_op1_imm), f_op1_fp_v), f_op1_ap_v);
+            uint32_t base = m31_add(m31_add(m31_add(
+                m31_mul(f_op1_imm, pc), m31_mul(f_op1_fp_v, fp)),
+                m31_mul(f_op1_ap_v, ap)), m31_mul(op1_default, op0));
+            uint32_t expected = m31_sub(m31_add(base, off2_v), BIAS);
+            uint32_t c = m31_sub(op1_addr_v, expected);
+            QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+            quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
+        }
+        // Constraint 23: JNZ fall-through
+        {
+            uint32_t inst_size_c = m31_add(1, f_op1_imm);
+            uint32_t dst_x_inv = m31_mul(dst, dst_inv_v);
+            uint32_t c = m31_mul(f_pc_jnz, m31_mul(m31_sub(1, dst_x_inv), m31_sub(next_pc, m31_add(pc, inst_size_c))));
+            QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+            quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
+        }
+        // Constraint 24: JNZ inverse consistency
+        {
+            uint32_t c = m31_mul(f_pc_jnz, m31_mul(dst, m31_sub(1, m31_mul(dst, dst_inv_v))));
+            QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+            quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
+        }
+        // Constraint 25-27: Op1 source exclusivity
+        {
+            uint32_t c = m31_mul(f_op1_imm, f_op1_fp_v);
+            QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+            quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
+        }
+        {
+            uint32_t c = m31_mul(f_op1_imm, f_op1_ap_v);
+            QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+            quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
+        }
+        {
+            uint32_t c = m31_mul(f_op1_fp_v, f_op1_ap_v);
+            QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+            quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
+        }
+        // Constraint 28: PC update exclusivity
+        {
+            uint32_t c = m31_add(m31_add(
+                m31_mul(f_pc_jump_abs, f_pc_jump_rel),
+                m31_mul(f_pc_jump_abs, f_pc_jnz)),
+                m31_mul(f_pc_jump_rel, f_pc_jnz));
+            QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+            quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
+        }
+        // Constraint 29: Opcode exclusivity
+        {
+            uint32_t c = m31_add(m31_add(
+                m31_mul(f_call, f_ret),
+                m31_mul(f_call, f_assert)),
+                m31_mul(f_ret, f_assert));
+            QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+            quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
+        }
     }
 
     out0[local_i] = quotient.v[0];
