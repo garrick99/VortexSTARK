@@ -8,8 +8,16 @@ use std::time::Instant;
 fn main() {
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║           VORTEXSTARK FULL SYSTEM BENCHMARK                ║");
-    println!("║         RTX 5090 · Rust + CUDA · Circle STARK              ║");
+    println!("║              Rust + CUDA · Circle STARK                    ║");
     println!("╚══════════════════════════════════════════════════════════════╝\n");
+
+    // Auto-detect GPU
+    let gpu_info = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=name,memory.total,compute_cap", "--format=csv,noheader"])
+        .output().ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "Unknown GPU".to_string());
+    println!("  GPU: {gpu_info}\n");
 
     ffi::init_memory_pool_greedy();
 
@@ -150,11 +158,10 @@ fn main() {
     println!("  SYSTEM SUMMARY");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  Engine:     GPU-native Circle STARK (M31, 100-bit security)");
-    println!("  GPU:        RTX 5090 (32GB VRAM, SM 12.0 Blackwell)");
-    println!("  Tests:      113 passing");
-    println!("  Builtins:   Poseidon (GPU), Pedersen (CPU), Bitwise");
+    println!("  GPU:        {gpu_info}");
+    println!("  Tests:      148 passing");
+    println!("  Builtins:   Poseidon (GPU), Pedersen (GPU), Bitwise");
     println!("  Features:   LogUp memory consistency, range checks, 2-phase commitment");
     println!("  CLI:        stark_cli prove/verify (binary proof serialization)");
-    println!("  GitHub:     https://github.com/garrick99/VortexSTARK");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 }

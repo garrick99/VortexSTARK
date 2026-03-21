@@ -15,11 +15,13 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 #[derive(Clone, Serialize)]
 struct GpuStats {
+    gpu_name: String,
     vram_used_mb: u64,
     vram_total_mb: u64,
     temp_c: u64,
     util_pct: u64,
     power_w: f64,
+    power_limit_w: f64,
 }
 
 #[derive(Deserialize)]
@@ -214,18 +216,65 @@ fn gpu_pedersen_compare(n: usize, tx: &broadcast::Sender<WsMessage>) {
 
 fn parse_gpu_stats() -> Option<GpuStats> {
     let output = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=memory.used,memory.total,temperature.gpu,utilization.gpu,power.draw",
+        .args(["--query-gpu=name,memory.used,memory.total,temperature.gpu,utilization.gpu,power.draw,power.limit",
                "--format=csv,noheader,nounits"])
         .output().ok()?;
     let s = String::from_utf8_lossy(&output.stdout);
     let parts: Vec<&str> = s.trim().split(',').map(|p| p.trim()).collect();
-    if parts.len() < 5 { return None; }
+    if parts.len() < 7 { return None; }
     Some(GpuStats {
-        vram_used_mb: parts[0].parse().ok()?,
-        vram_total_mb: parts[1].parse().ok()?,
-        temp_c: parts[2].parse().ok()?,
-        util_pct: parts[3].parse().ok()?,
-        power_w: parts[4].parse().ok()?,
+        gpu_name: parts[0].to_string(),
+        vram_used_mb: parts[1].parse().ok()?,
+        vram_total_mb: parts[2].parse().ok()?,
+        temp_c: parts[3].parse().ok()?,
+        util_pct: parts[4].parse().ok()?,
+        power_w: parts[5].parse().ok()?,
+        power_limit_w: parts[6].parse().ok()?,
+    })
+}
+
+fn get_system_info() -> serde_json::Value {
+    // CPU
+    let cpu_name = if cfg!(target_os = "windows") {
+        std::process::Command::new("wmic")
+            .args(["cpu", "get", "name", "/format:value"])
+            .output().ok()
+            .and_then(|o| {
+                let s = String::from_utf8_lossy(&o.stdout).to_string();
+                s.lines().find(|l| l.starts_with("Name=")).map(|l| l.trim_start_matches("Name=").trim().to_string())
+            })
+    } else {
+        std::fs::read_to_string("/proc/cpuinfo").ok()
+            .and_then(|s| s.lines().find(|l| l.starts_with("model name")).map(|l| l.split(':').nth(1).unwrap_or("").trim().to_string()))
+    }.unwrap_or_else(|| "Unknown".to_string());
+
+    // RAM
+    let ram_gb = if cfg!(target_os = "windows") {
+        std::process::Command::new("wmic")
+            .args(["computersystem", "get", "totalphysicalmemory", "/format:value"])
+            .output().ok()
+            .and_then(|o| {
+                let s = String::from_utf8_lossy(&o.stdout).to_string();
+                s.lines().find(|l| l.starts_with("TotalPhysicalMemory="))
+                    .and_then(|l| l.trim_start_matches("TotalPhysicalMemory=").trim().parse::<u64>().ok())
+                    .map(|b| b / (1024 * 1024 * 1024))
+            })
+    } else {
+        std::fs::read_to_string("/proc/meminfo").ok()
+            .and_then(|s| s.lines().find(|l| l.starts_with("MemTotal:"))
+                .and_then(|l| l.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()))
+                .map(|kb| kb / (1024 * 1024)))
+    }.unwrap_or(0);
+
+    // GPU (from first nvidia-smi call)
+    let gpu = parse_gpu_stats();
+
+    serde_json::json!({
+        "cpu": cpu_name,
+        "ram_gb": ram_gb,
+        "gpu_name": gpu.as_ref().map(|g| g.gpu_name.as_str()).unwrap_or("Unknown"),
+        "vram_total_mb": gpu.as_ref().map(|g| g.vram_total_mb).unwrap_or(0),
+        "power_limit_w": gpu.as_ref().map(|g| g.power_limit_w).unwrap_or(0.0),
     })
 }
 
@@ -239,7 +288,18 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) ->
     ws.on_upgrade(move |socket| handle_ws(socket, state))
 }
 
+async fn system_info_handler() -> impl IntoResponse {
+    axum::Json(get_system_info())
+}
+
 async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
+    // Send system info on connect
+    let sys_info = WsMessage {
+        msg_type: "system_info".to_string(),
+        data: get_system_info(),
+    };
+    let _ = socket.send(Message::Text(serde_json::to_string(&sys_info).unwrap_or_default().into())).await;
+
     let mut rx = state.broadcast_tx.subscribe();
     loop {
         tokio::select! {
@@ -356,6 +416,7 @@ async fn main() {
         .route("/api/prove", post(prove_handler))
         .route("/api/pedersen-compare", post(pedersen_handler))
         .route("/api/gpu-stats", get(gpu_stats_handler))
+        .route("/api/system-info", get(system_info_handler))
         .with_state(state);
 
     let addr = "0.0.0.0:8080";

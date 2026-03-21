@@ -66,7 +66,7 @@ td.mono { font-size:13px; }
 <div class="header">
   <h1>Vortex<span>STARK</span></h1>
   <div class="gpu-badge">
-    <span>RTX 5090</span>
+    <span id="hdr-gpu">--</span>
     <span>VRAM: <span class="val" id="hdr-vram">--</span></span>
     <span>Temp: <span class="val" id="hdr-temp">--</span></span>
     <span>Power: <span class="val" id="hdr-power">--</span></span>
@@ -121,7 +121,7 @@ td.mono { font-size:13px; }
       <div class="gauge-track"><div class="gauge-fill util" id="util-fill" style="width:0%"></div></div>
     </div>
     <div class="gauge">
-      <div class="gauge-label"><span>Power</span><span id="power-text">-- / 575W</span></div>
+      <div class="gauge-label"><span>Power</span><span id="power-text">-- / --W</span></div>
       <div class="gauge-track"><div class="gauge-fill power" id="power-fill" style="width:0%"></div></div>
     </div>
     <div class="gauge">
@@ -153,6 +153,8 @@ td.mono { font-size:13px; }
 <script>
 let ws = null;
 let maxPhaseMs = 0;
+let gpuName = '--';
+let powerLimitW = 575;
 
 function log(msg, cls) {
   const el = document.getElementById('event-log');
@@ -185,6 +187,14 @@ function connect() {
 
 function handleMessage(msg) {
   switch(msg.type) {
+    case 'system_info':
+      gpuName = msg.gpu_name || '--';
+      powerLimitW = msg.power_limit_w || 575;
+      document.getElementById('hdr-gpu').textContent = gpuName;
+      if (msg.cpu) log(`CPU: ${msg.cpu}`, 'dim');
+      if (msg.ram_gb) log(`RAM: ${msg.ram_gb} GB`, 'dim');
+      log(`GPU: ${gpuName} (${msg.vram_total_mb || '?'} MB VRAM, ${powerLimitW}W TDP)`, 'accent');
+      break;
     case 'gpu_stats': updateGpu(msg); break;
     case 'proof_started':
       document.getElementById('prove-status').innerHTML = '<span class="status running">PROVING...</span>';
@@ -219,13 +229,15 @@ function handleMessage(msg) {
 }
 
 function updateGpu(s) {
+  if (s.gpu_name && s.gpu_name !== '--') { gpuName = s.gpu_name; document.getElementById('hdr-gpu').textContent = gpuName; }
+  if (s.power_limit_w && s.power_limit_w > 0) powerLimitW = s.power_limit_w;
   const vramPct = (s.vram_used_mb / s.vram_total_mb * 100).toFixed(0);
   document.getElementById('vram-text').textContent = `${s.vram_used_mb} / ${s.vram_total_mb} MB`;
   document.getElementById('vram-fill').style.width = vramPct + '%';
   document.getElementById('util-text').textContent = s.util_pct + '%';
   document.getElementById('util-fill').style.width = s.util_pct + '%';
-  document.getElementById('power-text').textContent = s.power_w.toFixed(0) + ' / 575W';
-  document.getElementById('power-fill').style.width = (s.power_w/575*100).toFixed(0) + '%';
+  document.getElementById('power-text').textContent = s.power_w.toFixed(0) + ' / ' + powerLimitW.toFixed(0) + 'W';
+  document.getElementById('power-fill').style.width = (s.power_w/powerLimitW*100).toFixed(0) + '%';
   const tempPct = (s.temp_c / 90 * 100).toFixed(0);
   document.getElementById('temp-text').textContent = s.temp_c + 'C';
   document.getElementById('temp-fill').style.width = tempPct + '%';
@@ -266,7 +278,7 @@ function showPedersen(msg) {
   document.getElementById('ped-result').innerHTML =
     `<div class="speedup-num">${fmtNum(Math.round(msg.speedup))}x speedup</div>`+
     `<div class="compare-bar"><div class="label">CPU (${msg.cpu_threads}T)</div><div class="bar cpu" style="width:${cpuW}%"></div><div class="rate">${fmtRate(msg.cpu_rate)}/s</div></div>`+
-    `<div class="compare-bar"><div class="label">GPU (RTX 5090)</div><div class="bar gpu" style="width:${gpuW}%"></div><div class="rate">${fmtRate(msg.gpu_rate)}/s</div></div>`;
+    `<div class="compare-bar"><div class="label">GPU (${gpuName})</div><div class="bar gpu" style="width:${gpuW}%"></div><div class="rate">${fmtRate(msg.gpu_rate)}/s</div></div>`;
 }
 
 function fmtMs(ms) {
