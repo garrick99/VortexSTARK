@@ -297,11 +297,34 @@ function fmtRate(r) {
   return r.toFixed(0);
 }
 
+const logNOptions = {
+  fibonacci: [
+    ['16','log_n=16 (65K)'],['20','log_n=20 (1M)'],['22','log_n=22 (4M)'],
+    ['24','log_n=24 (16M)'],['26','log_n=26 (67M)'],['28','log_n=28 (268M)'],['30','log_n=30 (1.07B)']
+  ],
+  cairo: [
+    ['16','log_n=16 (65K)'],['20','log_n=20 (1M)'],['22','log_n=22 (4M)'],
+    ['24','log_n=24 (16M)'],['26','log_n=26 (67M)']
+  ]
+};
+
 function onProofTypeChange() {
   const pt = document.getElementById('proof-type').value;
-  document.getElementById('log-n').style.display = pt === 'pedersen' ? 'none' : '';
-  document.getElementById('ped-n').style.display = pt === 'pedersen' ? '' : 'none';
-  document.getElementById('btn-prove').textContent = pt === 'pedersen' ? 'Compare' : 'Prove';
+  const isPed = pt === 'pedersen';
+  document.getElementById('log-n').style.display = isPed ? 'none' : '';
+  document.getElementById('ped-n').style.display = isPed ? '' : 'none';
+  document.getElementById('btn-prove').textContent = isPed ? 'Compare' : 'Prove';
+  if (!isPed) {
+    const sel = document.getElementById('log-n');
+    const cur = sel.value;
+    sel.innerHTML = '';
+    for (const [v, label] of logNOptions[pt]) {
+      const opt = document.createElement('option');
+      opt.value = v; opt.textContent = label;
+      if (v === cur || (v === '20' && !logNOptions[pt].some(o => o[0] === cur))) opt.selected = true;
+      sel.appendChild(opt);
+    }
+  }
 }
 
 function startProve() {
