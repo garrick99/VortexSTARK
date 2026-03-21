@@ -999,10 +999,16 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
         .collect();
 
     // Wait for async trace download to complete (was launched before FRI)
+    let t_sync = Instant::now();
     eval_dl_stream.sync();
+    let sync_ms = t_sync.elapsed().as_secs_f64() * 1000.0;
     let eval_full_host = eval_full_pinned.as_slice(eval_size);
     drop(d_eval_full); // free GPU buffer now that download is complete
-    { let ms = t0_tdl.elapsed().as_secs_f64() * 1000.0; report_phase("trace_download", ms, timed); }
+    let total_ms = t0_tdl.elapsed().as_secs_f64() * 1000.0;
+    // Report the sync wait (0ms = fully overlapped with FRI, >0 = DMA was the bottleneck)
+    report_phase("trace_download", sync_ms, timed);
+    if timed { eprintln!("    (launched {:.1}ms ago, {:.1}ms sync wait = {:.0}% overlapped)",
+        total_ms, sync_ms, if total_ms > 0.0 { (1.0 - sync_ms / total_ms) * 100.0 } else { 100.0 }); }
 
     // Decommit trace from host eval data
     let td0 = Instant::now();
