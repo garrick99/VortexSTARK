@@ -236,12 +236,12 @@ fn parse_gpu_stats() -> Option<GpuStats> {
 fn get_system_info() -> serde_json::Value {
     // CPU
     let cpu_name = if cfg!(target_os = "windows") {
-        std::process::Command::new("wmic")
-            .args(["cpu", "get", "name", "/format:value"])
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", "(Get-CimInstance Win32_Processor).Name"])
             .output().ok()
             .and_then(|o| {
-                let s = String::from_utf8_lossy(&o.stdout).to_string();
-                s.lines().find(|l| l.starts_with("Name=")).map(|l| l.trim_start_matches("Name=").trim().to_string())
+                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if s.is_empty() { None } else { Some(s) }
             })
     } else {
         std::fs::read_to_string("/proc/cpuinfo").ok()
@@ -250,14 +250,11 @@ fn get_system_info() -> serde_json::Value {
 
     // RAM
     let ram_gb = if cfg!(target_os = "windows") {
-        std::process::Command::new("wmic")
-            .args(["computersystem", "get", "totalphysicalmemory", "/format:value"])
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", "[math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)"])
             .output().ok()
             .and_then(|o| {
-                let s = String::from_utf8_lossy(&o.stdout).to_string();
-                s.lines().find(|l| l.starts_with("TotalPhysicalMemory="))
-                    .and_then(|l| l.trim_start_matches("TotalPhysicalMemory=").trim().parse::<u64>().ok())
-                    .map(|b| b / (1024 * 1024 * 1024))
+                String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok()
             })
     } else {
         std::fs::read_to_string("/proc/meminfo").ok()
