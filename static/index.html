@@ -92,6 +92,7 @@ td.mono { font-size:13px; }
         <option value="100000">100K hashes</option>
       </select>
       <button class="primary" id="btn-prove" onclick="startProve()">Prove</button>
+      <label style="font-size:12px;color:var(--dim);cursor:pointer;user-select:none"><input type="checkbox" id="verbose-mode" style="margin-right:4px;cursor:pointer">Verbose</label>
       <span id="prove-status"></span>
     </div>
     <table id="phase-table">
@@ -357,10 +358,11 @@ function startProve() {
     }).catch(e => log('Fetch error: ' + e));
   } else {
     const logN = parseInt(document.getElementById('log-n').value);
+    const verbose = document.getElementById('verbose-mode').checked;
     fetch('/api/prove', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({proof_type: proofType, log_n: logN})
+      body: JSON.stringify({proof_type: proofType, log_n: logN, verbose: verbose})
     }).catch(e => log('Fetch error: ' + e));
   }
 }

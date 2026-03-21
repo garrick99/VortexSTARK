@@ -28,6 +28,8 @@ struct GpuStats {
 struct ProveRequest {
     proof_type: String,
     log_n: u32,
+    #[serde(default)]
+    verbose: bool,
 }
 
 #[derive(Deserialize)]
@@ -49,7 +51,7 @@ struct GpuJob {
 }
 
 enum GpuRequest {
-    Prove { proof_type: String, log_n: u32, resp: oneshot::Sender<()> },
+    Prove { proof_type: String, log_n: u32, verbose: bool, resp: oneshot::Sender<()> },
     PedersenCompare { n: usize, resp: oneshot::Sender<()> },
 }
 
@@ -70,8 +72,8 @@ fn gpu_worker(mut rx: mpsc::Receiver<GpuJob>) {
     while let Some(job) = rx.blocking_recv() {
         let tx = &job.broadcast;
         match job.request {
-            GpuRequest::Prove { proof_type, log_n, resp } => {
-                gpu_prove(&proof_type, log_n, tx);
+            GpuRequest::Prove { proof_type, log_n, verbose, resp } => {
+                gpu_prove(&proof_type, log_n, verbose, tx);
                 let _ = resp.send(());
             }
             GpuRequest::PedersenCompare { n, resp } => {
@@ -91,21 +93,36 @@ fn broadcast(tx: &broadcast::Sender<WsMessage>, msg_type: &str, data: serde_json
     });
 }
 
-fn gpu_prove(proof_type: &str, log_n: u32, tx: &broadcast::Sender<WsMessage>) {
+fn gpu_prove(proof_type: &str, log_n: u32, verbose: bool, tx: &broadcast::Sender<WsMessage>) {
     use vortexstark::field::M31;
     use std::time::Instant;
 
     broadcast(tx, "proof_started", serde_json::json!({
-        "proof_type": proof_type, "log_n": log_n
+        "proof_type": proof_type, "log_n": log_n, "verbose": verbose
     }));
 
     match proof_type {
         "fibonacci" => {
+            if verbose {
+                let tx2 = tx.clone();
+                vortexstark::prover::set_phase_callback(move |name, ms| {
+                    broadcast(&tx2, "phase", serde_json::json!({"name": name, "ms": ms}));
+                });
+            }
+
             let t0 = Instant::now();
-            let proof = vortexstark::prover::prove_lean(M31(1), M31(1), log_n);
+            let proof = if verbose {
+                vortexstark::prover::prove_lean_timed(M31(1), M31(1), log_n)
+            } else {
+                vortexstark::prover::prove_lean(M31(1), M31(1), log_n)
+            };
             let prove_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-            broadcast(tx, "phase", serde_json::json!({"name": "prove (all phases)", "ms": prove_ms}));
+            if verbose {
+                vortexstark::prover::clear_phase_callback();
+            } else {
+                broadcast(tx, "phase", serde_json::json!({"name": "prove", "ms": prove_ms}));
+            }
 
             let t1 = Instant::now();
             let ok = vortexstark::verifier::verify(&proof).is_ok();
@@ -124,7 +141,6 @@ fn gpu_prove(proof_type: &str, log_n: u32, tx: &broadcast::Sender<WsMessage>) {
 
             let n = 1usize << log_n;
 
-            // Build fibonacci program for Cairo VM
             let assert_imm = Instruction {
                 off0: 0x8000, off1: 0x8000, off2: 0x8001,
                 op1_imm: 1, opcode_assert: 1, ap_add1: 1,
@@ -147,10 +163,22 @@ fn gpu_prove(proof_type: &str, log_n: u32, tx: &broadcast::Sender<WsMessage>) {
             let cache_ms = t0.elapsed().as_secs_f64() * 1000.0;
             broadcast(tx, "phase", serde_json::json!({"name": "cache init", "ms": cache_ms}));
 
+            if verbose {
+                let tx2 = tx.clone();
+                vortexstark::prover::set_phase_callback(move |name, ms| {
+                    broadcast(&tx2, "phase", serde_json::json!({"name": name, "ms": ms}));
+                });
+            }
+
             let t1 = Instant::now();
             let proof = cairo_prove_cached(&program, n, log_n, &cache, None);
             let prove_ms = t1.elapsed().as_secs_f64() * 1000.0;
-            broadcast(tx, "phase", serde_json::json!({"name": "prove (all phases)", "ms": prove_ms}));
+
+            if verbose {
+                vortexstark::prover::clear_phase_callback();
+            } else {
+                broadcast(tx, "phase", serde_json::json!({"name": "prove", "ms": prove_ms}));
+            }
 
             let t2 = Instant::now();
             let ok = cairo_verify(&proof).is_ok();
@@ -347,6 +375,7 @@ async fn prove_handler(
         request: GpuRequest::Prove {
             proof_type: req.proof_type,
             log_n: req.log_n,
+            verbose: req.verbose,
             resp: resp_tx,
         },
         broadcast: state.broadcast_tx.clone(),

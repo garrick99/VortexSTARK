@@ -22,6 +22,36 @@ use crate::ntt::{self, TwiddleCache, ForwardTwiddleCache, InverseTwiddleCache};
 use std::sync::Once;
 use std::time::Instant;
 
+// Thread-local phase callback for verbose dashboard mode.
+// When set, timing phases are sent here instead of (in addition to) stderr.
+thread_local! {
+    static PHASE_CALLBACK: std::cell::RefCell<Option<Box<dyn Fn(&str, f64)>>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Set a callback that receives (phase_name, milliseconds) for each prover phase.
+/// The callback is thread-local and only applies to the calling thread.
+pub fn set_phase_callback<F: Fn(&str, f64) + 'static>(cb: F) {
+    PHASE_CALLBACK.with(|c| *c.borrow_mut() = Some(Box::new(cb)));
+}
+
+/// Clear the phase callback.
+pub fn clear_phase_callback() {
+    PHASE_CALLBACK.with(|c| *c.borrow_mut() = None);
+}
+
+/// Report a phase timing. Calls the thread-local callback if set.
+fn report_phase(name: &str, ms: f64, timed: bool) {
+    if timed {
+        eprintln!("  {name}: {ms:.1}ms");
+    }
+    PHASE_CALLBACK.with(|c| {
+        if let Some(cb) = c.borrow().as_ref() {
+            cb(name, ms);
+        }
+    });
+}
+
 static POOL_INIT: Once = Once::new();
 fn ensure_pool_init() {
     POOL_INIT.call_once(|| ffi::init_memory_pool());
@@ -187,7 +217,7 @@ fn prove_lean_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     // --- Step 1: Generate trace ---
     let t0 = Instant::now();
     unsafe { air::fibonacci_trace_parallel(a, b, log_n, pinned_trace) };
-    if timed { eprintln!("  trace_gen (cpu): {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0); }
+    { let ms = t0.elapsed().as_secs_f64() * 1000.0; report_phase("trace_gen", ms, timed); }
 
     let t0b = Instant::now();
     let mut d_trace = unsafe { DeviceBuffer::from_pinned(pinned_trace as *const u32, n) };
@@ -539,7 +569,7 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     let log_eval_size = log_n + BLOWUP_BITS;
     let eval_size = 1usize << log_eval_size;
 
-    let t_total = Instant::now();
+    let _t_total = Instant::now();
 
     // Reusable pinned buffer for eval download. First call: 855ms alloc. Subsequent: 0ms.
     use std::sync::Mutex;
@@ -577,18 +607,18 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     assert!(err == 0, "cudaMallocHost failed: {err}");
     let pinned_trace = pinned_ptr as *mut u32;
     unsafe { air::fibonacci_trace_parallel(a, b, log_n, pinned_trace) };
-    if timed { eprintln!("  trace_gen+twiddles: {:.1}ms (overlapped)", t0.elapsed().as_secs_f64() * 1000.0); }
+    { let ms = t0.elapsed().as_secs_f64() * 1000.0; report_phase("trace_gen+twiddles", ms, timed); }
 
     let t0 = Instant::now();
     let mut d_coeffs = unsafe { DeviceBuffer::from_pinned(pinned_trace as *const u32, n) };
-    if timed { unsafe { ffi::cuda_device_sync() }; eprintln!("  trace_upload: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0); }
+    { unsafe { ffi::cuda_device_sync() }; let ms = t0.elapsed().as_secs_f64() * 1000.0; report_phase("trace_upload", ms, timed); }
     unsafe { ffi::cudaFreeHost(pinned_ptr) };
 
     // --- Step 2: Interpolate on trace domain (twiddles already precomputed) ---
     let t0 = Instant::now();
     ntt::interpolate(&mut d_coeffs, &trace_inv);
     drop(trace_inv);
-    if timed { unsafe { ffi::cuda_device_sync() }; eprintln!("  interpolate: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0); }
+    { unsafe { ffi::cuda_device_sync() }; let ms = t0.elapsed().as_secs_f64() * 1000.0; report_phase("interpolate", ms, timed); }
 
     // --- Step 3: Zero-pad + full-group NTT (twiddles already precomputed) ---
     let t0 = Instant::now();
@@ -601,13 +631,13 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     ntt::evaluate(&mut d_eval_full, &eval_fwd);
     drop(eval_fwd);
     unsafe { ffi::cuda_device_sync() };
-    if timed { eprintln!("  fullgroup_ntt: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0); }
+    { let ms = t0.elapsed().as_secs_f64() * 1000.0; report_phase("fullgroup_ntt", ms, timed); }
 
     // --- Step 5: Commit trace (root-only, tiled) ---
     let t0 = Instant::now();
     let (trace_commitment, trace_subtree_roots) =
         MerkleTree::commit_root_only_with_subtrees(std::slice::from_ref(&d_eval_full), log_eval_size);
-    if timed { eprintln!("  trace_commit: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0); }
+    { let ms = t0.elapsed().as_secs_f64() * 1000.0; report_phase("trace_commit", ms, timed); }
 
     // eval_full_pinned already joined above (after trace_gen)
 
@@ -673,8 +703,8 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
 
     let quotient_commitment = reduce_subtree_roots_to_root(&all_quotient_subtrees);
     channel.mix_digest(&quotient_commitment);
-    if timed { eprintln!("  quotient_subtrees: {:.1}ms ({} chunks)", t_qsub.elapsed().as_secs_f64() * 1000.0, n_chunks); }
-    if timed { eprintln!("  quotient_commit: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0); }
+    { let ms = t_qsub.elapsed().as_secs_f64() * 1000.0; report_phase("quotient_subtrees", ms, timed); }
+    { let ms = t0.elapsed().as_secs_f64() * 1000.0; report_phase("quotient_commit", ms, timed); }
 
     // --- Circle fold: fused with quotient (re-compute quotient per chunk) ---
     let t0 = Instant::now();
@@ -696,7 +726,7 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
         Coset::subgroup(log_eval_size)
     };
     let d_fold_twid = fri::compute_fold_twiddles_on_demand(&fold_domain, true);
-    if timed { unsafe { ffi::cuda_device_sync() }; eprintln!("  circle_fold_twiddles: {:.1}ms", t_cftwid.elapsed().as_secs_f64() * 1000.0); }
+    { unsafe { ffi::cuda_device_sync() }; let ms = t_cftwid.elapsed().as_secs_f64() * 1000.0; report_phase("circle_fold_twiddles", ms, timed); }
 
     let fold_chunk_size = chunk_size / 2; // 2^26 fold outputs per quotient chunk
     let _fold_chunk_log: u32 = quotient_chunk_log - 1;
@@ -972,20 +1002,19 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     eval_dl_stream.sync();
     let eval_full_host = eval_full_pinned.as_slice(eval_size);
     drop(d_eval_full); // free GPU buffer now that download is complete
-    if timed { eprintln!("  trace_download: {:.1}ms (async, overlapped with FRI)",
-        t0_tdl.elapsed().as_secs_f64() * 1000.0); }
+    { let ms = t0_tdl.elapsed().as_secs_f64() * 1000.0; report_phase("trace_download", ms, timed); }
 
     // Decommit trace from host eval data
     let td0 = Instant::now();
     let trace_decommitment = decommit_trace_gpu(&eval_full_host, &trace_subtree_roots, &query_indices);
-    if timed { eprintln!("    decommit_trace: {:.1}ms", td0.elapsed().as_secs_f64() * 1000.0); }
+    { let ms = td0.elapsed().as_secs_f64() * 1000.0; report_phase("decommit_trace", ms, timed); }
 
     // Decommit quotient: recompute from host eval data
     let td1 = Instant::now();
     let quotient_decommitment = decommit_quotient_recompute(
         &eval_full_host, eval_size, alpha, &all_quotient_subtrees, &query_indices,
     );
-    if timed { eprintln!("    decommit_quotient: {:.1}ms", td1.elapsed().as_secs_f64() * 1000.0); }
+    { let ms = td1.elapsed().as_secs_f64() * 1000.0; report_phase("decommit_quotient", ms, timed); }
 
     // Decommit FRI layer 0 from GPU-resident data (tile download, ~3MB)
     let td2 = Instant::now();
@@ -996,7 +1025,7 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
         fri_decommitments.push(decom);
         folded_indices = folded_indices.iter().map(|&i| i / 2).collect();
     }
-    if timed { eprintln!("    decommit_fri0_gpu: {:.1}ms", td2.elapsed().as_secs_f64() * 1000.0); }
+    { let ms = td2.elapsed().as_secs_f64() * 1000.0; report_phase("decommit_fri0", ms, timed); }
     drop(fri0_gpu_saved);
 
     // Decommit remaining FRI layers
@@ -1050,12 +1079,8 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
         });
         folded_indices = folded_indices.iter().map(|&i| i / 2).collect();
     }
-    if timed { eprintln!("    decommit_cpu_tail: {:.1}ms", td4.elapsed().as_secs_f64() * 1000.0); }
-
-    if timed {
-        eprintln!("  query_decommit: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
-        eprintln!("  TOTAL: {:.1}ms", t_total.elapsed().as_secs_f64() * 1000.0);
-    }
+    { let ms = td4.elapsed().as_secs_f64() * 1000.0; report_phase("decommit_cpu_tail", ms, timed); }
+    { let ms = t0.elapsed().as_secs_f64() * 1000.0; report_phase("query_decommit", ms, timed); }
 
     // Return pinned buffer to pool for reuse (next proof: 0ms alloc)
     let _ = eval_full_host;
