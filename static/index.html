@@ -52,6 +52,36 @@ td.mono { font-size:13px; }
 @media(max-width:900px) { .bottom-row { grid-template-columns:1fr; } }
 .fade-in { animation: fadeIn .3s ease; }
 @keyframes fadeIn { from{opacity:0;transform:translateY(4px)} to{opacity:1;transform:none} }
+
+/* Print / PDF export */
+@media print {
+  * { color-adjust: exact; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  body { background:#fff; color:#111; font-size:11px; }
+  .header { background:#f8f9fa; border-bottom:2px solid #333; padding:12px 20px; }
+  .header h1 { color:#111; font-size:18px; }
+  .header h1 span { color:#2563eb; }
+  .gpu-badge { color:#555; }
+  .gpu-badge .val { color:#111; }
+  #ws-status, .controls, .log, .gauge-track, #prove-status { display:none !important; }
+  .no-print { display:none !important; }
+  .grid { display:block; padding:8px 20px; max-width:100%; }
+  .panel { background:#fff; border:1px solid #ccc; border-radius:4px; padding:14px; margin-bottom:12px; page-break-inside:avoid; }
+  .panel h2 { color:#2563eb; font-size:13px; margin-bottom:8px; }
+  .gauge { display:none; }
+  .gauge-label { display:none; }
+  .bottom-row { display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; grid-column:auto; }
+  th { color:#555; border-bottom:2px solid #333; }
+  td { border-bottom:1px solid #ddd; }
+  .phase-bar { background:#2563eb; }
+  .status.ok { background:#dcfce7; color:#166534; }
+  .status.fail { background:#fecaca; color:#991b1b; }
+  .print-header { display:block !important; text-align:center; margin:0 0 12px; padding-bottom:8px; border-bottom:1px solid #ccc; }
+  .print-header h2 { font-size:10px; color:#888; margin-top:4px; font-weight:400; }
+  .print-sysinfo { display:block !important; margin-bottom:12px; font-size:11px; }
+  .print-sysinfo td { padding:3px 12px 3px 0; border:none; color:#333; }
+  .print-sysinfo th { display:none; }
+}
+.print-header, .print-sysinfo { display:none; }
 </style>
 </head>
 <body>
@@ -64,8 +94,18 @@ td.mono { font-size:13px; }
     <span>Temp: <span class="val" id="hdr-temp">--</span></span>
     <span>Power: <span class="val" id="hdr-power">--</span></span>
     <span id="ws-status" style="color:var(--red)">disconnected</span>
+    <button class="no-print" onclick="window.print()" style="margin-left:auto;background:var(--surface);color:var(--dim);border:1px solid var(--border);padding:6px 12px;font-size:12px;cursor:pointer;border-radius:4px;">Export PDF</button>
   </div>
 </div>
+
+<div class="print-header">
+  <h1>Vortex<span style="color:#2563eb">STARK</span> Benchmark Report</h1>
+  <h2 id="print-date"></h2>
+</div>
+<table class="print-sysinfo" id="print-sysinfo-table">
+  <tr><td><b>CPU:</b></td><td id="print-cpu">--</td><td><b>RAM:</b></td><td id="print-ram">--</td></tr>
+  <tr><td><b>GPU:</b></td><td id="print-gpu">--</td><td><b>VRAM:</b></td><td id="print-vram">--</td></tr>
+</table>
 
 <div class="grid">
   <!-- Live Proof Demo -->
@@ -125,7 +165,7 @@ td.mono { font-size:13px; }
   </div>
 
   <!-- Bottom row: Benchmark History -->
-  <div class="bottom-row">
+  <div class="bottom-row" style="grid-template-columns:1fr 1fr 1fr;">
     <div class="panel">
       <h2>Fibonacci STARK</h2>
       <table>
@@ -140,12 +180,10 @@ td.mono { font-size:13px; }
         <tbody id="cairo-bench"></tbody>
       </table>
     </div>
-  </div>
-  <div class="bottom-row">
-    <div class="panel" style="grid-column:1/-1;">
+    <div class="panel">
       <h2>Pedersen Hash: CPU vs GPU</h2>
       <table>
-        <thead><tr><th>Hashes</th><th>CPU Time</th><th>GPU Time</th><th>CPU Rate</th><th>GPU Rate</th><th>Speedup</th></tr></thead>
+        <thead><tr><th>Hashes</th><th>CPU</th><th>GPU</th><th>Speedup</th></tr></thead>
         <tbody id="ped-bench"></tbody>
       </table>
     </div>
@@ -196,6 +234,12 @@ function handleMessage(msg) {
       if (msg.cpu) log(`CPU: ${msg.cpu}`, 'dim');
       if (msg.ram_gb) log(`RAM: ${msg.ram_gb} GB`, 'dim');
       log(`GPU: ${gpuName} (${msg.vram_total_mb || '?'} MB VRAM, ${powerLimitW}W TDP)`, 'accent');
+      // Populate print fields
+      document.getElementById('print-cpu').textContent = msg.cpu || '--';
+      document.getElementById('print-ram').textContent = (msg.ram_gb || '--') + ' GB';
+      document.getElementById('print-gpu').textContent = gpuName;
+      document.getElementById('print-vram').textContent = (msg.vram_total_mb || '--') + ' MB';
+      document.getElementById('print-date').textContent = new Date().toLocaleDateString('en-US', {year:'numeric',month:'long',day:'numeric'});
       break;
     case 'gpu_stats': updateGpu(msg); break;
     case 'proof_started':
@@ -290,7 +334,7 @@ function showPedersen(msg) {
   const tbody = document.getElementById('ped-bench');
   const tr = document.createElement('tr');
   tr.className = 'fade-in';
-  tr.innerHTML = `<td>${fmtNum(msg.n)}</td><td class="mono">${fmtMs(cpuMs)}</td><td class="mono">${fmtMs(gpuMs)}</td><td class="mono">${fmtRate(msg.cpu_rate)}/s</td><td class="mono">${fmtRate(msg.gpu_rate)}/s</td><td><span class="status ok">${fmtNum(Math.round(msg.speedup))}x</span></td>`;
+  tr.innerHTML = `<td>${fmtNum(msg.n)}</td><td class="mono">${fmtRate(msg.cpu_rate)}/s</td><td class="mono">${fmtRate(msg.gpu_rate)}/s</td><td><span class="status ok">${fmtNum(Math.round(msg.speedup))}x</span></td>`;
   tbody.appendChild(tr);
 }
 
