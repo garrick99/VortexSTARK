@@ -102,19 +102,22 @@ fn main() {
     }
 
     println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("  PEDERSEN HASH (CPU, STARK curve EC, projective coordinates)");
+    println!("  PEDERSEN HASH (GPU, STARK curve EC, windowed scalar mul)");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    let t = Instant::now();
-    let n_ped = 100;
-    for i in 0..n_ped {
-        let _ = vortexstark::cairo_air::stark252_field::pedersen_hash(
-            vortexstark::cairo_air::stark252_field::Fp::from_u64(i + 1),
-            vortexstark::cairo_air::stark252_field::Fp::from_u64(i + 100),
-        );
+    use vortexstark::cairo_air::{pedersen, stark252_field::Fp};
+    pedersen::gpu_init();
+    for &n_ped in &[1_000u64, 10_000, 100_000, 1_000_000] {
+        let inputs_a: Vec<Fp> = (0..n_ped).map(|i| Fp::from_u64(i + 1)).collect();
+        let inputs_b: Vec<Fp> = (0..n_ped).map(|i| Fp::from_u64(i + 1_000_000)).collect();
+        // Warmup on first small batch
+        let _ = pedersen::gpu_hash_batch(&inputs_a[..1], &inputs_b[..1]);
+        let t = Instant::now();
+        let results = pedersen::gpu_hash_batch(&inputs_a, &inputs_b);
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        let hps = n_ped as f64 / (ms / 1000.0);
+        println!("  {n_ped:>9} hashes: {ms:>7.1}ms  ({:.0} hashes/sec)", hps);
+        let _ = results;
     }
-    let ped_ms = t.elapsed().as_secs_f64() * 1000.0;
-    println!("  {n_ped} hashes: {ped_ms:.1}ms ({:.1}ms/hash, {:.0} hashes/sec)",
-        ped_ms / n_ped as f64, n_ped as f64 / (ped_ms / 1000.0));
 
     println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  SYSTEM SUMMARY");
