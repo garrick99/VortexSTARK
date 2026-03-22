@@ -27,7 +27,9 @@ fn main() {
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  FIBONACCI STARK (1 column, degree-1 constraint)");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    for log_n in [20, 24, 28, 29, 30] {
+    let max_fib_log_n: u32 = std::env::var("VORTEX_MAX_LOG_N").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(30);
+    for log_n in [20u32, 24, 28, 29, 30].iter().copied().filter(|&n| n <= max_fib_log_n) {
         let n: u64 = 1 << log_n;
         let t = Instant::now();
         let proof = vortexstark::prover::prove_lean(M31(1), M31(1), log_n);

@@ -13,7 +13,7 @@
 //! - The LogUp bus connects VM memory reads/writes to builtin I/O
 
 use crate::field::M31;
-use crate::poseidon::{self, STATE_WIDTH, NUM_ROUNDS};
+use crate::poseidon::{self, STATE_WIDTH, NUM_ROUNDS, RF_BEFORE, RP};
 
 /// Poseidon builtin segment in the execution trace.
 /// Each invocation occupies NUM_ROUNDS rows in the builtin sub-trace.
@@ -51,51 +51,52 @@ impl PoseidonBuiltin {
 
     /// Generate the builtin sub-trace columns.
     /// Returns STATE_WIDTH columns, each of length n_rows.
-    /// Each block of NUM_ROUNDS rows contains the intermediate states
-    /// of one Poseidon permutation.
+    /// Each block of NUM_ROUNDS (30) rows contains the intermediate states
+    /// of one Poseidon2 permutation: 4 full → 22 partial → 4 full rounds.
     pub fn generate_trace(&self, log_n: u32) -> Vec<Vec<u32>> {
         let n = 1usize << log_n;
         let n_rows = self.n_rows();
         assert!(n_rows <= n, "builtin trace too large for log_n={log_n}");
 
-        let rc = poseidon::round_constants_flat();
-        let rc_parsed: Vec<[M31; STATE_WIDTH]> = (0..NUM_ROUNDS)
-            .map(|r| {
-                let mut row = [M31::ZERO; STATE_WIDTH];
-                for j in 0..STATE_WIDTH {
-                    row[j] = M31(rc[r * STATE_WIDTH + j]);
-                }
-                row
-            })
-            .collect();
+        let full_rc = poseidon::full_round_constants();
+        let partial_rc = poseidon::partial_round_constants();
 
         let mut cols: Vec<Vec<u32>> = (0..STATE_WIDTH).map(|_| vec![0u32; n]).collect();
 
         for (inv_idx, input) in self.inputs.iter().enumerate() {
             let base_row = inv_idx * NUM_ROUNDS;
             let mut state = *input;
+            let mut row = base_row;
 
-            for r in 0..NUM_ROUNDS {
-                // Add round constants
-                for j in 0..STATE_WIDTH {
-                    state[j] = state[j] + rc_parsed[r][j];
-                }
-                // S-box: x^5
-                for j in 0..STATE_WIDTH {
-                    let x2 = state[j] * state[j];
-                    let x4 = x2 * x2;
-                    state[j] = x4 * state[j];
-                }
-                // MDS
-                state = poseidon::mds_apply(&state);
-
-                // Write to columns
-                let row = base_row + r;
+            // First RF_BEFORE full rounds
+            for r in 0..RF_BEFORE {
+                for j in 0..STATE_WIDTH { state[j] = state[j] + full_rc[r][j]; }
+                poseidon::sbox_all(&mut state);
+                poseidon::m_ext(&mut state);
                 if row < n {
-                    for j in 0..STATE_WIDTH {
-                        cols[j][row] = state[j].0;
-                    }
+                    for j in 0..STATE_WIDTH { cols[j][row] = state[j].0; }
                 }
+                row += 1;
+            }
+            // RP partial rounds
+            for r in 0..RP {
+                state[0] = state[0] + partial_rc[r];
+                state[0] = poseidon::sbox_one(state[0]);
+                poseidon::m_int(&mut state);
+                if row < n {
+                    for j in 0..STATE_WIDTH { cols[j][row] = state[j].0; }
+                }
+                row += 1;
+            }
+            // Last RF_AFTER full rounds
+            for r in 0..poseidon::RF_AFTER {
+                for j in 0..STATE_WIDTH { state[j] = state[j] + full_rc[RF_BEFORE + r][j]; }
+                poseidon::sbox_all(&mut state);
+                poseidon::m_ext(&mut state);
+                if row < n {
+                    for j in 0..STATE_WIDTH { cols[j][row] = state[j].0; }
+                }
+                row += 1;
             }
         }
 

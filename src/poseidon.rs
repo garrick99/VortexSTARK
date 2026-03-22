@@ -1,151 +1,203 @@
-//! Poseidon hash function over M31 for STARK AIR.
+//! Poseidon2 hash function over M31 for STARK AIR.
 //!
 //! Parameters:
 //! - State width: 8 (capacity 4, rate 4)
-//! - S-box: x^5 (full S-box, all elements)
-//! - Rounds: 22 full rounds (conservative security margin for M31)
-//! - MDS: 8×8 circulant matrix derived from first row
+//! - S-box: x^5
+//! - Full rounds: RF = 8 (RF_BEFORE=4 at start, RF_AFTER=4 at end)
+//! - Partial rounds: RP = 22 (middle, only x[0] gets S-box)
+//! - Total rounds: NUM_ROUNDS = 30 (down from old Poseidon's 22)
+//! - S-box count: 8*8 + 22*1 = 86 (was 22*8 = 176 — 51% fewer)
 //!
-//! The AIR traces one Poseidon permutation per 22 rows.
-//! Each row stores the 8-element state AFTER that round's transformation.
-//! Row 0 = state after round 0 (input + round_const + sbox + MDS).
-//! The constraint checks: state[r+1] = MDS(sbox(state[r] + round_const[r+1])).
+//! Linear layers:
+//! - M_E (external, full rounds):   circ(3,1,1,1,1,1,1,1)
+//!     s = sum(state); out[i] = 2*state[i] + s
+//! - M_I (internal, partial rounds): circ(2,1,1,1,1,1,1,1)
+//!     s = sum(state); out[i] = state[i] + s
+//!
+//! Trace layout per permutation block (NUM_ROUNDS = 30 rows):
+//!   Rows 0..4:   first half full rounds (RF_BEFORE=4)
+//!   Rows 4..26:  partial rounds (RP=22), only x[0] changes via S-box
+//!   Rows 26..30: second half full rounds (RF_AFTER=4)
+//!
+//! Round constants:
+//!   Full RC: RF * STATE_WIDTH = 64 values (8 rounds × 8 elements)
+//!   Partial RC: RP = 22 values (one per partial round, applied to x[0] only)
+//!   Flat GPU layout: [full_rcs[64], partial_rcs[22]] = 86 total values
 
 use crate::field::M31;
 
 /// Number of state elements.
 pub const STATE_WIDTH: usize = 8;
+/// Full rounds at start (before partial rounds).
+pub const RF_BEFORE: usize = 4;
+/// Partial rounds.
+pub const RP: usize = 22;
+/// Full rounds at end (after partial rounds).
+pub const RF_AFTER: usize = 4;
+/// Total full rounds (RF_BEFORE + RF_AFTER).
+pub const RF: usize = RF_BEFORE + RF_AFTER;
+/// Total rounds per permutation.
+pub const NUM_ROUNDS: usize = RF + RP; // 30
 
-/// Number of full rounds.
-pub const NUM_ROUNDS: usize = 22;
+/// M_E: external linear layer for full rounds.
+/// circ(3,1,1,1,1,1,1,1): s = sum(state); out[i] = 2*state[i] + s.
+/// Computable with additions only (2*x[i] = x[i]+x[i]).
+#[inline]
+pub fn m_ext(state: &mut [M31; STATE_WIDTH]) {
+    let s = state.iter().copied().fold(M31::ZERO, |a, b| a + b);
+    for x in state.iter_mut() {
+        *x = *x + *x + s;
+    }
+}
 
-/// MDS matrix first row (circulant: row k = rotate(first_row, k)).
-/// These are small constants chosen for efficient arithmetic and full-rank MDS.
-const MDS_FIRST_ROW: [u32; STATE_WIDTH] = [3, 1, 1, 1, 1, 1, 1, 2];
+/// M_I: internal linear layer for partial rounds.
+/// circ(2,1,1,1,1,1,1,1): s = sum(state); out[i] = state[i] + s.
+#[inline]
+pub fn m_int(state: &mut [M31; STATE_WIDTH]) {
+    let s = state.iter().copied().fold(M31::ZERO, |a, b| a + b);
+    for x in state.iter_mut() {
+        *x = *x + s;
+    }
+}
 
-/// Round constants: NUM_ROUNDS × STATE_WIDTH.
-/// Generated deterministically from a seed via repeated squaring in M31.
-fn round_constants() -> Vec<[M31; STATE_WIDTH]> {
-    let mut constants = Vec::with_capacity(NUM_ROUNDS);
-    // Deterministic generation: hash-like derivation from a fixed seed
-    let mut state = M31(0x12345678 % crate::field::m31::P);
-    for _round in 0..NUM_ROUNDS {
+/// S-box: x → x^5 for one element.
+#[inline]
+pub fn sbox_one(x: M31) -> M31 {
+    let x2 = x * x;
+    let x4 = x2 * x2;
+    x4 * x
+}
+
+/// S-box: x → x^5 for all 8 elements.
+#[inline]
+pub fn sbox_all(state: &mut [M31; STATE_WIDTH]) {
+    for x in state.iter_mut() {
+        *x = sbox_one(*x);
+    }
+}
+
+/// Full round constants: RF rounds × STATE_WIDTH values.
+/// Generated deterministically from a fixed seed.
+pub fn full_round_constants() -> Vec<[M31; STATE_WIDTH]> {
+    let mut rcs = Vec::with_capacity(RF);
+    let mut seed = M31(0x12345678 % crate::field::m31::P);
+    for r in 0..RF {
         let mut rc = [M31::ZERO; STATE_WIDTH];
         for j in 0..STATE_WIDTH {
-            // Mix: state = state^5 + (round*width + j + 1)
-            state = state * state;
-            state = state * state;
-            state = state * M31(state.0 ^ (((_round * STATE_WIDTH + j + 1) as u32) % crate::field::m31::P));
-            // Ensure non-zero
-            if state.0 == 0 { state = M31(1); }
-            rc[j] = state;
+            seed = seed * seed;
+            seed = seed * seed;
+            seed = M31(seed.0 ^ (((r * STATE_WIDTH + j + 1) as u32) % crate::field::m31::P));
+            if seed.0 == 0 { seed = M31(1); }
+            rc[j] = seed;
         }
-        constants.push(rc);
+        rcs.push(rc);
     }
-    constants
+    rcs
 }
 
-/// Get the round constants as a flat array (for GPU upload).
+/// Partial round constants: RP values, applied to x[0] only.
+pub fn partial_round_constants() -> Vec<M31> {
+    let mut rcs = Vec::with_capacity(RP);
+    let mut seed = M31(0xDEADBEEF % crate::field::m31::P);
+    for r in 0..RP {
+        seed = seed * seed;
+        seed = seed * seed;
+        seed = M31(seed.0 ^ (((r + RF * STATE_WIDTH + 1) as u32) % crate::field::m31::P));
+        if seed.0 == 0 { seed = M31(1); }
+        rcs.push(seed);
+    }
+    rcs
+}
+
+/// Flat round constants for GPU upload.
+/// Layout: [full_rcs: RF*STATE_WIDTH=64, partial_rcs: RP=22] = 86 total u32s.
 pub fn round_constants_flat() -> Vec<u32> {
-    let rc = round_constants();
-    rc.iter().flat_map(|row| row.iter().map(|m| m.0)).collect()
-}
-
-/// Apply MDS matrix to state (circulant multiplication).
-#[inline]
-pub fn mds_apply(state: &[M31; STATE_WIDTH]) -> [M31; STATE_WIDTH] {
-    mds(state)
-}
-
-#[inline]
-fn mds(state: &[M31; STATE_WIDTH]) -> [M31; STATE_WIDTH] {
-    let mut out = [M31::ZERO; STATE_WIDTH];
-    for i in 0..STATE_WIDTH {
-        let mut acc = M31::ZERO;
-        for j in 0..STATE_WIDTH {
-            let mds_val = M31(MDS_FIRST_ROW[(STATE_WIDTH + j - i) % STATE_WIDTH]);
-            acc = acc + mds_val * state[j];
-        }
-        out[i] = acc;
+    let full = full_round_constants();
+    let partial = partial_round_constants();
+    let mut out = Vec::with_capacity(RF * STATE_WIDTH + RP);
+    for rc in &full {
+        for v in rc { out.push(v.0); }
+    }
+    for v in &partial {
+        out.push(v.0);
     }
     out
 }
 
-/// Apply S-box: x → x^5 for each element.
-#[inline]
-fn sbox(state: &mut [M31; STATE_WIDTH]) {
-    for s in state.iter_mut() {
-        let x2 = *s * *s;
-        let x4 = x2 * x2;
-        *s = x4 * *s;
-    }
-}
-
-/// Full Poseidon permutation: apply all rounds to input state.
+/// Poseidon2 permutation: 4 full → 22 partial → 4 full rounds.
 pub fn poseidon_permutation(input: &[M31; STATE_WIDTH]) -> [M31; STATE_WIDTH] {
-    let rc = round_constants();
+    let full_rc = full_round_constants();
+    let partial_rc = partial_round_constants();
     let mut state = *input;
-    for r in 0..NUM_ROUNDS {
-        // Add round constants
-        for j in 0..STATE_WIDTH {
-            state[j] = state[j] + rc[r][j];
-        }
-        // S-box
-        sbox(&mut state);
-        // MDS
-        state = mds(&state);
+
+    for r in 0..RF_BEFORE {
+        for j in 0..STATE_WIDTH { state[j] = state[j] + full_rc[r][j]; }
+        sbox_all(&mut state);
+        m_ext(&mut state);
+    }
+    for r in 0..RP {
+        state[0] = state[0] + partial_rc[r];
+        state[0] = sbox_one(state[0]);
+        m_int(&mut state);
+    }
+    for r in 0..RF_AFTER {
+        for j in 0..STATE_WIDTH { state[j] = state[j] + full_rc[RF_BEFORE + r][j]; }
+        sbox_all(&mut state);
+        m_ext(&mut state);
     }
     state
 }
 
-/// Generate a Poseidon hash chain trace.
-/// Each "block" is one permutation (NUM_ROUNDS rows).
-/// The trace has STATE_WIDTH columns and n_blocks * NUM_ROUNDS rows.
-/// Row layout within each block:
-///   Row 0: state after round 0
-///   Row 1: state after round 1
-///   ...
-///   Row NUM_ROUNDS-1: state after last round (= output)
-///
-/// The input to block k+1 is derived from the output of block k
-/// by XOR-ing the block index (sponge-like construction).
-///
-/// Returns STATE_WIDTH columns, each of length n_rows.
+/// External MDS wrapper (for builtins.rs compatibility).
+#[inline]
+pub fn mds_apply(state: &[M31; STATE_WIDTH]) -> [M31; STATE_WIDTH] {
+    let mut s = *state;
+    m_ext(&mut s);
+    s
+}
+
+/// Generate Poseidon2 hash chain trace on CPU.
+/// Each block is one permutation (NUM_ROUNDS=30 rows).
+/// Returns STATE_WIDTH columns of length n_blocks * NUM_ROUNDS.
 pub fn generate_trace(log_n: u32) -> (Vec<Vec<u32>>, [M31; STATE_WIDTH], [M31; STATE_WIDTH]) {
     let n_rows = 1usize << log_n;
     assert!(n_rows >= NUM_ROUNDS, "trace too small for one permutation");
     let n_blocks = n_rows / NUM_ROUNDS;
 
+    let full_rc = full_round_constants();
+    let partial_rc = partial_round_constants();
     let mut columns: Vec<Vec<u32>> = (0..STATE_WIDTH).map(|_| Vec::with_capacity(n_rows)).collect();
-
-    let rc = round_constants();
 
     let first_input = {
         let mut inp = [M31::ZERO; STATE_WIDTH];
-        for j in 0..STATE_WIDTH {
-            inp[j] = M31(((j + 1) as u32) % crate::field::m31::P);
-        }
+        for j in 0..STATE_WIDTH { inp[j] = M31(((j + 1) as u32) % crate::field::m31::P); }
         inp
     };
-
     let mut last_output = [M31::ZERO; STATE_WIDTH];
 
     for block in 0..n_blocks {
-        // Independent block input (no chain dependency)
         let mut state = [M31::ZERO; STATE_WIDTH];
         for j in 0..STATE_WIDTH {
             let val = ((block * STATE_WIDTH + j + 1) as u64) % (crate::field::m31::P as u64);
             state[j] = M31(val as u32);
         }
-        for r in 0..NUM_ROUNDS {
-            for j in 0..STATE_WIDTH {
-                state[j] = state[j] + rc[r][j];
-            }
-            sbox(&mut state);
-            state = mds(&state);
-            for j in 0..STATE_WIDTH {
-                columns[j].push(state[j].0);
-            }
+        for r in 0..RF_BEFORE {
+            for j in 0..STATE_WIDTH { state[j] = state[j] + full_rc[r][j]; }
+            sbox_all(&mut state);
+            m_ext(&mut state);
+            for j in 0..STATE_WIDTH { columns[j].push(state[j].0); }
+        }
+        for r in 0..RP {
+            state[0] = state[0] + partial_rc[r];
+            state[0] = sbox_one(state[0]);
+            m_int(&mut state);
+            for j in 0..STATE_WIDTH { columns[j].push(state[j].0); }
+        }
+        for r in 0..RF_AFTER {
+            for j in 0..STATE_WIDTH { state[j] = state[j] + full_rc[RF_BEFORE + r][j]; }
+            sbox_all(&mut state);
+            m_ext(&mut state);
+            for j in 0..STATE_WIDTH { columns[j].push(state[j].0); }
         }
         last_output = state;
     }
@@ -153,35 +205,42 @@ pub fn generate_trace(log_n: u32) -> (Vec<Vec<u32>>, [M31; STATE_WIDTH], [M31; S
     (columns, first_input, last_output)
 }
 
-/// Evaluate the Poseidon transition constraint at row index `row`.
-/// The constraint checks: state[row+1] = MDS(sbox(state[row] + round_const[round_of_row]))
-///
-/// For each state element j, the constraint is:
-///   C_j(row) = next_state[j] - MDS_row_j(sbox(state + rc))
-///
-/// Returns STATE_WIDTH constraint values (one per column).
+/// Evaluate the Poseidon2 transition constraint at row `row`.
+/// Determines round type from row index, applies the correct transformation,
+/// returns STATE_WIDTH constraint values (zero iff trace is correct).
 pub fn eval_constraints_at(
-    columns: &[&[u32]],  // STATE_WIDTH columns of eval data
+    columns: &[&[u32]],
     row: usize,
     eval_size: usize,
 ) -> [M31; STATE_WIDTH] {
-    let rc = round_constants();
-    let next_round = (row + 1) % NUM_ROUNDS;
+    let full_rc = full_round_constants();
+    let partial_rc = partial_round_constants();
+
+    let round_in_block = row % NUM_ROUNDS;
+    // next_round is the round being applied to produce state[row+1]
+    let next_round = (round_in_block + 1) % NUM_ROUNDS;
     let next_row = (row + 1) % eval_size;
 
-    // The transition: state[row] → add round_const[next_round] → sbox → MDS → should equal state[row+1]
-    let mut state = [M31::ZERO; STATE_WIDTH];
-    for j in 0..STATE_WIDTH {
-        state[j] = M31(columns[j][row]) + rc[next_round][j];
+    let mut state: [M31; STATE_WIDTH] = std::array::from_fn(|j| M31(columns[j][row]));
+    let expected;
+
+    let next_is_partial = next_round >= RF_BEFORE && next_round < RF_BEFORE + RP;
+
+    if next_is_partial {
+        let p = next_round - RF_BEFORE;
+        state[0] = state[0] + partial_rc[p];
+        state[0] = sbox_one(state[0]);
+        m_int(&mut state);
+        expected = state;
+    } else {
+        // full round
+        let full_r = if next_round < RF_BEFORE { next_round } else { next_round - RP };
+        for j in 0..STATE_WIDTH { state[j] = state[j] + full_rc[full_r][j]; }
+        sbox_all(&mut state);
+        m_ext(&mut state);
+        expected = state;
     }
 
-    // S-box
-    sbox(&mut state);
-
-    // MDS
-    let expected = mds(&state);
-
-    // Constraint: next_state - expected
     let mut constraints = [M31::ZERO; STATE_WIDTH];
     for j in 0..STATE_WIDTH {
         let actual_next = M31(columns[j][next_row]);
@@ -190,10 +249,9 @@ pub fn eval_constraints_at(
     constraints
 }
 
-/// Generate Poseidon trace on GPU.
-/// Pre-computes block inputs on CPU (sequential, fast — just 8 values per block),
-/// then GPU-parallelizes the actual permutation work (22 rounds × 8 S-boxes per block).
-/// Returns DeviceBuffers (trace stays on GPU, no download).
+/// Generate Poseidon2 trace on GPU.
+/// Block inputs are pre-computed on CPU (deterministic, O(1) per block),
+/// then GPU-parallelizes the 30-round permutation work.
 pub fn generate_trace_gpu(log_n: u32) -> (Vec<crate::device::DeviceBuffer<u32>>, [M31; STATE_WIDTH], [M31; STATE_WIDTH]) {
     use crate::cuda::ffi;
     use crate::device::DeviceBuffer;
@@ -202,19 +260,13 @@ pub fn generate_trace_gpu(log_n: u32) -> (Vec<crate::device::DeviceBuffer<u32>>,
     assert!(n_rows >= NUM_ROUNDS);
     let n_blocks = n_rows / NUM_ROUNDS;
 
-    // Upload round constants to GPU constant memory (one-time)
+    // Upload round constants [full_rcs:64, partial_rcs:22]
     let rc_flat = round_constants_flat();
-    unsafe { ffi::cuda_poseidon_upload_round_consts(rc_flat.as_ptr()) };
+    unsafe { ffi::cuda_poseidon_upload_round_consts(rc_flat.as_ptr()); }
 
-    // Block inputs: independent (no chain dependency), computed in O(1) per block.
-    // Each block's input is deterministic: input_k[j] = (k * STATE_WIDTH + j + 1) mod P.
-    // This makes trace generation embarrassingly parallel on GPU.
-    // The STARK proves that each block's rounds are computed correctly (the hard part).
     let first_input = {
         let mut inp = [M31::ZERO; STATE_WIDTH];
-        for j in 0..STATE_WIDTH {
-            inp[j] = M31(((j + 1) as u32) % crate::field::m31::P);
-        }
+        for j in 0..STATE_WIDTH { inp[j] = M31(((j + 1) as u32) % crate::field::m31::P); }
         inp
     };
 
@@ -226,32 +278,37 @@ pub fn generate_trace_gpu(log_n: u32) -> (Vec<crate::device::DeviceBuffer<u32>>,
         }
     }
 
-    // Compute last block's output on CPU (for public input)
-    let rc = round_constants();
+    // Compute last block output on CPU for public input
+    let full_rc = full_round_constants();
+    let partial_rc = partial_round_constants();
     let mut last_state = [M31::ZERO; STATE_WIDTH];
     for j in 0..STATE_WIDTH {
         last_state[j] = M31(block_inputs_flat[(n_blocks - 1) * STATE_WIDTH + j]);
     }
-    for r in 0..NUM_ROUNDS {
-        for j in 0..STATE_WIDTH { last_state[j] = last_state[j] + rc[r][j]; }
-        sbox(&mut last_state);
-        last_state = mds(&last_state);
+    for r in 0..RF_BEFORE {
+        for j in 0..STATE_WIDTH { last_state[j] = last_state[j] + full_rc[r][j]; }
+        sbox_all(&mut last_state);
+        m_ext(&mut last_state);
+    }
+    for r in 0..RP {
+        last_state[0] = last_state[0] + partial_rc[r];
+        last_state[0] = sbox_one(last_state[0]);
+        m_int(&mut last_state);
+    }
+    for r in 0..RF_AFTER {
+        for j in 0..STATE_WIDTH { last_state[j] = last_state[j] + full_rc[RF_BEFORE + r][j]; }
+        sbox_all(&mut last_state);
+        m_ext(&mut last_state);
     }
     let last_output = last_state;
 
-    // Upload block inputs to GPU
     let d_inputs = DeviceBuffer::from_host(&block_inputs_flat);
-
-    // Allocate output columns on GPU
     let mut d_cols: Vec<DeviceBuffer<u32>> = (0..STATE_WIDTH)
         .map(|_| DeviceBuffer::<u32>::alloc(n_rows))
         .collect();
-
-    // Build column pointer array
     let col_ptrs: Vec<*mut u32> = d_cols.iter_mut().map(|c| c.as_mut_ptr()).collect();
     let d_col_ptrs = DeviceBuffer::from_host(&col_ptrs);
 
-    // Launch GPU trace generation
     unsafe {
         ffi::cuda_poseidon_trace(
             d_inputs.as_ptr(),
@@ -269,7 +326,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_poseidon_permutation_deterministic() {
+    fn test_poseidon2_permutation_deterministic() {
         let input: [M31; STATE_WIDTH] = std::array::from_fn(|j| M31((j + 1) as u32));
         let out1 = poseidon_permutation(&input);
         let out2 = poseidon_permutation(&input);
@@ -277,29 +334,55 @@ mod tests {
     }
 
     #[test]
-    fn test_poseidon_permutation_nontrivial() {
+    fn test_poseidon2_permutation_nontrivial() {
         let input: [M31; STATE_WIDTH] = std::array::from_fn(|j| M31((j + 1) as u32));
         let output = poseidon_permutation(&input);
-        // Output should differ from input
         assert_ne!(input, output);
-        // All elements should be non-zero
         for j in 0..STATE_WIDTH {
             assert_ne!(output[j], M31::ZERO, "output[{j}] is zero");
         }
     }
 
     #[test]
+    fn test_m_ext_nontrivial() {
+        let mut state: [M31; STATE_WIDTH] = std::array::from_fn(|j| M31((j + 1) as u32));
+        let orig = state;
+        m_ext(&mut state);
+        assert_ne!(state, orig);
+        // Verify formula: s = sum(orig); out[i] = 2*orig[i] + s
+        let s: M31 = orig.iter().copied().fold(M31::ZERO, |a, b| a + b);
+        for i in 0..STATE_WIDTH {
+            assert_eq!(state[i], orig[i] + orig[i] + s);
+        }
+    }
+
+    #[test]
+    fn test_m_int_nontrivial() {
+        let mut state: [M31; STATE_WIDTH] = std::array::from_fn(|j| M31((j + 1) as u32));
+        let orig = state;
+        m_int(&mut state);
+        // Verify formula: s = sum(orig); out[i] = orig[i] + s
+        let s: M31 = orig.iter().copied().fold(M31::ZERO, |a, b| a + b);
+        for i in 0..STATE_WIDTH {
+            assert_eq!(state[i], orig[i] + s);
+        }
+    }
+
+    #[test]
+    fn test_sbox_is_x5() {
+        let x = M31(42);
+        assert_eq!(sbox_one(x), x * x * x * x * x);
+    }
+
+    #[test]
     fn test_trace_satisfies_constraints() {
-        // Need enough rows for at least 2 blocks so we can check within-block transitions
-        // NUM_ROUNDS = 22, so log_n=6 gives 64 rows = 2 blocks (44 rows) + 20 padding rows
-        // Actually, 64/22 = 2 blocks with remainder. Let's use exact multiple.
-        // 22 * 4 = 88 → need log_n=7 (128 rows) for 5 blocks
+        // 30 rounds per block, need log_n s.t. 2^log_n / 30 >= 2 blocks
+        // 30*4 = 120 → log_n=7 (128 rows = 4 blocks with 8 unused rows)
         let log_n = 7;
         let (columns, _input, _output) = generate_trace(log_n);
         let n = columns[0].len();
         let col_refs: Vec<&[u32]> = columns.iter().map(|c| c.as_slice()).collect();
 
-        // Check constraint at every within-block row (not at block boundaries)
         let n_blocks = n / NUM_ROUNDS;
         for block in 0..n_blocks {
             let base = block * NUM_ROUNDS;
@@ -308,7 +391,7 @@ mod tests {
                 let c = eval_constraints_at(&col_refs, row, n);
                 for j in 0..STATE_WIDTH {
                     assert_eq!(c[j], M31::ZERO,
-                        "constraint violated at block {block}, round {r}, column {j}: {:?}", c[j]);
+                        "constraint violated at block {block}, round {r}, col {j}");
                 }
             }
         }
@@ -317,7 +400,7 @@ mod tests {
     #[test]
     fn test_gpu_trace_matches_cpu() {
         crate::cuda::ffi::init_memory_pool();
-        let log_n = 7; // 128 rows
+        let log_n = 7;
         let (cpu_cols, cpu_input, cpu_output) = generate_trace(log_n);
         let (gpu_cols, gpu_input, gpu_output) = generate_trace_gpu(log_n);
 
@@ -329,24 +412,7 @@ mod tests {
 
         for c in 0..STATE_WIDTH {
             let gpu_host = gpu_cols[c].to_host();
-            // Compare only filled rows (CPU vec may be shorter than GPU allocation)
             assert_eq!(&cpu_cols[c][..n_filled], &gpu_host[..n_filled], "column {c} differs");
         }
-    }
-
-    #[test]
-    fn test_mds_nontrivial() {
-        let input: [M31; STATE_WIDTH] = std::array::from_fn(|j| M31((j + 1) as u32));
-        let output = mds(&input);
-        assert_ne!(input, output);
-    }
-
-    #[test]
-    fn test_sbox_is_x5() {
-        let x = M31(42);
-        let mut state = [x; STATE_WIDTH];
-        sbox(&mut state);
-        let expected = x * x * x * x * x;
-        assert_eq!(state[0], expected);
     }
 }

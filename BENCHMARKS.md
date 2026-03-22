@@ -375,3 +375,67 @@ Fix: removed all 4 calls — CUDA default (1KB) is sufficient.
 ```
 149 tests, all passing (single-threaded)
 ```
+
+---
+
+## CHECKPOINT: Poseidon2 Migration (2026-03-21)
+
+### Changes
+- Migrated from Poseidon (22 full rounds) → Poseidon2 (8 full + 22 partial = 30 total rounds)
+- S-box count per permutation: 176 → 86 (51% fewer)
+- Linear layers: M_E = circ(3,1,1,1,1,1,1,1) for full rounds; M_I = circ(2,1,1,1,1,1,1,1) for partial
+- Rust nightly toolchain: nightly-2025-06-23 → nightly (2026-03-20 build, rustc 1.96.0-nightly)
+- NUM_ROUNDS constant: 22 → 30
+- Round constants: 176 values → 86 values (64 full + 22 partial)
+
+### Hardware
+```
+GPU:    NVIDIA GeForce RTX 5090 (32607 MB GDDR7, SM 12.0)
+Driver: 595.79 / CUDA 13.2
+CPU:    Intel Core Ultra 9 285K, 64 GB DDR5
+OS:     Windows 11 Build 26200
+```
+
+### Fibonacci STARK (unchanged)
+```
+log_n=20 |      1,048,576 elements | prove:   109.6ms | verify:  4.6ms | ✓
+log_n=24 |     16,777,216 elements | prove:   211.6ms | verify:  6.3ms | ✓
+log_n=28 |    268,435,456 elements | prove:  1547.3ms | verify:  8.2ms | ✓
+log_n=29 |    536,870,912 elements | prove:  3614.9ms | verify:  8.7ms | ✓
+log_n=30 |  1,073,741,824 elements | prove: 10591.3ms | verify:  9.3ms | ✓
+```
+
+### Cairo VM STARK (31 columns, 31 constraints — unchanged)
+```
+log_n=20 |      1,048,576 steps | prove:   626.9ms | verify:  0.4ms | ✓
+log_n=24 |     16,777,216 steps | prove:  7259.2ms | verify:  0.4ms | ✓
+log_n=26 |     67,108,864 steps | prove: 29592.5ms | verify:  0.5ms | ✓
+```
+
+### Poseidon2 Trace+NTT Throughput (8 columns, degree-5 S-box)
+```
+log_n=20 |     34,952 hashes | trace:   1ms | NTT:   4ms | total:   6.7ms |  5.2M hash/s
+log_n=24 |    559,240 hashes | trace:  28ms | NTT:  62ms | total:  96.4ms |  5.8M hash/s
+log_n=28 |  8,947,848 hashes | trace: 487ms | NTT: 1218ms | total: 1864.8ms | 4.8M hash/s
+```
+
+#### Comparison vs old Poseidon (22 full rounds, same trace size)
+```
+                    Poseidon (old)   Poseidon2 (new)   Ratio
+Rounds/permutation:     22               30            1.36×
+S-boxes/permutation:   176               86            0.49×
+Hashes at log_n=24:    762,600          559,240        0.73×  (=22/30)
+Hash/s at log_n=24:     6.6M             5.8M          0.88×
+Hash/s at log_n=28:     6.8M             4.8M          0.71×
+```
+Note: Poseidon2 hash/s is lower because the trace size is fixed (2^log_n rows) but each
+permutation uses 30 rows instead of 22 → fewer hashes per trace. The 22/30 = 0.73 ratio
+matches exactly. The absolute NTT time improved slightly due to newer Rust nightly (1.96.0).
+
+The benefit of Poseidon2 is standardization (Plonky3/Stwo ecosystem alignment) and
+stronger algebraic security, not STARK proving throughput.
+
+### Test Suite
+```
+150 tests (149 pass in parallel; 1 flaky GPU-pool test passes when run in isolation)
+```
