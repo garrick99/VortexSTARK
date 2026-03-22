@@ -32,6 +32,10 @@ path = "src/bin/sustained_bench.rs"
 name = "full_benchmark"
 path = "src/bin/full_benchmark.rs"
 
+[[bin]]
+name = "rpo_bench"
+path = "src/bin/rpo_bench.rs"
+
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }

@@ -3,6 +3,7 @@ use vortexstark::cuda::ffi;
 use vortexstark::field::M31;
 use vortexstark::poseidon;
 use vortexstark::cairo_air::{decode::Instruction, prover::cairo_prove, prover::cairo_verify};
+use vortexstark::rpo_m31;
 use std::time::Instant;
 
 fn main() {
@@ -102,6 +103,42 @@ fn main() {
     }
 
     println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("  RPO-M31 (24 cols, 14 rows/perm — Circle STARK optimised)");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    for log_n in [20, 24, 28] {
+        let n: usize = 1 << log_n;
+        let n_hashes = n / rpo_m31::ROWS_PER_PERM;
+
+        let t = Instant::now();
+        let d_cols = rpo_m31::generate_trace_gpu(log_n);
+        let trace_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        let eval_size = 2 * n;
+        let log_eval = log_n + 1;
+        let trace_domain = vortexstark::circle::Coset::half_coset(log_n);
+        let eval_domain = vortexstark::circle::Coset::half_coset(log_eval);
+        let inv = vortexstark::ntt::InverseTwiddleCache::new(&trace_domain);
+        let fwd = vortexstark::ntt::ForwardTwiddleCache::new(&eval_domain);
+
+        let t2 = Instant::now();
+        let mut d_eval_cols = Vec::new();
+        for mut col in d_cols {
+            vortexstark::ntt::interpolate(&mut col, &inv);
+            let mut d_eval = vortexstark::device::DeviceBuffer::<u32>::alloc(eval_size);
+            unsafe { ffi::cuda_zero_pad(col.as_ptr(), d_eval.as_mut_ptr(), n as u32, eval_size as u32); }
+            drop(col);
+            vortexstark::ntt::evaluate(&mut d_eval, &fwd);
+            d_eval_cols.push(d_eval);
+        }
+        let ntt_ms = t2.elapsed().as_secs_f64() * 1000.0;
+        let total_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let hashes_per_sec = n_hashes as f64 / (total_ms / 1000.0);
+
+        println!("  log_n={log_n:>2} | {n_hashes:>12} hashes | trace: {trace_ms:>6.0}ms | NTT: {ntt_ms:>6.0}ms | total: {total_ms:>8.1}ms | {:.1}M hash/s", hashes_per_sec / 1e6);
+        drop(d_eval_cols);
+    }
+
+    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  PEDERSEN HASH (GPU, STARK curve EC, windowed scalar mul)");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     use vortexstark::cairo_air::{pedersen, stark252_field::Fp};
@@ -125,7 +162,7 @@ fn main() {
     println!("  Engine:     GPU-native Circle STARK (M31, 100-bit security)");
     println!("  GPU:        {gpu_info}");
   
-    println!("  Builtins:   Poseidon (GPU), Pedersen (GPU), Bitwise");
+    println!("  Builtins:   Poseidon2 (GPU, 30 rows/perm), RPO-M31 (GPU, 14 rows/perm), Pedersen (GPU)");
     println!("  Features:   LogUp memory consistency, range checks, 2-phase commitment");
     println!("  CLI:        stark_cli prove/verify (binary proof serialization)");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");

@@ -535,6 +535,14 @@ unsafe extern "C" {
         output: *mut u32,
         half_n: u32,
     );
+
+    pub fn cuda_rpo_upload_constants(host_mds: *const u32, host_rc: *const u32);
+
+    pub fn cuda_rpo_trace(
+        block_inputs: *const u32,
+        trace_cols: *const *mut u32,
+        n_blocks: u32,
+    );
 }
 
 // Blake2s PoW grinding kernel

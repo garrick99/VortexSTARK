@@ -439,3 +439,65 @@ stronger algebraic security, not STARK proving throughput.
 ```
 150 tests (149 pass in parallel; 1 flaky GPU-pool test passes when run in isolation)
 ```
+
+---
+
+## CHECKPOINT: RPO-M31 (2026-03-22)
+
+### Summary
+Implemented RPO-M31 — a Circle STARK–native hash function from eprint 2024/1635 (Ashur & Tariq).
+New files: `src/rpo_m31.rs`, `cuda/rpo_trace.cu`.
+
+### Why RPO-M31
+- Designed specifically for Circle STARKs over M31 (unlike Poseidon2 which is general-purpose)
+- 14 rows/permutation vs Poseidon2's 30 → 2.14× more permutations per trace
+- State width 24 (rate 16, capacity 8) vs Poseidon2's 8 (rate 4, capacity 4)
+- Balanced FM/BM round structure: both forward (x^5) and inverse (x^(1/5)) S-boxes
+- Round constants: SHAKE-256 derived, 360 total (15 steps × 24 elements)
+- MDS: 24×24 circulant from 32-element root-of-unity construction (Appendix A.3)
+
+### Architecture
+```
+Per round (7 total):
+  FM: MDS → add RC → x^5       → write trace row 2r
+  BM: MDS → add RC → x^(1/5)  → write trace row 2r+1
+CLS: MDS → add RC              (final state, no trace row)
+
+Total: 14 trace rows, 15 constant sets (360 u32 values)
+MDS: 24×24 = 576 u32 values, uploaded to CUDA __constant__ memory
+x^(1/5) = x^1717986917, implemented as square-and-multiply (~45 mults)
+```
+
+### Performance (RTX 5090, CUDA 13, 2026-03-22)
+```
+log_n=20 |    74,898 hashes | trace:  86ms | NTT:  13ms | total:  102ms |  0.74M hash/s
+log_n=24 | 1,198,372 hashes | trace:  87ms | NTT: 155ms | total:  251ms |  4.78M hash/s
+log_n=28 | 19,173,961 hashes| trace: 1358ms | NTT: N/A* |
+  *log_n=28: NTT requires 24 cols × 2^29 eval domain = 48 GB VRAM (exceeds 32 GB)
+```
+
+### Comparison vs Poseidon2 (same trace size)
+```
+Metric                  | Poseidon2         | RPO-M31
+─────────────────────────────────────────────────────────
+Rows per permutation    | 30                | 14  (2.14x fewer)
+State width             | 8                 | 24  (3x wider)
+Hashes at log_n=24      | ~560K/perm        | ~1.2M/perm  (+2.14x)
+Trace gen time (log_n=24)| ~87ms           | ~87ms  (same bandwidth)
+NTT cost (log_n=24)     | ~52ms (8 cols)    | ~155ms (24 cols)
+Total at log_n=24       | ~4.8M hash/s      | ~4.78M hash/s  (comparable)
+Max viable log_n        | 28 (16 GB NTT)    | 24-26 (NTT memory limit)
+S-box operations        | 86/perm (x^5 only)| 14*24 fwd + 14*24 inv/perm
+```
+
+### Memory Note
+RPO-M31's 24 columns means the NTT evaluation domain (size 2^(log_n+1) × 24 cols) is 3x
+larger than Poseidon2's 8 columns. For log_n=28: 24 × 2 GB = 48 GB needed, exceeds 32 GB VRAM.
+Practical limit for RPO-M31 trace+NTT on RTX 5090: log_n ≤ 25 (32 GB / 24 cols / 2 ≈ 680M rows/col).
+For log_n > 25, batch the NTT column-by-column (8 cols at a time).
+
+### Correctness
+- 7 CPU unit tests pass (permutation, S-box roundtrip, MDS, zero input)
+- GPU trace correctness test passes: CUDA output matches CPU byte-for-byte for all 14 rows × 24 cols
+- Round constants pre-verified against AbdelStark/rpo-xhash-m31 reference (MIT)
+
