@@ -58,8 +58,11 @@ pub struct CairoProof {
     pub log_trace_size: u32,
     /// Public inputs (verified by both prover and verifier)
     pub public_inputs: CairoPublicInputs,
-    /// Merkle root: VM trace (31 columns)
+    /// Merkle root: VM trace columns 0-15 (lo half)
     pub trace_commitment: [u32; 8],
+    /// Merkle root: VM trace columns 16-30 (hi half). Together with trace_commitment,
+    /// this commits all 31 trace columns (GPU leaf hash is capped at 16 cols per tree).
+    pub trace_commitment_hi: [u32; 8],
     /// Merkle root: LogUp interaction trace (4 QM31 columns)
     pub interaction_commitment: [u32; 8],
     /// Merkle root: range check interaction trace (4 QM31 columns)
@@ -81,10 +84,14 @@ pub struct CairoProof {
     pub trace_values_at_queries: Vec<[u32; N_COLS]>,
     /// Trace values at query+1 points (for next-row constraints)
     pub trace_values_at_queries_next: Vec<[u32; N_COLS]>,
-    /// Merkle auth paths binding trace_values_at_queries to trace_commitment
+    /// Merkle auth paths binding trace cols 0-15 at query points to trace_commitment
     pub trace_auth_paths: Vec<Vec<[u32; 8]>>,
-    /// Merkle auth paths binding trace_values_at_queries_next to trace_commitment
+    /// Merkle auth paths binding trace cols 0-15 at query+1 points to trace_commitment
     pub trace_auth_paths_next: Vec<Vec<[u32; 8]>>,
+    /// Merkle auth paths binding trace cols 16-30 at query points to trace_commitment_hi
+    pub trace_auth_paths_hi: Vec<Vec<[u32; 8]>>,
+    /// Merkle auth paths binding trace cols 16-30 at query+1 points to trace_commitment_hi
+    pub trace_auth_paths_hi_next: Vec<Vec<[u32; 8]>>,
     /// LogUp memory argument: claimed final running sum
     pub logup_final_sum: [u32; 4],
     /// Range check: claimed final running sum
@@ -237,7 +244,12 @@ pub fn cairo_prove_cached(
     drop(columns);
     let _ntt_ms = t_ntt.elapsed().as_secs_f64() * 1000.0;
 
-    let trace_commitment = MerkleTree::commit_root_only(&d_eval_cols, log_eval_size);
+    // Commit trace in two halves: cols 0-15 (lo) and cols 16-30 (hi).
+    // The GPU Blake2s leaf hash loads at most 16 column words per leaf (switch statement cap),
+    // so each half-commitment securely binds its 15-16 columns.
+    const TRACE_LO: usize = 16; // first half: columns 0..TRACE_LO
+    let trace_commitment = MerkleTree::commit_root_only(&d_eval_cols[..TRACE_LO], log_eval_size);
+    let trace_commitment_hi = MerkleTree::commit_root_only(&d_eval_cols[TRACE_LO..N_COLS], log_eval_size);
 
     // ---- VRAM streaming: download all eval cols to host, free non-LogUp cols ----
     // At log_n=27 the 27 columns consume 28.9 GiB. We download all to host and
@@ -256,6 +268,7 @@ pub fn cairo_prove_cached(
     let mut channel = Channel::new();
     channel.mix_digest(&public_inputs.program_hash);
     channel.mix_digest(&trace_commitment);
+    channel.mix_digest(&trace_commitment_hi);
 
     // ---- EC trace for Pedersen (optional) ----
     let (ec_trace_commitment, ec_trace_host) = if let Some((ped_a, ped_b)) = pedersen_inputs {
@@ -529,28 +542,37 @@ pub fn cairo_prove_cached(
         result
     };
     // Generate Merkle auth paths for trace decommitment.
-    // This binds trace_values_at_queries[q] and trace_values_at_queries_next[q]
-    // to the committed trace_commitment root.
-    // Note: GPU leaf hash only secures columns 0..min(N_COLS,16)=16; columns 16-30
-    // are hashed with length 64 bytes, effectively leaving them uncovered by the
-    // Merkle tree. This is a known remaining gap documented in SOUNDNESS.md.
-    let trace_auth_paths = {
+    // lo paths cover cols 0-15 against trace_commitment.
+    // hi paths cover cols 16-30 against trace_commitment_hi.
+    // Together they bind all 31 trace columns to committed polynomials.
+    let (trace_auth_paths, trace_auth_paths_next,
+         trace_auth_paths_hi, trace_auth_paths_hi_next) = {
         let next_indices: Vec<usize> = query_indices.iter()
             .map(|&qi| (qi + 1) % eval_size)
             .collect();
         let all_indices: Vec<usize> = query_indices.iter().copied()
             .chain(next_indices.iter().copied())
             .collect();
-        let all_paths = MerkleTree::cpu_merkle_auth_paths_ncols(
-            &host_eval_cols[..N_COLS],
+        let n_q = query_indices.len();
+
+        // lo: cols 0..TRACE_LO
+        let lo_paths = MerkleTree::cpu_merkle_auth_paths_ncols(
+            &host_eval_cols[..TRACE_LO],
             &all_indices,
         );
-        let n_q = query_indices.len();
-        let paths_qi: Vec<Vec<[u32; 8]>> = all_paths[..n_q].to_vec();
-        let paths_qi1: Vec<Vec<[u32; 8]>> = all_paths[n_q..].to_vec();
-        (paths_qi, paths_qi1)
+        let paths_lo_qi: Vec<Vec<[u32; 8]>> = lo_paths[..n_q].to_vec();
+        let paths_lo_qi1: Vec<Vec<[u32; 8]>> = lo_paths[n_q..].to_vec();
+
+        // hi: cols TRACE_LO..N_COLS
+        let hi_paths = MerkleTree::cpu_merkle_auth_paths_ncols(
+            &host_eval_cols[TRACE_LO..N_COLS],
+            &all_indices,
+        );
+        let paths_hi_qi: Vec<Vec<[u32; 8]>> = hi_paths[..n_q].to_vec();
+        let paths_hi_qi1: Vec<Vec<[u32; 8]>> = hi_paths[n_q..].to_vec();
+
+        (paths_lo_qi, paths_lo_qi1, paths_hi_qi, paths_hi_qi1)
     };
-    let (trace_auth_paths, trace_auth_paths_next) = trace_auth_paths;
 
     drop(host_eval_cols);
 
@@ -593,6 +615,7 @@ pub fn cairo_prove_cached(
         log_trace_size: log_n,
         public_inputs,
         trace_commitment,
+        trace_commitment_hi,
         ec_trace_commitment,
         ec_trace_at_queries,
         ec_trace_at_queries_next,
@@ -606,6 +629,8 @@ pub fn cairo_prove_cached(
         trace_values_at_queries_next,
         trace_auth_paths,
         trace_auth_paths_next,
+        trace_auth_paths_hi,
+        trace_auth_paths_hi_next,
         logup_final_sum,
         rc_final_sum,
         quotient_decommitment,
@@ -631,6 +656,7 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
     let mut channel = Channel::new();
     channel.mix_digest(&proof.public_inputs.program_hash);
     channel.mix_digest(&proof.trace_commitment);
+    channel.mix_digest(&proof.trace_commitment_hi);
 
     let _z_mem = channel.draw_felt();
     let _alpha_mem = channel.draw_felt();
@@ -776,36 +802,40 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
         }
     }
 
-    // ---- Verify trace decommitment: auth paths bind trace values to trace_commitment ----
-    // Columns 0..min(N_COLS,16)=16 are secured by the Merkle commitment (GPU leaf hash cap).
-    // Without this check, a cheating prover could supply arbitrary trace values that satisfy
-    // constraints without being bound to the committed trace polynomial.
-    if proof.trace_auth_paths.len() != proof.query_indices.len() {
-        return Err("trace_auth_paths length mismatch".into());
+    // ---- Verify trace decommitment: auth paths bind all 31 trace columns to commitments ----
+    // lo commitment (trace_commitment) covers cols 0..TRACE_LO=16.
+    // hi commitment (trace_commitment_hi) covers cols TRACE_LO..N_COLS=31.
+    // Together they cryptographically bind all 31 trace columns.
+    const TRACE_LO: usize = 16;
+    let n_q = proof.query_indices.len();
+    if proof.trace_auth_paths.len() != n_q || proof.trace_auth_paths_next.len() != n_q
+        || proof.trace_auth_paths_hi.len() != n_q || proof.trace_auth_paths_hi_next.len() != n_q {
+        return Err("trace auth path length mismatch".into());
     }
-    if proof.trace_auth_paths_next.len() != proof.query_indices.len() {
-        return Err("trace_auth_paths_next length mismatch".into());
+    if proof.trace_commitment_hi == [0u32; 8] {
+        return Err("trace_commitment_hi is zero".into());
     }
     for (q, &qi) in proof.query_indices.iter().enumerate() {
-        // Leaf hash: only the first min(N_COLS, 16) columns contribute (GPU cap).
-        let effective = N_COLS.min(16);
-        let leaf_vals_qi: Vec<u32> = proof.trace_values_at_queries[q][..effective].to_vec();
-        let leaf_hash_qi = MerkleTree::hash_leaf(&leaf_vals_qi);
-        if !MerkleTree::verify_auth_path(
-            &proof.trace_commitment, &leaf_hash_qi, qi,
-            &proof.trace_auth_paths[q],
-        ) {
-            return Err(format!("Trace auth path verification failed at query {q} (qi={qi})"));
+        let qi_next = (qi + 1) % eval_size;
+
+        // lo: cols 0..TRACE_LO vs trace_commitment
+        let leaf_lo_qi = MerkleTree::hash_leaf(&proof.trace_values_at_queries[q][..TRACE_LO]);
+        if !MerkleTree::verify_auth_path(&proof.trace_commitment, &leaf_lo_qi, qi, &proof.trace_auth_paths[q]) {
+            return Err(format!("Trace lo auth path failed at query {q} (qi={qi})"));
+        }
+        let leaf_lo_next = MerkleTree::hash_leaf(&proof.trace_values_at_queries_next[q][..TRACE_LO]);
+        if !MerkleTree::verify_auth_path(&proof.trace_commitment, &leaf_lo_next, qi_next, &proof.trace_auth_paths_next[q]) {
+            return Err(format!("Trace lo auth path (next) failed at query {q}"));
         }
 
-        let qi_next = (qi + 1) % eval_size;
-        let leaf_vals_next: Vec<u32> = proof.trace_values_at_queries_next[q][..effective].to_vec();
-        let leaf_hash_next = MerkleTree::hash_leaf(&leaf_vals_next);
-        if !MerkleTree::verify_auth_path(
-            &proof.trace_commitment, &leaf_hash_next, qi_next,
-            &proof.trace_auth_paths_next[q],
-        ) {
-            return Err(format!("Trace auth path (next) verification failed at query {q} (qi_next={qi_next})"));
+        // hi: cols TRACE_LO..N_COLS vs trace_commitment_hi
+        let leaf_hi_qi = MerkleTree::hash_leaf(&proof.trace_values_at_queries[q][TRACE_LO..]);
+        if !MerkleTree::verify_auth_path(&proof.trace_commitment_hi, &leaf_hi_qi, qi, &proof.trace_auth_paths_hi[q]) {
+            return Err(format!("Trace hi auth path failed at query {q} (qi={qi})"));
+        }
+        let leaf_hi_next = MerkleTree::hash_leaf(&proof.trace_values_at_queries_next[q][TRACE_LO..]);
+        if !MerkleTree::verify_auth_path(&proof.trace_commitment_hi, &leaf_hi_next, qi_next, &proof.trace_auth_paths_hi_next[q]) {
+            return Err(format!("Trace hi auth path (next) failed at query {q}"));
         }
     }
 
@@ -1618,18 +1648,30 @@ mod tests {
 
     #[test]
     fn test_tamper_trace_auth_paths() {
-        // Tamper a trace value while keeping the auth path for the original value.
-        // The verifier should reject: the auth path won't match the tampered value's leaf hash.
+        // Tamper trace values while keeping auth paths for the original values.
+        // Verifier should reject: auth path won't match the tampered value's leaf hash.
         ffi::init_memory_pool();
         let program = build_fib_program(64);
-        let mut proof = cairo_prove(&program, 64, 6);
-        // Corrupt a column covered by the leaf hash (column 0 = pc, within first 16 cols).
-        for row in &mut proof.trace_values_at_queries {
-            row[0] = row[0].wrapping_add(1) % crate::field::m31::P;
+
+        // Test lo commitment: tamper col 0 (pc), which is in cols 0-15
+        {
+            let mut proof = cairo_prove(&program, 64, 6);
+            for row in &mut proof.trace_values_at_queries {
+                row[0] = row[0].wrapping_add(1) % crate::field::m31::P;
+            }
+            let result = cairo_verify(&proof);
+            assert!(result.is_err(), "Tampered lo col (pc) with stale auth path should fail: {:?}", result);
         }
-        // auth paths are untouched (still correct for the original values)
-        let result = cairo_verify(&proof);
-        assert!(result.is_err(), "Tampered trace value with stale auth path should fail: {:?}", result);
+
+        // Test hi commitment: tamper col 26 (res), which is in cols 16-30
+        {
+            let mut proof = cairo_prove(&program, 64, 6);
+            for row in &mut proof.trace_values_at_queries {
+                row[26] = row[26].wrapping_add(1) % crate::field::m31::P;
+            }
+            let result = cairo_verify(&proof);
+            assert!(result.is_err(), "Tampered hi col (res) with stale auth path should fail: {:?}", result);
+        }
     }
 
     #[test]
