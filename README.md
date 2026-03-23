@@ -94,7 +94,7 @@ stark_cli bench 28                             # Benchmark
 
 ## Building
 
-Requires: Rust nightly (1.89+), CUDA 13.2+, RTX 5090 (SM 12.0) or RTX 4090 (SM 8.9).
+Requires: Rust 1.85+ (stable), CUDA 13.0+, RTX 5090 (SM 12.0) or RTX 4090 (SM 8.9).
 
 ```bash
 cargo build --release
