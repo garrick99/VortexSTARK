@@ -77,11 +77,18 @@
 - initial_pc, initial_ap, n_steps, program_hash, program bytecode
 - All bound into Fiat-Shamir transcript
 
-### Merkle auth paths
-- Generated via cpu_merkle_auth_paths_soa4
-- Verified for quotient commitment + all FRI layers
+### Merkle auth paths (FULLY ACTIVATED 2026-03-22)
+- Previously: quotient and FRI decommitments had empty auth_paths; verifier skipped the check,
+  allowing a cheating prover to supply fake quotient/FRI values without Merkle binding.
+- Now: all four commitments have real auth paths:
+  - trace_commitment (cols 0-15) + trace_commitment_hi (cols 16-30) — cpu_merkle_auth_paths_ncols
+  - quotient_commitment — decommit_from_host_soa4 (cpu_merkle_auth_paths_soa4)
+  - all FRI layer commitments — decommit_fri_layer (cpu_merkle_auth_paths_soa4)
+- Verifier rejects empty auth paths (hard error instead of silent skip).
 - Domain separation: internal nodes use Blake2s personalization (h[6] ^= 0x01), leaves use h[6] = IV6
 - Prevents second-preimage attacks where leaf data could be confused with internal node hashes
+- test_quotient_auth_paths_reject_fake_value: DETECTED
+- test_fri_auth_paths_reject_fake_value: DETECTED
 
 ### Trace decommitment auth paths (ADDED 2026-03-22)
 - Previously: trace_values_at_queries had NO Merkle auth paths. A cheating prover could supply
@@ -127,12 +134,11 @@ in error — the implementation is correct.
 |-----------|-----------|
 | GPU kernels / benchmarks | 95% |
 | Fibonacci STARK (prove+verify) | 95% |
-| Cairo verifier soundness | 96% |
+| Cairo verifier soundness | 97% |
 | Cairo constraint completeness | 92% |
-| Production readiness | 86% |
+| Production readiness | 88% |
 
 ### What would move production readiness higher
-- Extend trace Merkle leaf hash to cover all 31 columns (two-block hash or split commitment)
 - Wire range checks into prover pipeline (RC interaction trace committed, verifier decommits at queries)
 - Full instruction decomposition (extend LogUp to cover inst_hi, or add multi-limb decomposition columns)
 - Interaction trace decommitment at query points (verifier checks LogUp running sum transitions)
