@@ -62,6 +62,8 @@ pub struct CairoProof {
     pub trace_commitment: [u32; 8],
     /// Merkle root: LogUp interaction trace (4 QM31 columns)
     pub interaction_commitment: [u32; 8],
+    /// Merkle root: range check interaction trace (4 QM31 columns)
+    pub rc_interaction_commitment: [u32; 8],
     /// Merkle root: EC multiplication trace (28 columns, proves Pedersen correctness)
     pub ec_trace_commitment: Option<[u32; 8]>,
     /// EC trace values at query points (for verifier constraint check)
@@ -338,26 +340,55 @@ pub fn cairo_prove_cached(
         val
     };
 
-    // Range check: compute actual LogUp sum over offsets on the trace domain.
-    let (_, rc_exec_sum) = compute_rc_interaction_trace(&rc_offsets, n_steps, z_rc);
+    // Range check: compute LogUp interaction trace over the 3 offsets per row.
+    // Keep the 4 columns so we can commit them; the final element is rc_exec_sum.
+    let (mut rc_trace_cols, rc_exec_sum) = compute_rc_interaction_trace(&rc_offsets, n_steps, z_rc);
     let rc_table_sum = compute_rc_table_sum(&rc_counts, z_rc);
     assert_eq!(rc_exec_sum + rc_table_sum, QM31::ZERO,
         "range check LogUp sums don't cancel — offset out of range");
     let rc_final_sum = rc_exec_sum.to_u32_array();
 
+    // Pad each RC column from n_steps to n by repeating the final running-sum value.
+    // After the last real row the sum stays constant (zero contribution from padding).
+    for c in 0..4 {
+        let last = *rc_trace_cols[c].last().unwrap_or(&0);
+        rc_trace_cols[c].resize(n, last);
+    }
+
     let interaction_commitment = MerkleTree::commit_root_soa4(
         &d_logup0, &d_logup1, &d_logup2, &d_logup3, log_eval_size,
     );
     channel.mix_digest(&interaction_commitment);
+    drop(d_logup0); drop(d_logup1); drop(d_logup2); drop(d_logup3);
+
+    // Free memory LogUp eval cols before uploading RC trace columns.
+    drop(d_eval_cols);
+
+    // Commit the RC interaction trace polynomial: NTT to eval domain, Merkle commit.
+    // This binds the prover to a specific RC trace BEFORE constraint alphas are drawn,
+    // closing the gap where rc_final_sum was previously an unconstrained claim.
+    let mut rc_d_eval: [DeviceBuffer<u32>; 4] = std::array::from_fn(|_| DeviceBuffer::<u32>::alloc(0));
+    for c in 0..4usize {
+        let mut d_col = DeviceBuffer::from_host(&rc_trace_cols[c]);
+        ntt::interpolate(&mut d_col, &cache.inv_cache);
+        let mut d_eval = DeviceBuffer::<u32>::alloc(eval_size);
+        unsafe { ffi::cuda_zero_pad(d_col.as_ptr(), d_eval.as_mut_ptr(), n as u32, eval_size as u32); }
+        drop(d_col);
+        ntt::evaluate(&mut d_eval, &cache.fwd_cache);
+        rc_d_eval[c] = d_eval;
+    }
+    let rc_interaction_commitment = MerkleTree::commit_root_soa4(
+        &rc_d_eval[0], &rc_d_eval[1], &rc_d_eval[2], &rc_d_eval[3], log_eval_size,
+    );
+    channel.mix_digest(&rc_interaction_commitment);
+    drop(rc_d_eval);
+    drop(rc_trace_cols);
+
     // Bind LogUp and RC final sums into Fiat-Shamir (tampering breaks FRI)
     channel.mix_digest(&[
         logup_final_sum[0], logup_final_sum[1], logup_final_sum[2], logup_final_sum[3],
         rc_final_sum[0], rc_final_sum[1], rc_final_sum[2], rc_final_sum[3],
     ]);
-    drop(d_logup0); drop(d_logup1); drop(d_logup2); drop(d_logup3);
-
-    // Free remaining LogUp eval cols — all trace data now lives on host only
-    drop(d_eval_cols);
 
     // ---- Phase 3: Quotient ----
     let constraint_alphas: Vec<QM31> = (0..N_CONSTRAINTS).map(|_| channel.draw_felt()).collect();
@@ -538,6 +569,7 @@ pub fn cairo_prove_cached(
         ec_trace_at_queries,
         ec_trace_at_queries_next,
         interaction_commitment,
+        rc_interaction_commitment,
         quotient_commitment,
         fri_commitments,
         fri_last_layer,
@@ -592,8 +624,13 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
     // This provides equivalent security without re-executing the VM.
     // (The verifier is O(n_queries × log(n)), not O(n_steps))
 
-    // Must match prover order exactly: interaction_commitment → final_sums → draw alphas
+    // Must match prover order exactly:
+    //   interaction_commitment → rc_interaction_commitment → final_sums → draw alphas
     channel.mix_digest(&proof.interaction_commitment);
+    if proof.rc_interaction_commitment == [0u32; 8] {
+        return Err("RC interaction commitment is zero".into());
+    }
+    channel.mix_digest(&proof.rc_interaction_commitment);
     channel.mix_digest(&[
         proof.logup_final_sum[0], proof.logup_final_sum[1],
         proof.logup_final_sum[2], proof.logup_final_sum[3],
