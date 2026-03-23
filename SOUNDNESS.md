@@ -44,9 +44,19 @@
 
 ## Verified Subsystems
 
+### Vanishing polynomial / zerofier (FIXED 2026-03-22)
+- Previously: quotient kernel wrote C(x) (raw constraint sum). FRI proved C(x) low-degree,
+  but low-degree C(x) alone does not prove constraints vanish on the trace domain.
+- Now: GPU kernel `compute_vanishing_inv_kernel` computes 1/Z_H(x) for every NTT position.
+  Z_H(x) = f_{log_n}(x)+1 where f_k is iterated circle doubling (x→2x²−1), zero iff x is
+  in the trace domain. Quotient kernel multiplies by vh_inv, producing Q(x)=C(x)/Z_H(x).
+- Verifier checks C(x)==Q(x)·Z_H(x) at each query point using Coset::circle_vanishing_poly_at.
+- Closing this gap is the primary soundness improvement: FRI now proves Q(x) is low-degree,
+  which by the Schwartz-Zippel argument implies C(x) vanishes on the trace domain w.h.p.
+
 ### Verifier-side constraint evaluation
 - Verifier independently evaluates all 31 constraints at query points
-- Checks constraint_sum == quotient_decommitment_value (exact equality)
+- Checks constraint_sum == quotient_value * Z_H(eval_point.x) (accounting for zerofier)
 - Per-constraint-family tamper tests all passing
 
 ### LogUp final-value enforcement
@@ -93,8 +103,11 @@ M31 field arithmetic (2^31 ≡ 1) prevents expressing the full 63-bit instructio
 ### Range check wiring
 The range check LogUp argument is fully implemented and tested (extract_offsets, interaction trace, table sum, cancellation tests all pass). It is not yet called from the prover pipeline. Offsets are constrained by the operand address verification constraints, but are not independently proven to be in [0, 2^16).
 
-### Merkle domain separation
-Leaf and internal node hashing both use raw Blake2s. Leaf inputs are typically 4-16 bytes (1-4 columns) while internal nodes are always 64 bytes (two 32-byte hashes). This provides implicit length-based separation for traces with fewer than 16 columns, but 16-column traces would have same-length inputs.
+### Merkle domain separation (CORRECTLY IMPLEMENTED — not a gap)
+Blake2s leaf hashing uses h[6]=IV6 (default); internal node hashing uses h[6]=IV6^1 via
+`IV6_NODE` in blake2s.cu and `blake2s_hash_node` on the CPU side. This is standard
+domain separation that prevents second-preimage attacks. Previously documented as a gap
+in error — the implementation is correct.
 
 ## Confidence Summary
 
@@ -102,14 +115,14 @@ Leaf and internal node hashing both use raw Blake2s. Leaf inputs are typically 4
 |-----------|-----------|
 | GPU kernels / benchmarks | 95% |
 | Fibonacci STARK (prove+verify) | 95% |
-| Cairo verifier soundness | 90% |
-| Cairo constraint completeness | 90% |
-| Production readiness | 75% |
+| Cairo verifier soundness | 92% |
+| Cairo constraint completeness | 92% |
+| Production readiness | 82% |
 
 ### What would move production readiness higher
-- Wire range checks into prover pipeline
+- Wire range checks into prover pipeline (RC interaction trace committed, verifier decommits at queries)
 - Full instruction decomposition (extend LogUp to cover inst_hi, or add multi-limb decomposition columns)
-- Merkle domain separation (leaf prefix 0x00, node prefix 0x01)
+- Interaction trace decommitment at query points (verifier checks LogUp running sum transitions)
 - Security audit by an external party
 - Formal verification of constraint polynomials
 - Adversarial testing with intentionally malformed traces
