@@ -382,6 +382,22 @@ pub fn cairo_prove_cached(
     let d_col_ptrs = DeviceBuffer::from_host(&col_ptrs);
     let d_alpha = DeviceBuffer::from_host(&alpha_flat);
 
+    // Compute 1/Z_H for every NTT position in the eval domain.
+    // Z_H(x) = 0 iff x is the x-coordinate of a trace domain point.
+    // The quotient Q(x) = C(x)/Z_H(x) is the polynomial that FRI proves low-degree.
+    let eval_domain = crate::circle::Coset::half_coset(log_eval_size);
+    let mut d_vh_inv = DeviceBuffer::<u32>::alloc(eval_size);
+    unsafe {
+        ffi::cuda_compute_vanishing_inv(
+            eval_domain.initial.x.0, eval_domain.initial.y.0,
+            eval_domain.step.x.0,   eval_domain.step.y.0,
+            d_vh_inv.as_mut_ptr(),
+            log_eval_size,
+            log_n,
+        );
+        ffi::cuda_device_sync();
+    }
+
     let mut q0 = DeviceBuffer::<u32>::alloc(eval_size);
     let mut q1 = DeviceBuffer::<u32>::alloc(eval_size);
     let mut q2 = DeviceBuffer::<u32>::alloc(eval_size);
@@ -392,10 +408,12 @@ pub fn cairo_prove_cached(
             d_col_ptrs.as_ptr() as *const *const u32,
             q0.as_mut_ptr(), q1.as_mut_ptr(), q2.as_mut_ptr(), q3.as_mut_ptr(),
             d_alpha.as_ptr(),
+            d_vh_inv.as_ptr(),
             eval_size as u32,
         );
         ffi::cuda_device_sync();
     }
+    drop(d_vh_inv);
     // Free quotient-phase eval cols — trace data stays on host_eval_cols
     drop(d_quot_cols);
     drop(d_dummy);
@@ -695,6 +713,7 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
     // The verifier independently evaluates the 31 Cairo constraints and checks
     // they match the quotient values. This closes the critical soundness gap.
     let constraint_alphas = constraint_alphas_drawn;
+    let verif_eval_domain = crate::circle::Coset::half_coset(log_eval_size);
     for (q, &qi) in proof.query_indices.iter().enumerate() {
         let row = &proof.trace_values_at_queries[q];
         let next = &proof.trace_values_at_queries_next[q];
@@ -883,15 +902,20 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
         }
         let _ = ci; // all 31 constraints evaluated
 
-        // The GPU quotient kernel outputs the raw alpha-weighted constraint sum
-        // (no zerofier division). So the committed quotient value at this point
-        // must exactly equal our constraint evaluation.
+        // The GPU quotient kernel outputs Q(x) = C(x)/Z_H(x).
+        // So the committed quotient value times the vanishing polynomial must equal
+        // the constraint sum: C(x) == Q(x) * Z_H(x).
+        let natural_idx = bit_reverse(qi, log_eval_size);
+        let eval_point = verif_eval_domain.at(natural_idx);
+        let zh = crate::circle::Coset::circle_vanishing_poly_at(eval_point.x, log_n);
+
         let q_val = QM31::from_u32_array(proof.quotient_decommitment.values[q]);
-        if constraint_sum != q_val {
+        let q_times_zh = q_val * zh;
+        if constraint_sum != q_times_zh {
             return Err(format!(
                 "Constraint evaluation mismatch at query {q} (qi={qi}): \
-                 verifier computed {:?}, quotient has {:?}",
-                constraint_sum.to_u32_array(), q_val.to_u32_array()
+                 verifier computed C(x)={:?}, Q(x)*Z_H={:?}",
+                constraint_sum.to_u32_array(), q_times_zh.to_u32_array()
             ));
         }
     }

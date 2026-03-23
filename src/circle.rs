@@ -130,6 +130,19 @@ impl Coset {
         self.initial.mul(self.step.mul_scalar(i as u32))
     }
 
+    /// Evaluate the vanishing polynomial of half_coset(log_size) at x.
+    ///
+    /// Z_H(x) = 0 iff x is the x-coordinate of a point in the trace domain.
+    /// Formula: Z_H(x) = f_{log_size}(x) + 1,
+    ///   where f_0(x) = x, f_{i+1}(x) = 2x^2 − 1  (circle group doubling).
+    pub fn circle_vanishing_poly_at(x: M31, log_size: u32) -> M31 {
+        let mut v = x;
+        for _ in 0..log_size {
+            v = M31(2) * v * v - M31::ONE;
+        }
+        v + M31::ONE
+    }
+
     /// Generate all coset points at once using sequential multiplication.
     /// O(n) circle multiplications instead of O(n log n).
     pub fn all_points(&self) -> Vec<CirclePoint> {

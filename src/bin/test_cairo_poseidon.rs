@@ -144,14 +144,24 @@ fn main() {
         let mut q2 = DeviceBuffer::<u32>::alloc(eval_size);
         let mut q3 = DeviceBuffer::<u32>::alloc(eval_size);
 
+        let mut d_vh_inv = vortexstark::device::DeviceBuffer::<u32>::alloc(eval_size);
         unsafe {
+            ffi::cuda_compute_vanishing_inv(
+                eval_domain.initial.x.0, eval_domain.initial.y.0,
+                eval_domain.step.x.0,   eval_domain.step.y.0,
+                d_vh_inv.as_mut_ptr(),
+                log_eval_size,
+                log_n,
+            );
             ffi::cuda_cairo_quotient(
                 d_col_ptrs.as_ptr() as *const *const u32,
                 q0.as_mut_ptr(), q1.as_mut_ptr(), q2.as_mut_ptr(), q3.as_mut_ptr(),
                 d_alpha.as_ptr(),
+                d_vh_inv.as_ptr(),
                 eval_size as u32,
             );
         }
+        drop(d_vh_inv);
 
         // Also add Poseidon constraint quotient (using builtin columns 27-34)
         let poseidon_alpha_coeffs: Vec<QM31> = (0..STATE_WIDTH).map(|_| channel.draw_felt()).collect();

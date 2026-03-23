@@ -36,11 +36,84 @@
 #define COL_OP0_ADDR 22
 #define COL_OP1_ADDR 24
 
+// ── Vanishing polynomial helpers ───────────────────────────────────────────
+
+// Bit-reverse an index of log_n bits.
+__device__ __forceinline__ uint32_t cairo_bit_reverse(uint32_t val, uint32_t log_n) {
+    uint32_t result = 0;
+    for (uint32_t i = 0; i < log_n; i++) {
+        result = (result << 1) | (val & 1);
+        val >>= 1;
+    }
+    return result;
+}
+
+// For trace half_coset(log_n), the vanishing polynomial is:
+//   Z_H(x) = f_{log_n}(x) + 1,  where f_0(x) = x, f_{i+1}(x) = 2x^2 - 1.
+// Z_H(x) = 0 iff x is the x-coordinate of a point in the trace domain.
+__device__ __forceinline__ uint32_t vanishing_poly(uint32_t x, uint32_t log_n) {
+    uint32_t v = x;
+    for (uint32_t k = 0; k < log_n; k++) {
+        // v = 2v^2 - 1  (circle group doubling x-coordinate)
+        v = m31_sub(m31_add(m31_mul(v, v), m31_mul(v, v)), 1u);
+    }
+    return m31_add(v, 1u);  // Z_H = f_{log_n}(x) + 1
+}
+
+// Compute 1/Z_H for every NTT position in the eval domain.
+// The eval domain is half_coset(log_eval): initial*(step^j) at natural index j.
+// NTT output index i corresponds to natural index j = bit_reverse(i, log_eval).
+//
+// Per-thread: compute step^j via square-and-multiply, multiply by initial,
+// extract x, apply Z_H formula, compute Fermat inverse.
+__global__ void compute_vanishing_inv_kernel(
+    uint32_t initial_x, uint32_t initial_y,
+    uint32_t step_x,    uint32_t step_y,
+    uint32_t* __restrict__ out_vh_inv,
+    uint32_t log_eval,  // log2(eval domain size)
+    uint32_t log_n      // log2(trace domain size) — doubling count for Z_H
+) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t eval_n = 1u << log_eval;
+    if (i >= eval_n) return;
+
+    // NTT index → natural coset index
+    uint32_t j = cairo_bit_reverse(i, log_eval);
+
+    // Compute step^j in the circle group via square-and-multiply
+    // Identity = (1, 0)
+    uint32_t rx = 1u, ry = 0u;
+    uint32_t bx = step_x, by = step_y;
+    uint32_t k = j;
+    for (uint32_t bit = 0; bit < log_eval; bit++) {
+        if (k & 1u) {
+            // r = r * b  (circle multiplication)
+            uint32_t nx = m31_sub(m31_mul(rx, bx), m31_mul(ry, by));
+            uint32_t ny = m31_add(m31_mul(rx, by), m31_mul(ry, bx));
+            rx = nx; ry = ny;
+        }
+        // b = b^2  (circle doubling: x' = 2x^2-1, y' = 2xy)
+        uint32_t nx = m31_sub(m31_add(m31_mul(bx, bx), m31_mul(bx, bx)), 1u);
+        uint32_t ny = m31_add(m31_mul(bx, by), m31_mul(bx, by));
+        bx = nx; by = ny;
+        k >>= 1;
+    }
+
+    // point = initial * step^j
+    uint32_t px = m31_sub(m31_mul(initial_x, rx), m31_mul(initial_y, ry));
+    // (y-coordinate not needed)
+
+    // Z_H(px) and its inverse
+    uint32_t zh = vanishing_poly(px, log_n);
+    out_vh_inv[i] = m31_inv(zh);
+}
+
 __global__ void cairo_quotient_kernel(
     const uint32_t* const* __restrict__ trace_cols,  // [31] column pointers
     uint32_t* __restrict__ out0, uint32_t* __restrict__ out1,
     uint32_t* __restrict__ out2, uint32_t* __restrict__ out3,
     const uint32_t* __restrict__ alpha_coeffs,  // [N_CONSTRAINTS * 4] QM31 coefficients
+    const uint32_t* __restrict__ vh_inv,        // [n] 1/Z_H at each eval point (NTT order)
     uint32_t n  // eval domain size
 ) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -306,6 +379,9 @@ __global__ void cairo_quotient_kernel(
         quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
     }
 
+    // Divide by vanishing polynomial: Q(x) = C(x) / Z_H(x)
+    quotient = qm31_mul_m31(quotient, vh_inv[i]);
+
     out0[i] = quotient.v[0];
     out1[i] = quotient.v[1];
     out2[i] = quotient.v[2];
@@ -318,6 +394,7 @@ __global__ void cairo_quotient_chunk_kernel(
     uint32_t* __restrict__ out0, uint32_t* __restrict__ out1,
     uint32_t* __restrict__ out2, uint32_t* __restrict__ out3,
     const uint32_t* __restrict__ alpha_coeffs,
+    const uint32_t* __restrict__ vh_inv,  // [global_n] 1/Z_H in NTT order
     uint32_t offset, uint32_t chunk_n, uint32_t global_n
 ) {
     uint32_t local_i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -503,6 +580,9 @@ __global__ void cairo_quotient_chunk_kernel(
         }
     }
 
+    // Divide by vanishing polynomial: Q(x) = C(x) / Z_H(x)
+    quotient = qm31_mul_m31(quotient, vh_inv[i]);
+
     out0[local_i] = quotient.v[0];
     out1[local_i] = quotient.v[1];
     out2[local_i] = quotient.v[2];
@@ -511,16 +591,33 @@ __global__ void cairo_quotient_chunk_kernel(
 
 extern "C" {
 
+void cuda_compute_vanishing_inv(
+    uint32_t initial_x, uint32_t initial_y,
+    uint32_t step_x, uint32_t step_y,
+    uint32_t* out_vh_inv,
+    uint32_t log_eval,
+    uint32_t log_n
+) {
+    uint32_t eval_n = 1u << log_eval;
+    uint32_t threads = 256;
+    uint32_t blocks = (eval_n + threads - 1) / threads;
+    compute_vanishing_inv_kernel<<<blocks, threads>>>(
+        initial_x, initial_y, step_x, step_y,
+        out_vh_inv, log_eval, log_n
+    );
+}
+
 void cuda_cairo_quotient(
     const uint32_t* const* trace_cols,
     uint32_t* out0, uint32_t* out1, uint32_t* out2, uint32_t* out3,
     const uint32_t* alpha_coeffs,
+    const uint32_t* vh_inv,
     uint32_t n
 ) {
     uint32_t threads = 256;
     uint32_t blocks = (n + threads - 1) / threads;
     cairo_quotient_kernel<<<blocks, threads>>>(
-        trace_cols, out0, out1, out2, out3, alpha_coeffs, n
+        trace_cols, out0, out1, out2, out3, alpha_coeffs, vh_inv, n
     );
 }
 
@@ -528,12 +625,13 @@ void cuda_cairo_quotient_chunk(
     const uint32_t* const* trace_cols,
     uint32_t* out0, uint32_t* out1, uint32_t* out2, uint32_t* out3,
     const uint32_t* alpha_coeffs,
+    const uint32_t* vh_inv,
     uint32_t offset, uint32_t chunk_n, uint32_t global_n
 ) {
     uint32_t threads = 256;
     uint32_t blocks = (chunk_n + threads - 1) / threads;
     cairo_quotient_chunk_kernel<<<blocks, threads>>>(
-        trace_cols, out0, out1, out2, out3, alpha_coeffs,
+        trace_cols, out0, out1, out2, out3, alpha_coeffs, vh_inv,
         offset, chunk_n, global_n
     );
 }

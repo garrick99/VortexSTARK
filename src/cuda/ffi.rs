@@ -432,10 +432,19 @@ unsafe extern "C" {
         n: u32, block_size: u32,
     );
 
+    pub fn cuda_compute_vanishing_inv(
+        initial_x: u32, initial_y: u32,
+        step_x: u32, step_y: u32,
+        out_vh_inv: *mut u32,
+        log_eval: u32,
+        log_n: u32,
+    );
+
     pub fn cuda_cairo_quotient(
         trace_cols: *const *const u32,
         out0: *mut u32, out1: *mut u32, out2: *mut u32, out3: *mut u32,
         alpha_coeffs: *const u32,
+        vh_inv: *const u32,
         n: u32,
     );
 
@@ -443,6 +452,7 @@ unsafe extern "C" {
         trace_cols: *const *const u32,
         out0: *mut u32, out1: *mut u32, out2: *mut u32, out3: *mut u32,
         alpha_coeffs: *const u32,
+        vh_inv: *const u32,
         offset: u32, chunk_n: u32, global_n: u32,
     );
 
