@@ -543,6 +543,14 @@ unsafe extern "C" {
         trace_cols: *const *mut u32,
         n_blocks: u32,
     );
+
+    pub fn cuda_p2f_upload_consts(host_rc: *const u32);
+
+    pub fn cuda_p2f_trace(
+        block_inputs: *const u32,
+        trace_cols: *const *mut u32,
+        n_blocks: u32,
+    );
 }
 
 // Blake2s PoW grinding kernel

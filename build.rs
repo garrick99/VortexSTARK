@@ -9,7 +9,23 @@ fn main() {
 
     // Find CUDA
     let cuda_dir = if is_windows {
-        PathBuf::from(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0")
+        // Try v13.x versions in preference order, fall back to v13.0
+        let cuda_base = PathBuf::from(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA");
+        let candidate = std::fs::read_dir(&cuda_base)
+            .ok()
+            .and_then(|entries| {
+                let mut versions: Vec<_> = entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                    .filter_map(|e| {
+                        let name = e.file_name().into_string().ok()?;
+                        if name.starts_with("v13.") { Some((name, e.path())) } else { None }
+                    })
+                    .collect();
+                versions.sort_by(|a, b| a.0.cmp(&b.0)); // lowest version first (prefer older, more compatible nvcc)
+                versions.into_iter().next().map(|(_, p)| p)
+            });
+        candidate.unwrap_or_else(|| cuda_base.join("v13.0"))
     } else {
         // Linux: check CUDA_PATH, then common locations
         env::var("CUDA_PATH").map(PathBuf::from).unwrap_or_else(|_| {
@@ -28,12 +44,30 @@ fn main() {
         cuda_dir.join("bin").join("nvcc")
     };
 
-    // Windows: ensure MSVC on PATH
+    // Windows: ensure MSVC lib.exe is on PATH
     if is_windows {
-        let msvc_bin = r"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.50.35717\bin\Hostx64\x64";
         let path = env::var("PATH").unwrap_or_default();
         if !path.contains("MSVC") {
-            unsafe { env::set_var("PATH", format!("{msvc_bin};{path}")) };
+            // Use vswhere to find the MSVC toolchain dynamically
+            let vswhere_paths = [
+                r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe",
+                r"C:\Program Files\Microsoft Visual Studio\Installer\vswhere.exe",
+            ];
+            let msvc_bin = vswhere_paths.iter()
+                .find(|p| std::fs::metadata(p).is_ok())
+                .and_then(|vswhere| {
+                    Command::new(vswhere)
+                        .args(["-latest", "-products", "*",
+                               "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                               "-find", r"VC\Tools\MSVC\*\bin\Hostx64\x64"])
+                        .output().ok()
+                })
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.lines().last().unwrap_or("").trim().to_string())
+                .filter(|s| !s.is_empty());
+            if let Some(bin) = msvc_bin {
+                unsafe { env::set_var("PATH", format!("{bin};{path}")) };
+            }
         }
     }
 
@@ -54,6 +88,36 @@ fn main() {
 
         let mut cmd = Command::new(&nvcc);
         cmd.args(["-c", "-O3"]);
+
+        // On Windows, nvcc may reject newer MSVC/SDK versions as an unsupported host compiler.
+        // Use an older MSVC (14.44 / VS 2022) and an older Windows SDK (22621) for CUDA
+        // host compilation, which CUDA 13.x is known to support.
+        if is_windows {
+            let preferred_ccbin = PathBuf::from(
+                r"C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64"
+            );
+            if preferred_ccbin.exists() {
+                cmd.arg("-ccbin").arg(&preferred_ccbin);
+            }
+
+            // Prefer an older Windows SDK for CUDA include paths
+            let sdk_base = PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10\Include");
+            for sdk_ver in &["10.0.22621.0", "10.0.22000.0", "10.0.26100.0"] {
+                let sdk_inc = sdk_base.join(sdk_ver);
+                if sdk_inc.exists() {
+                    let msvc_inc = r"C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.44.35207\include";
+                    let include = format!(
+                        "{};{};{};{}",
+                        msvc_inc,
+                        sdk_inc.join("ucrt").display(),
+                        sdk_inc.join("um").display(),
+                        sdk_inc.join("shared").display(),
+                    );
+                    cmd.env("INCLUDE", &include);
+                    break;
+                }
+            }
+        }
 
         // GPU architectures
         cmd.args(["-gencode", "arch=compute_89,code=sm_89"]);

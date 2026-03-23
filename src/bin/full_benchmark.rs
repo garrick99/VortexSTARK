@@ -4,6 +4,7 @@ use vortexstark::field::M31;
 use vortexstark::poseidon;
 use vortexstark::cairo_air::{decode::Instruction, prover::cairo_prove, prover::cairo_verify};
 use vortexstark::rpo_m31;
+use vortexstark::poseidon2f;
 use std::time::Instant;
 
 fn main() {
@@ -21,6 +22,12 @@ fn main() {
     println!("  GPU: {gpu_info}\n");
 
     ffi::init_memory_pool_greedy();
+
+    // Wake the GPU: nvidia-smi query forces the driver out of idle/P8 state
+    // before any CUDA work begins, eliminating first-run latency spikes.
+    let _ = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=power.draw", "--format=csv,noheader"])
+        .output();
 
     // Warmup
     let _ = vortexstark::prover::prove(M31(1), M31(1), 8);
@@ -59,22 +66,22 @@ fn main() {
         let inv = vortexstark::ntt::InverseTwiddleCache::new(&trace_domain);
         let fwd = vortexstark::ntt::ForwardTwiddleCache::new(&eval_domain);
 
+        // Drop each eval col immediately — do NOT accumulate. Wide traces (RPO: 24 cols,
+        // Cairo: 31 cols) would OOM if all eval cols were kept alive simultaneously.
         let t2 = Instant::now();
-        let mut d_eval_cols = Vec::new();
         for mut col in d_cols {
             vortexstark::ntt::interpolate(&mut col, &inv);
             let mut d_eval = vortexstark::device::DeviceBuffer::<u32>::alloc(eval_size);
             unsafe { ffi::cuda_zero_pad(col.as_ptr(), d_eval.as_mut_ptr(), n as u32, eval_size as u32); }
             drop(col);
             vortexstark::ntt::evaluate(&mut d_eval, &fwd);
-            d_eval_cols.push(d_eval);
+            // d_eval drops here
         }
         let ntt_ms = t2.elapsed().as_secs_f64() * 1000.0;
         let total_ms = t.elapsed().as_secs_f64() * 1000.0;
         let hashes_per_sec = n_hashes as f64 / (total_ms / 1000.0);
 
         println!("  log_n={log_n:>2} | {n_hashes:>12} hashes | trace: {trace_ms:>6.0}ms | NTT: {ntt_ms:>6.0}ms | total: {total_ms:>8.1}ms | {:.1}M hash/s", hashes_per_sec / 1e6);
-        drop(d_eval_cols);
     }
 
     println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -120,22 +127,58 @@ fn main() {
         let inv = vortexstark::ntt::InverseTwiddleCache::new(&trace_domain);
         let fwd = vortexstark::ntt::ForwardTwiddleCache::new(&eval_domain);
 
+        // Drop each eval col immediately — do NOT accumulate. Wide traces (RPO: 24 cols,
+        // Cairo: 31 cols) would OOM if all eval cols were kept alive simultaneously.
         let t2 = Instant::now();
-        let mut d_eval_cols = Vec::new();
         for mut col in d_cols {
             vortexstark::ntt::interpolate(&mut col, &inv);
             let mut d_eval = vortexstark::device::DeviceBuffer::<u32>::alloc(eval_size);
             unsafe { ffi::cuda_zero_pad(col.as_ptr(), d_eval.as_mut_ptr(), n as u32, eval_size as u32); }
             drop(col);
             vortexstark::ntt::evaluate(&mut d_eval, &fwd);
-            d_eval_cols.push(d_eval);
+            // d_eval drops here
         }
         let ntt_ms = t2.elapsed().as_secs_f64() * 1000.0;
         let total_ms = t.elapsed().as_secs_f64() * 1000.0;
         let hashes_per_sec = n_hashes as f64 / (total_ms / 1000.0);
 
         println!("  log_n={log_n:>2} | {n_hashes:>12} hashes | trace: {trace_ms:>6.0}ms | NTT: {ntt_ms:>6.0}ms | total: {total_ms:>8.1}ms | {:.1}M hash/s", hashes_per_sec / 1e6);
-        drop(d_eval_cols);
+    }
+
+    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("  POSEIDON2-FULL [EXPERIMENTAL] (8 cols, 8 rows/perm — RF=8, RP=0)");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    for log_n in [20, 24, 28] {
+        let n: usize = 1 << log_n;
+        let n_hashes = n / poseidon2f::ROWS_PER_PERM;
+
+        let t = Instant::now();
+        let d_cols = poseidon2f::generate_trace_gpu(log_n);
+        let trace_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        let eval_size = 2 * n;
+        let log_eval = log_n + 1;
+        let trace_domain = vortexstark::circle::Coset::half_coset(log_n);
+        let eval_domain = vortexstark::circle::Coset::half_coset(log_eval);
+        let inv = vortexstark::ntt::InverseTwiddleCache::new(&trace_domain);
+        let fwd = vortexstark::ntt::ForwardTwiddleCache::new(&eval_domain);
+
+        // Drop each eval col immediately — do NOT accumulate. Wide traces (RPO: 24 cols,
+        // Cairo: 31 cols) would OOM if all eval cols were kept alive simultaneously.
+        let t2 = Instant::now();
+        for mut col in d_cols {
+            vortexstark::ntt::interpolate(&mut col, &inv);
+            let mut d_eval = vortexstark::device::DeviceBuffer::<u32>::alloc(eval_size);
+            unsafe { ffi::cuda_zero_pad(col.as_ptr(), d_eval.as_mut_ptr(), n as u32, eval_size as u32); }
+            drop(col);
+            vortexstark::ntt::evaluate(&mut d_eval, &fwd);
+            // d_eval drops here
+        }
+        let ntt_ms = t2.elapsed().as_secs_f64() * 1000.0;
+        let total_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let hashes_per_sec = n_hashes as f64 / (total_ms / 1000.0);
+
+        println!("  log_n={log_n:>2} | {n_hashes:>12} hashes | trace: {trace_ms:>6.0}ms | NTT: {ntt_ms:>6.0}ms | total: {total_ms:>8.1}ms | {:.1}M hash/s", hashes_per_sec / 1e6);
     }
 
     println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -162,7 +205,7 @@ fn main() {
     println!("  Engine:     GPU-native Circle STARK (M31, 100-bit security)");
     println!("  GPU:        {gpu_info}");
   
-    println!("  Builtins:   Poseidon2 (GPU, 30 rows/perm), RPO-M31 (GPU, 14 rows/perm), Pedersen (GPU)");
+    println!("  Builtins:   Poseidon2 (GPU, 30 rows/perm), RPO-M31 (GPU, 14 rows/perm), Poseidon2-Full (GPU, 8 rows/perm, experimental), Pedersen (GPU)");
     println!("  Features:   LogUp memory consistency, range checks, 2-phase commitment");
     println!("  CLI:        stark_cli prove/verify (binary proof serialization)");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");

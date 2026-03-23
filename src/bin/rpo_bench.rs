@@ -34,22 +34,24 @@ fn main() {
         let inv_cache = InverseTwiddleCache::new(&trace_domain);
         let fwd_cache = ForwardTwiddleCache::new(&eval_domain);
 
+        // NTT: process one column at a time, dropping each eval col immediately.
+        // Do NOT accumulate all eval cols — for RPO at log_n=28 that would be
+        // 24 × 2 GB = 48 GB simultaneously, which exceeds 32 GB VRAM.
+        // Peak with this pattern: trace_all (24 GB) + one_eval (2 GB) = 26 GB.
         let t2 = Instant::now();
-        let mut d_evals = Vec::new();
         for mut col in d_cols {
             interpolate(&mut col, &inv_cache);
             let mut d_eval = DeviceBuffer::<u32>::alloc(eval_size);
             unsafe { ffi::cuda_zero_pad(col.as_ptr(), d_eval.as_mut_ptr(), n as u32, eval_size as u32); }
             drop(col);
             evaluate(&mut d_eval, &fwd_cache);
-            d_evals.push(d_eval);
+            // d_eval drops here — only one eval col live at a time
         }
         let ntt_ms = t2.elapsed().as_secs_f64() * 1000.0;
         let total_ms = t.elapsed().as_secs_f64() * 1000.0;
         let mhps = (n_hashes as f64) / (total_ms / 1000.0) / 1e6;
 
         println!("  log_n={log_n:>2} | {n_hashes:>12} hashes | trace: {trace_ms:>6.0}ms | NTT: {ntt_ms:>6.0}ms | total: {total_ms:>8.1}ms | {mhps:.2}M hash/s");
-        drop(d_evals);
     }
 
     // ── Poseidon2 comparison ────────────────────────────────────────────────
@@ -72,20 +74,17 @@ fn main() {
         let fwd_cache = ForwardTwiddleCache::new(&eval_domain);
 
         let t2 = Instant::now();
-        let mut d_evals = Vec::new();
         for mut col in d_cols {
             interpolate(&mut col, &inv_cache);
             let mut d_eval = DeviceBuffer::<u32>::alloc(eval_size);
             unsafe { ffi::cuda_zero_pad(col.as_ptr(), d_eval.as_mut_ptr(), n as u32, eval_size as u32); }
             drop(col);
             evaluate(&mut d_eval, &fwd_cache);
-            d_evals.push(d_eval);
         }
         let ntt_ms = t2.elapsed().as_secs_f64() * 1000.0;
         let total_ms = t.elapsed().as_secs_f64() * 1000.0;
         let mhps = (n_hashes as f64) / (total_ms / 1000.0) / 1e6;
 
         println!("  log_n={log_n:>2} | {n_hashes:>12} hashes | trace: {trace_ms:>6.0}ms | NTT: {ntt_ms:>6.0}ms | total: {total_ms:>8.1}ms | {mhps:.2}M hash/s");
-        drop(d_evals);
     }
 }

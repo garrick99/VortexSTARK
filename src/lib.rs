@@ -9,6 +9,7 @@ pub mod channel;
 pub mod air;
 pub mod poseidon;
 pub mod rpo_m31;
+pub mod poseidon2f;
 pub mod cairo_air;
 pub mod prover;
 pub mod verifier;

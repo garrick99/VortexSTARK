@@ -36,6 +36,14 @@ path = "src/bin/full_benchmark.rs"
 name = "rpo_bench"
 path = "src/bin/rpo_bench.rs"
 
+[[bin]]
+name = "hash_bench"
+path = "src/bin/hash_bench.rs"
+
+[[bin]]
+name = "gpu_bench"
+path = "src/bin/gpu_bench.rs"
+
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
