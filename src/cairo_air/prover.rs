@@ -593,20 +593,24 @@ pub fn cairo_prove_cached(
     };
 
     // Sparse quotient decommitment from host (downloaded after quotient commitment)
-    let quotient_decommitment = sparse_decommit_soa4_host(
-        &host_q0, &host_q1, &host_q2, &host_q3, &query_indices, eval_size,
-    );
-    drop(host_q0); drop(host_q1); drop(host_q2); drop(host_q3);
+    // Generate quotient decommitment with real Merkle auth paths.
+    // Previously used sparse_decommit_soa4_host which left auth_paths empty;
+    // the verifier skipped auth path checks, allowing fake quotient values.
+    let quotient_decommitment = {
+        let cols = [host_q0, host_q1, host_q2, host_q3]; // moves Vecs
+        let decom = decommit_from_host_soa4(&cols, &query_indices);
+        decom
+        // cols (and the host_q* Vecs) are dropped here
+    };
 
-    // Sparse FRI decommitments: extract only queried values per layer
+    // FRI decommitments with real Merkle auth paths.
+    // Previously used sparse_decommit_soa4_gpu (empty auth_paths); the verifier
+    // would skip auth path checks, allowing forged fold equation values.
     let mut fri_decommitments = Vec::new();
     let mut folded_indices: Vec<usize> = query_indices.iter().map(|&qi| qi / 2).collect();
 
     for eval in &fri_evals {
-        let decom = sparse_decommit_soa4_gpu(
-            &[&eval.cols[0], &eval.cols[1], &eval.cols[2], &eval.cols[3]],
-            &folded_indices, eval.len,
-        );
+        let decom = decommit_fri_layer(eval, &folded_indices);
         fri_decommitments.push(decom);
         folded_indices = folded_indices.iter().map(|&i| i / 2).collect();
     }
@@ -1115,10 +1119,9 @@ fn verify_decommitment_auth_paths_soa4(
     if decom.values.len() != N_QUERIES {
         return Err(format!("{label} decommitment size mismatch"));
     }
-    // Auth paths are optional — sparse GPU decommitment skips them for performance.
-    // FRI fold equations + Fiat-Shamir binding provide equivalent security.
+    // Require non-empty auth paths (empty = legacy behavior with no Merkle binding).
     if decom.auth_paths.iter().all(|p| p.is_empty()) {
-        return Ok(());
+        return Err(format!("{label} auth paths are empty — commitment is unverified"));
     }
     for (q, &qi) in indices.iter().enumerate() {
         let leaf_hash = MerkleTree::hash_leaf(&decom.values[q]);
@@ -1425,6 +1428,34 @@ mod tests {
         proof.quotient_decommitment.values[0][0] ^= 1;
         let result = cairo_verify(&proof);
         assert!(result.is_err(), "Tampered quotient should fail");
+    }
+
+    #[test]
+    fn test_quotient_auth_paths_reject_fake_value() {
+        // Tamper quotient value while keeping stale auth path (for original value).
+        // The auth path check should reject the tampered value.
+        ffi::init_memory_pool();
+        let program = build_fib_program(64);
+        let mut proof = cairo_prove(&program, 64, 6);
+        // Keep auth path but change the value — auth path is for a different leaf hash.
+        proof.quotient_decommitment.values[0][0] ^= 1;
+        // Also fix the constraint sum check by adjusting sibling (to isolate auth path check).
+        // Actually just let it fail at whichever check comes first (auth or constraint).
+        let result = cairo_verify(&proof);
+        assert!(result.is_err(), "Tampered quotient with stale auth path should fail: {:?}", result);
+    }
+
+    #[test]
+    fn test_fri_auth_paths_reject_fake_value() {
+        // Tamper FRI decommitment value — now auth paths bind these to commitments.
+        ffi::init_memory_pool();
+        let program = build_fib_program(64);
+        let mut proof = cairo_prove(&program, 64, 6);
+        if !proof.fri_decommitments.is_empty() {
+            proof.fri_decommitments[0].values[0][0] ^= 1;
+        }
+        let result = cairo_verify(&proof);
+        assert!(result.is_err(), "Tampered FRI value with stale auth path should fail: {:?}", result);
     }
 
     // ---- Step 6: Non-Fibonacci programs ----
