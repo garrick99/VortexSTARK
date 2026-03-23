@@ -468,12 +468,11 @@ MDS: 24×24 = 576 u32 values, uploaded to CUDA __constant__ memory
 x^(1/5) = x^1717986917, implemented as square-and-multiply (~45 mults)
 ```
 
-### Performance (RTX 5090, CUDA 13, 2026-03-22)
+### Performance (RTX 5090, CUDA 13.2, 2026-03-22, updated)
 ```
-log_n=20 |    74,898 hashes | trace:  86ms | NTT:  13ms | total:  102ms |  0.74M hash/s
-log_n=24 | 1,198,372 hashes | trace:  87ms | NTT: 155ms | total:  251ms |  4.78M hash/s
-log_n=28 | 19,173,961 hashes| trace: 1358ms | NTT: N/A* |
-  *log_n=28: NTT requires 24 cols × 2^29 eval domain = 48 GB VRAM (exceeds 32 GB)
+log_n=20 |    74,898 hashes | trace:  101ms | NTT:    9ms | total:  112ms |  0.7M hash/s
+log_n=24 | 1,198,372 hashes | trace:   82ms | NTT:  162ms | total:  250ms |  4.8M hash/s
+log_n=28 |19,173,961 hashes | trace: 1404ms | NTT: 3867ms | total: 5507ms |  3.5M hash/s
 ```
 
 ### Comparison vs Poseidon2 (same trace size)
@@ -483,21 +482,99 @@ Metric                  | Poseidon2         | RPO-M31
 Rows per permutation    | 30                | 14  (2.14x fewer)
 State width             | 8                 | 24  (3x wider)
 Hashes at log_n=24      | ~560K/perm        | ~1.2M/perm  (+2.14x)
-Trace gen time (log_n=24)| ~87ms           | ~87ms  (same bandwidth)
-NTT cost (log_n=24)     | ~52ms (8 cols)    | ~155ms (24 cols)
-Total at log_n=24       | ~4.8M hash/s      | ~4.78M hash/s  (comparable)
-Max viable log_n        | 28 (16 GB NTT)    | 24-26 (NTT memory limit)
+Trace gen time (log_n=24)| ~27ms           | ~82ms
+NTT cost (log_n=24)     | ~43ms (8 cols)    | ~162ms (24 cols)
+Total at log_n=24       | 7.4M hash/s       | 4.8M hash/s
+Total at log_n=28       | 4.7M hash/s       | 3.5M hash/s
 S-box operations        | 86/perm (x^5 only)| 14*24 fwd + 14*24 inv/perm
 ```
 
 ### Memory Note
-RPO-M31's 24 columns means the NTT evaluation domain (size 2^(log_n+1) × 24 cols) is 3x
-larger than Poseidon2's 8 columns. For log_n=28: 24 × 2 GB = 48 GB needed, exceeds 32 GB VRAM.
-Practical limit for RPO-M31 trace+NTT on RTX 5090: log_n ≤ 25 (32 GB / 24 cols / 2 ≈ 680M rows/col).
-For log_n > 25, batch the NTT column-by-column (8 cols at a time).
+RPO-M31's 24 columns accumulate significant NTT cost. The benchmark NTT loop now drops
+each eval column immediately after transform (instead of accumulating all 24), keeping
+peak VRAM at trace_all (24 GB at log_n=28) + one eval col (2 GB) = ~26 GB — well within
+32 GB. This was fixed in commit 5e67606; earlier builds would OOM at log_n=28.
 
 ### Correctness
 - 7 CPU unit tests pass (permutation, S-box roundtrip, MDS, zero input)
 - GPU trace correctness test passes: CUDA output matches CPU byte-for-byte for all 14 rows × 24 cols
 - Round constants pre-verified against AbdelStark/rpo-xhash-m31 reference (MIT)
+
+---
+
+## CHECKPOINT: Full System — OOM Fix + gpu_bench (2026-03-22)
+
+### Hardware / Toolkit
+```
+GPU:           NVIDIA GeForce RTX 5090 (32607 MiB GDDR7, SM 12.0 Blackwell)
+Driver:        595.79
+CUDA:          13.2
+Rust:          stable
+CPU:           Intel Core Ultra 9 285K (24C/24T)
+RAM:           64 GB DDR5
+OS:            Windows 11 Build 26200
+Power cap:     450W (max 600W)
+VRAM at start: 0 MB (clean)
+```
+
+### Bug Fixed
+NTT benchmark loops were accumulating all eval columns simultaneously before dropping them.
+RPO-M31 (24 cols) at log_n=28 produced 48 GB of live eval buffers, exceeding 32 GB VRAM.
+Fix: drop each eval column immediately after its NTT. Peak VRAM for RPO log_n=28 drops
+from ~72 GB to ~26 GB. All four benchmark binaries patched (full_benchmark, hash_bench,
+rpo_bench, gpu_bench).
+
+### Fibonacci STARK (1 column, degree-1 constraint)
+```
+log_n=20 |      1,048,576 elements | prove:   108.9ms | verify:  4.6ms | ✓
+log_n=24 |     16,777,216 elements | prove:   214.3ms | verify:  6.2ms | ✓
+log_n=28 |    268,435,456 elements | prove:  1556.1ms | verify:  8.2ms | ✓
+log_n=29 |    536,870,912 elements | prove:  3564.0ms | verify:  8.8ms | ✓
+log_n=30 |  1,073,741,824 elements | prove:  9786.9ms | verify: 10.7ms | ✓
+```
+
+### Poseidon2 Trace+NTT (8 cols, 30 rows/perm, RF=8 RP=22)
+```
+log_n=20 |        34,952 hashes | trace:   3ms | NTT:    3ms | total:    6.0ms |  5.8M hash/s
+log_n=24 |       559,240 hashes | trace:  27ms | NTT:   43ms | total:   75.5ms |  7.4M hash/s
+log_n=28 |     8,947,848 hashes | trace: 473ms | NTT: 1290ms | total: 1921.6ms |  4.7M hash/s
+```
+
+### Cairo VM STARK (31 cols, 31 constraints, LogUp + range checks)
+```
+log_n=20 |      1,048,576 steps | prove:    581.4ms | verify:  0.4ms | ✓
+log_n=24 |     16,777,216 steps | prove:   7237.7ms | verify:  0.4ms | ✓
+log_n=26 |     67,108,864 steps | prove:  29199.7ms | verify:  0.5ms | ✓
+```
+
+### RPO-M31 Trace+NTT (24 cols, 14 rows/perm)
+```
+log_n=20 |        74,898 hashes | trace:  101ms | NTT:    9ms | total:   112.0ms |  0.7M hash/s
+log_n=24 |     1,198,372 hashes | trace:   82ms | NTT:  162ms | total:   250.3ms |  4.8M hash/s
+log_n=28 |    19,173,961 hashes | trace: 1404ms | NTT: 3867ms | total:  5507.1ms |  3.5M hash/s
+```
+
+### Poseidon2-Full Trace+NTT [EXPERIMENTAL — no security analysis] (8 cols, 8 rows/perm, RF=8 RP=0)
+```
+log_n=20 |       131,072 hashes | trace:  23ms | NTT:    3ms | total:    27.0ms |  4.9M hash/s
+log_n=24 |     2,097,152 hashes | trace:  26ms | NTT:   43ms | total:    71.9ms | 29.2M hash/s
+log_n=28 |    33,554,432 hashes | trace: 475ms | NTT: 1288ms | total:  1916.2ms | 17.5M hash/s
+```
+
+### Pedersen Hash (GPU, windowed 4-bit scalar mul, STARK curve)
+```
+      1,000 hashes:   0.5ms   1,840,265 hash/s
+     10,000 hashes:   0.7ms  15,330,369 hash/s
+    100,000 hashes:   2.6ms  38,072,032 hash/s
+  1,000,000 hashes:  26.6ms  37,658,826 hash/s
+```
+
+### New Tool: gpu_bench
+Comprehensive benchmark binary with strict pre-flight GPU condition checks:
+- Detects competing compute processes (aborts unless --force)
+- Queries `nvidia-smi -q -d POWER` for draw, current limit, enforced limit, default, min, max
+- Queries `nvidia-smi -q -d MEMORY` for FB total/used/free
+- Checks temperature (warn >=70C, abort >=83C) and SM clock at idle
+- Background sampler records per-section peak temp/power/VRAM/clock during benchmarks
+- Correct VRAM estimates: (trace_cols + one_eval + 4 scratch) x n x 4 bytes
 

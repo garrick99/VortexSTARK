@@ -10,20 +10,23 @@ GPU-native Circle STARK prover with end-to-end proof generation and verification
 - **Cairo VM STARK**: 31-column trace, 31 transition constraints, verifier independently evaluates all constraints at query points
 - **LogUp memory consistency**: Execution sum + memory table sum cancellation, final value bound into Fiat-Shamir
 - **Pedersen hash**: GPU windowed EC scalar multiplication, 37.7M hashes/sec, verified against CPU reference
-- **Poseidon hash**: GPU trace generation, 34.7M hashes/sec
+- **Poseidon2 hash**: GPU trace generation + NTT, 4.7M hashes/sec at log_n=28 (30 rows/perm, RF=8 RP=22)
+- **RPO-M31 hash**: Circle STARK–native hash (eprint 2024/1635), 3.5M hashes/sec at log_n=28 (14 rows/perm, 24 cols)
 - **FRI**: Circle fold + line folds, GPU-resident decommitment, all fold equations verified
 
-### Benchmarked (measured on RTX 5090, CUDA 13.0, March 2026)
+### Benchmarked (RTX 5090, CUDA 13.2, driver 595.79, 2026-03-22)
 
 | Workload | Scale | Prove | Verify |
 |----------|-------|-------|--------|
-| Fibonacci log_n=24 | 16.8M elements | 390ms | 6.4ms |
-| Fibonacci log_n=28 | 268M elements | 2.68s | 11.9ms |
-| Fibonacci log_n=30 | 1.07B elements | 7.0s | 14.2ms |
-| Cairo VM log_n=24 | 16.8M steps, 453M elements | 818ms | — |
-| Cairo VM log_n=27 | 134M steps, 3.6B elements | 7.3s | — |
-| Poseidon trace gen | 12.2M hashes | 1.4s | — |
-| Pedersen GPU batch | 1M hashes | 26.5ms | — |
+| Fibonacci log_n=24 | 16.8M elements | 214ms | 6.2ms |
+| Fibonacci log_n=28 | 268M elements | 1.56s | 8.2ms |
+| Fibonacci log_n=30 | 1.07B elements | 9.79s | 10.7ms |
+| Cairo VM log_n=24 | 16.8M steps | 7.24s | 0.4ms |
+| Cairo VM log_n=26 | 67.1M steps | 29.2s | 0.5ms |
+| Poseidon2 trace+NTT log_n=28 | 8.9M hashes | 1.92s | — |
+| RPO-M31 trace+NTT log_n=28 | 19.2M hashes | 5.51s | — |
+| Poseidon2-Full trace+NTT log_n=28 | 33.6M hashes [experimental] | 1.92s | — |
+| Pedersen GPU batch | 1M hashes | 26.6ms | — |
 
 ### Adversarial soundness (constraint coverage)
 
@@ -69,9 +72,11 @@ See [SOUNDNESS.md](SOUNDNESS.md) for the full constraint-by-constraint analysis.
 
 ## Builtins
 
-| Builtin | Status | Throughput |
-|---------|--------|-----------|
-| Poseidon | GPU kernel, proven | 34.7M hashes/sec |
+| Builtin | Status | Throughput (log_n=28) |
+|---------|--------|----------------------|
+| Poseidon2 | GPU kernel, proven (RF=8 RP=22, 30 rows/perm) | 4.7M hashes/sec |
+| RPO-M31 | GPU kernel, proven (14 rows/perm, 24 cols) | 3.5M hashes/sec |
+| Poseidon2-Full | GPU kernel, **experimental — no security analysis** (8 rows/perm) | 17.5M hashes/sec |
 | Pedersen | GPU kernel, proven (windowed 4-bit EC, Montgomery Jacobian) | 37.7M hashes/sec |
 | Bitwise | Trace generation | AND/XOR/OR on 252-bit |
 
@@ -89,12 +94,13 @@ stark_cli bench 28                             # Benchmark
 
 ## Building
 
-Requires: Rust nightly (1.89+), CUDA 13.0+, RTX 5090 (SM 12.0) or RTX 4090 (SM 8.9).
+Requires: Rust nightly (1.89+), CUDA 13.2+, RTX 5090 (SM 12.0) or RTX 4090 (SM 8.9).
 
 ```bash
 cargo build --release
 cargo test -- --test-threads=1    # 149 tests
 cargo run --release --bin full_benchmark
+cargo run --release --bin gpu_bench     # pre-flight checks + per-section GPU telemetry
 ```
 
 ## Tests
