@@ -25,7 +25,6 @@ GPU-native Circle STARK prover with end-to-end proof generation and verification
 | Cairo VM log_n=26 | 67.1M steps | 29.2s | 0.5ms |
 | Poseidon2 trace+NTT log_n=28 | 8.9M hashes | 1.92s | — |
 | RPO-M31 trace+NTT log_n=28 | 19.2M hashes | 5.51s | — |
-| Poseidon2-Full trace+NTT log_n=28 | 33.6M hashes [experimental] | 1.92s | — |
 | Pedersen GPU batch | 1M hashes | 26.6ms | — |
 
 ### Adversarial soundness (constraint coverage)
@@ -76,7 +75,6 @@ See [SOUNDNESS.md](SOUNDNESS.md) for the full constraint-by-constraint analysis.
 |---------|--------|----------------------|
 | Poseidon2 | GPU kernel, proven (RF=8 RP=22, 30 rows/perm) | 4.7M hashes/sec |
 | RPO-M31 | GPU kernel, proven (14 rows/perm, 24 cols) | 3.5M hashes/sec |
-| Poseidon2-Full | GPU kernel, **experimental — no security analysis** (8 rows/perm) | 17.5M hashes/sec |
 | Pedersen | GPU kernel, proven (windowed 4-bit EC, Montgomery Jacobian) | 37.7M hashes/sec |
 | Bitwise | Trace generation | AND/XOR/OR on 252-bit |
 
