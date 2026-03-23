@@ -47,10 +47,14 @@ __global__ void merkle_hash_leaves_kernel(
     uint32_t h0=IV0^0x01010020, h1=IV1, h2=IV2, h3=IV3;
     uint32_t h4=IV4, h5=IV5, h6=IV6, h7=IV7;
 
+    // Length = min(n_cols, 16) * 4 so GPU matches CPU blake2s_hash (which caps at 64 bytes).
+    // For n_cols > 16 only columns 0-15 are loaded; using n_cols*4 would produce a different
+    // t0 counter than the CPU, breaking auth path verification.
+    uint32_t leaf_len = (n_cols > 16u ? 16u : n_cols) * 4u;
     blake2s_compress(h0,h1,h2,h3,h4,h5,h6,h7,
                      m0,m1,m2,m3,m4,m5,m6,m7,
                      m8,m9,m10,m11,m12,m13,m14,m15,
-                     n_cols * 4, 0xFFFFFFFF);
+                     leaf_len, 0xFFFFFFFF);
 
     uint32_t* out = &hashes[leaf * 8];
     out[0]=h0; out[1]=h1; out[2]=h2; out[3]=h3;
@@ -427,10 +431,11 @@ __global__ void merkle_tiled_generic_kernel(
         }
         uint32_t lh0=IV0^0x01010020, lh1=IV1, lh2=IV2, lh3=IV3;
         uint32_t lh4=IV4, lh5=IV5, lh6=IV6, lh7=IV7;
+        uint32_t leaf_len = (n_cols > 16u ? 16u : n_cols) * 4u;
         blake2s_compress(lh0,lh1,lh2,lh3,lh4,lh5,lh6,lh7,
                          m0,m1,m2,m3,m4,m5,m6,m7,
                          m8,m9,m10,m11,m12,m13,m14,m15,
-                         n_cols * 4, 0xFFFFFFFF);
+                         leaf_len, 0xFFFFFFFF);
 
         // Hash right leaf
         switch (n_cols) {
@@ -458,7 +463,7 @@ __global__ void merkle_tiled_generic_kernel(
         blake2s_compress(rh0,rh1,rh2,rh3,rh4,rh5,rh6,rh7,
                          m0,m1,m2,m3,m4,m5,m6,m7,
                          m8,m9,m10,m11,m12,m13,m14,m15,
-                         n_cols * 4, 0xFFFFFFFF);
+                         leaf_len, 0xFFFFFFFF);
 
         // Merge: hash both leaf hashes (internal node domain)
         uint32_t ph0=IV0^0x01010020, ph1=IV1, ph2=IV2, ph3=IV3;

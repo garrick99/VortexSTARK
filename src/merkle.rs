@@ -572,6 +572,29 @@ impl MerkleTree {
         Self::targeted_auth_paths(n, indices, &hash_leaf)
     }
 
+    /// Build CPU-side Merkle auth paths for an N-column (≤32) trace commitment.
+    /// Matches `commit_root_only` with n_cols columns: leaf hash uses the first
+    /// min(n_cols, 16) columns (GPU switch statement caps at 16), with the Blake2s
+    /// length counter set to min(n_cols, 16) * 4.
+    pub fn cpu_merkle_auth_paths_ncols(
+        host_cols: &[Vec<u32>],
+        indices: &[usize],
+    ) -> Vec<Vec<[u32; HASH_WORDS]>> {
+        let n = host_cols[0].len();
+        let n_cols = host_cols.len();
+        assert!(n.is_power_of_two() && n >= 1);
+        assert!(!host_cols.is_empty());
+
+        let hash_leaf = |i: usize| -> [u32; HASH_WORDS] {
+            // Only the first min(n_cols, 16) columns are loaded by the GPU kernel.
+            let effective = n_cols.min(16);
+            let vals: Vec<u32> = (0..effective).map(|c| host_cols[c][i]).collect();
+            Self::hash_leaf(&vals)
+        };
+
+        Self::targeted_auth_paths(n, indices, &hash_leaf)
+    }
+
     /// Build a CPU-side Merkle tree from single-column host data and extract auth paths.
     /// Produces the same hashes as the GPU Merkle tree (commit with 1 column).
     pub fn cpu_merkle_auth_paths_single(

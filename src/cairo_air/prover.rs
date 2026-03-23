@@ -81,6 +81,10 @@ pub struct CairoProof {
     pub trace_values_at_queries: Vec<[u32; N_COLS]>,
     /// Trace values at query+1 points (for next-row constraints)
     pub trace_values_at_queries_next: Vec<[u32; N_COLS]>,
+    /// Merkle auth paths binding trace_values_at_queries to trace_commitment
+    pub trace_auth_paths: Vec<Vec<[u32; 8]>>,
+    /// Merkle auth paths binding trace_values_at_queries_next to trace_commitment
+    pub trace_auth_paths_next: Vec<Vec<[u32; 8]>>,
     /// LogUp memory argument: claimed final running sum
     pub logup_final_sum: [u32; 4],
     /// Range check: claimed final running sum
@@ -524,6 +528,30 @@ pub fn cairo_prove_cached(
         }
         result
     };
+    // Generate Merkle auth paths for trace decommitment.
+    // This binds trace_values_at_queries[q] and trace_values_at_queries_next[q]
+    // to the committed trace_commitment root.
+    // Note: GPU leaf hash only secures columns 0..min(N_COLS,16)=16; columns 16-30
+    // are hashed with length 64 bytes, effectively leaving them uncovered by the
+    // Merkle tree. This is a known remaining gap documented in SOUNDNESS.md.
+    let trace_auth_paths = {
+        let next_indices: Vec<usize> = query_indices.iter()
+            .map(|&qi| (qi + 1) % eval_size)
+            .collect();
+        let all_indices: Vec<usize> = query_indices.iter().copied()
+            .chain(next_indices.iter().copied())
+            .collect();
+        let all_paths = MerkleTree::cpu_merkle_auth_paths_ncols(
+            &host_eval_cols[..N_COLS],
+            &all_indices,
+        );
+        let n_q = query_indices.len();
+        let paths_qi: Vec<Vec<[u32; 8]>> = all_paths[..n_q].to_vec();
+        let paths_qi1: Vec<Vec<[u32; 8]>> = all_paths[n_q..].to_vec();
+        (paths_qi, paths_qi1)
+    };
+    let (trace_auth_paths, trace_auth_paths_next) = trace_auth_paths;
+
     drop(host_eval_cols);
 
     // EC trace at query points
@@ -576,6 +604,8 @@ pub fn cairo_prove_cached(
         query_indices,
         trace_values_at_queries,
         trace_values_at_queries_next,
+        trace_auth_paths,
+        trace_auth_paths_next,
         logup_final_sum,
         rc_final_sum,
         quotient_decommitment,
@@ -743,6 +773,39 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
                     return Err(format!("FRI last layer mismatch at query {q}"));
                 }
             }
+        }
+    }
+
+    // ---- Verify trace decommitment: auth paths bind trace values to trace_commitment ----
+    // Columns 0..min(N_COLS,16)=16 are secured by the Merkle commitment (GPU leaf hash cap).
+    // Without this check, a cheating prover could supply arbitrary trace values that satisfy
+    // constraints without being bound to the committed trace polynomial.
+    if proof.trace_auth_paths.len() != proof.query_indices.len() {
+        return Err("trace_auth_paths length mismatch".into());
+    }
+    if proof.trace_auth_paths_next.len() != proof.query_indices.len() {
+        return Err("trace_auth_paths_next length mismatch".into());
+    }
+    for (q, &qi) in proof.query_indices.iter().enumerate() {
+        // Leaf hash: only the first min(N_COLS, 16) columns contribute (GPU cap).
+        let effective = N_COLS.min(16);
+        let leaf_vals_qi: Vec<u32> = proof.trace_values_at_queries[q][..effective].to_vec();
+        let leaf_hash_qi = MerkleTree::hash_leaf(&leaf_vals_qi);
+        if !MerkleTree::verify_auth_path(
+            &proof.trace_commitment, &leaf_hash_qi, qi,
+            &proof.trace_auth_paths[q],
+        ) {
+            return Err(format!("Trace auth path verification failed at query {q} (qi={qi})"));
+        }
+
+        let qi_next = (qi + 1) % eval_size;
+        let leaf_vals_next: Vec<u32> = proof.trace_values_at_queries_next[q][..effective].to_vec();
+        let leaf_hash_next = MerkleTree::hash_leaf(&leaf_vals_next);
+        if !MerkleTree::verify_auth_path(
+            &proof.trace_commitment, &leaf_hash_next, qi_next,
+            &proof.trace_auth_paths_next[q],
+        ) {
+            return Err(format!("Trace auth path (next) verification failed at query {q} (qi_next={qi_next})"));
         }
     }
 
@@ -1551,6 +1614,22 @@ mod tests {
         proof.rc_final_sum[0] ^= 1; // corrupt range check final sum
         let result = cairo_verify(&proof);
         assert!(result.is_err(), "Tampered RC final sum should fail");
+    }
+
+    #[test]
+    fn test_tamper_trace_auth_paths() {
+        // Tamper a trace value while keeping the auth path for the original value.
+        // The verifier should reject: the auth path won't match the tampered value's leaf hash.
+        ffi::init_memory_pool();
+        let program = build_fib_program(64);
+        let mut proof = cairo_prove(&program, 64, 6);
+        // Corrupt a column covered by the leaf hash (column 0 = pc, within first 16 cols).
+        for row in &mut proof.trace_values_at_queries {
+            row[0] = row[0].wrapping_add(1) % crate::field::m31::P;
+        }
+        // auth paths are untouched (still correct for the original values)
+        let result = cairo_verify(&proof);
+        assert!(result.is_err(), "Tampered trace value with stale auth path should fail: {:?}", result);
     }
 
     #[test]

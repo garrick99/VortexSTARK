@@ -83,6 +83,16 @@
 - Domain separation: internal nodes use Blake2s personalization (h[6] ^= 0x01), leaves use h[6] = IV6
 - Prevents second-preimage attacks where leaf data could be confused with internal node hashes
 
+### Trace decommitment auth paths (ADDED 2026-03-22)
+- Previously: trace_values_at_queries had NO Merkle auth paths. A cheating prover could supply
+  arbitrary trace values satisfying constraints without being bound to the committed trace root.
+- Now: cpu_merkle_auth_paths_ncols generates auth paths for both qi and qi+1 query positions.
+  Verifier calls MerkleTree::verify_auth_path against trace_commitment for each query.
+- GPU leaf hash cap: the Blake2s leaf hash uses min(N_COLS, 16)=16 columns (64 bytes).
+  Columns 0-15 are now cryptographically bound; columns 16-30 remain uncovered (see Remaining Gaps).
+- GPU/CPU agreement: fixed GPU merkle_tiled_generic_kernel and merkle_hash_leaves_kernel to use
+  min(n_cols,16)*4 as the Blake2s length counter, matching the CPU blake2s_hash behavior.
+
 ### Pedersen EC constraint system
 - Full intermediate EC trace generated
 - 29 columns per step, 9 M31 limbs per coordinate
@@ -100,6 +110,17 @@
 ### Instruction decomposition
 M31 field arithmetic (2^31 ≡ 1) prevents expressing the full 63-bit instruction as a single polynomial constraint — the inst_lo/inst_hi split at bit 31 loses 1 bit. LogUp checks (pc, inst_lo) consistency but does not verify inst_hi. A malicious prover could potentially set flag columns inconsistently with the instruction word's upper bits.
 
+### Trace columns 16-30 not bound to Merkle commitment
+The GPU Blake2s leaf hash loads at most 16 M31 words (columns 0-15) per leaf. N_COLS=31,
+so columns 16-30 are never included in the leaf hash. A cheating prover can substitute any
+values for columns 16-30 and the trace Merkle auth paths will still verify.
+Columns 16-30 carry: COL_DST_ADDR (20), COL_DST (21), COL_OP0_ADDR (22), COL_OP0 (23),
+COL_OP1_ADDR (24), COL_OP1 (25), COL_RES (26), plus 4 auxiliary columns (27-30).
+These are still constrained by the constraint evaluation check (which uses all 31 column values),
+but a prover can choose values that satisfy constraints without those values being tied to the
+committed polynomial. Fixing requires either a two-block leaf hash for 31 columns, or splitting
+the trace into two separate 16-column Merkle commitments.
+
 ### Range check wiring
 The range check LogUp argument is fully implemented and tested (extract_offsets, interaction trace, table sum, cancellation tests all pass). It is not yet called from the prover pipeline. Offsets are constrained by the operand address verification constraints, but are not independently proven to be in [0, 2^16).
 
@@ -115,11 +136,12 @@ in error — the implementation is correct.
 |-----------|-----------|
 | GPU kernels / benchmarks | 95% |
 | Fibonacci STARK (prove+verify) | 95% |
-| Cairo verifier soundness | 92% |
+| Cairo verifier soundness | 94% |
 | Cairo constraint completeness | 92% |
-| Production readiness | 82% |
+| Production readiness | 84% |
 
 ### What would move production readiness higher
+- Extend trace Merkle leaf hash to cover all 31 columns (two-block hash or split commitment)
 - Wire range checks into prover pipeline (RC interaction trace committed, verifier decommits at queries)
 - Full instruction decomposition (extend LogUp to cover inst_hi, or add multi-limb decomposition columns)
 - Interaction trace decommitment at query points (verifier checks LogUp running sum transitions)
