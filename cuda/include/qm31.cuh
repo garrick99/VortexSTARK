@@ -94,3 +94,6 @@ __device__ __forceinline__ QM31 qm31_inv(QM31 x) {
 // QM31 zero/one
 __device__ __forceinline__ QM31 qm31_zero() { return {{0, 0, 0, 0}}; }
 __device__ __forceinline__ QM31 qm31_one()  { return {{1, 0, 0, 0}}; }
+
+// Embed M31 scalar into QM31
+__device__ __forceinline__ QM31 qm31_from_m31(uint32_t x) { return {{x, 0, 0, 0}}; }

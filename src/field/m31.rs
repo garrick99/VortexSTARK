@@ -6,7 +6,7 @@ use std::ops::{Add, Mul, Neg, Sub};
 pub const P: u32 = 0x7FFF_FFFF;
 
 /// A field element in GF(2^31 - 1), stored as u32 in [0, P).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
 #[repr(transparent)]
 pub struct M31(pub u32);
 

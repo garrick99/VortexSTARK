@@ -442,17 +442,23 @@ unsafe extern "C" {
 
     pub fn cuda_cairo_quotient(
         trace_cols: *const *const u32,
+        s_logup0: *const u32, s_logup1: *const u32, s_logup2: *const u32, s_logup3: *const u32,
+        s_rc0: *const u32, s_rc1: *const u32, s_rc2: *const u32, s_rc3: *const u32,
         out0: *mut u32, out1: *mut u32, out2: *mut u32, out3: *mut u32,
         alpha_coeffs: *const u32,
         vh_inv: *const u32,
+        challenges: *const u32,
         n: u32,
     );
 
     pub fn cuda_cairo_quotient_chunk(
         trace_cols: *const *const u32,
+        s_logup0: *const u32, s_logup1: *const u32, s_logup2: *const u32, s_logup3: *const u32,
+        s_rc0: *const u32, s_rc1: *const u32, s_rc2: *const u32, s_rc3: *const u32,
         out0: *mut u32, out1: *mut u32, out2: *mut u32, out3: *mut u32,
         alpha_coeffs: *const u32,
         vh_inv: *const u32,
+        challenges: *const u32,
         offset: u32, chunk_n: u32, global_n: u32,
     );
 

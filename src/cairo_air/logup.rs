@@ -31,21 +31,29 @@ pub const ACCESSES_PER_ROW: usize = 4;
 
 /// Compute LogUp interaction values for a single row.
 /// Returns the sum of 1/(z - (addr_j + alpha * val_j)) for each access j.
+/// Access 0 is the instruction fetch: uses extended denominator
+///   z - (pc + alpha * inst_lo + alpha^2 * inst_hi)
+/// to fully bind both halves of the 63-bit instruction word.
 pub fn logup_row_contribution(
     z: QM31,
     alpha: QM31,
-    accesses: &[(M31, M31)], // [(addr, value)] pairs
+    alpha_sq: QM31,
+    accesses: &[(M31, M31)], // [(addr, value)] pairs; access 0 = (pc, inst_lo)
+    inst_hi: M31,            // upper 31 bits of instruction (for access 0 only)
 ) -> QM31 {
     let mut sum = QM31::ZERO;
-    for &(addr, value) in accesses {
-        // denom = z - (addr + alpha * value)
+    for (j, &(addr, value)) in accesses.iter().enumerate() {
         let addr_qm31 = qm31_from_m31(addr);
         let val_qm31 = qm31_from_m31(value);
-        let entry = addr_qm31 + alpha * val_qm31;
+        let entry = if j == 0 {
+            // Instruction fetch: bind inst_hi via alpha^2 term so the full
+            // 63-bit word is committed — not just the lower 31 bits.
+            addr_qm31 + alpha * val_qm31 + alpha_sq * qm31_from_m31(inst_hi)
+        } else {
+            addr_qm31 + alpha * val_qm31
+        };
         let denom = z - entry;
-        // 1 / denom
-        let inv = denom.inverse();
-        sum = sum + inv;
+        sum = sum + denom.inverse();
     }
     sum
 }
@@ -56,36 +64,43 @@ pub fn logup_row_contribution(
 /// - claimed_sum: final running sum value (should equal memory table's contribution)
 ///
 /// The running sum accumulates: S[i] = S[i-1] + logup_contribution(row_i)
+///
+/// The instruction fetch access uses the extended denominator
+///   z - (pc + alpha * inst_lo + alpha^2 * inst_hi)
+/// so both halves of the 63-bit instruction are authenticated.
 pub fn compute_interaction_trace(
-    trace_cols: &[Vec<u32>],  // 27 trace columns
+    trace_cols: &[Vec<u32>],  // 31 trace columns
     n: usize,
     z: QM31,
     alpha: QM31,
 ) -> ([Vec<u32>; 4], QM31) {
     use super::trace::*;
 
+    let alpha_sq = alpha * alpha;
     let mut running_sum = QM31::ZERO;
     let mut interaction: [Vec<u32>; 4] = std::array::from_fn(|_| vec![0u32; n]);
 
     for i in 0..n {
-        // Collect memory accesses at this row
-        let pc = M31(trace_cols[COL_PC][i]);
-        let inst_lo = M31(trace_cols[COL_INST_LO][i]);
+        let pc       = M31(trace_cols[COL_PC][i]);
+        let inst_lo  = M31(trace_cols[COL_INST_LO][i]);
+        let inst_hi  = M31(trace_cols[COL_INST_HI][i]);
         let dst_addr = M31(trace_cols[COL_DST_ADDR][i]);
-        let dst = M31(trace_cols[COL_DST][i]);
+        let dst      = M31(trace_cols[COL_DST][i]);
         let op0_addr = M31(trace_cols[COL_OP0_ADDR][i]);
-        let op0 = M31(trace_cols[COL_OP0][i]);
+        let op0      = M31(trace_cols[COL_OP0][i]);
         let op1_addr = M31(trace_cols[COL_OP1_ADDR][i]);
-        let op1 = M31(trace_cols[COL_OP1][i]);
+        let op1      = M31(trace_cols[COL_OP1][i]);
 
+        // Access 0 is instruction fetch; inst_hi is passed separately so
+        // logup_row_contribution can apply the alpha^2 * inst_hi extension.
         let accesses = [
-            (pc, inst_lo),         // instruction fetch (simplified: use inst_lo as value)
-            (dst_addr, dst),       // dst operand
-            (op0_addr, op0),       // op0 operand
-            (op1_addr, op1),       // op1 operand
+            (pc, inst_lo),
+            (dst_addr, dst),
+            (op0_addr, op0),
+            (op1_addr, op1),
         ];
 
-        let contribution = logup_row_contribution(z, alpha, &accesses);
+        let contribution = logup_row_contribution(z, alpha, alpha_sq, &accesses, inst_hi);
         running_sum = running_sum + contribution;
 
         let arr = running_sum.to_u32_array();
@@ -102,52 +117,83 @@ pub fn compute_interaction_trace(
 /// with multiplicity = number of times it's accessed.
 /// Its LogUp contribution is: sum_j -multiplicity_j / (z - (addr_j + alpha * value_j))
 ///
+/// For instruction fetch entries the denominator is extended:
+///   z - (pc + alpha * inst_lo + alpha^2 * inst_hi)
+/// to match the execution-side denominator. Pass inst_hi_override = Some(inst_hi)
+/// for instruction entries; None for all other memory accesses.
+///
 /// For the overall argument to hold: execution_sum + memory_table_sum = 0
 pub fn compute_memory_table_sum(
-    memory_entries: &[(M31, M31, u32)],  // (addr, value, multiplicity)
+    memory_entries: &[(M31, M31, u32)],  // (addr, value_lo, multiplicity)
+    instr_entries: &[(M31, M31, M31, u32)], // (pc, inst_lo, inst_hi, multiplicity)
     z: QM31,
     alpha: QM31,
 ) -> QM31 {
+    let alpha_sq = alpha * alpha;
     let mut sum = QM31::ZERO;
+
+    // Regular data accesses (dst, op0, op1)
     for &(addr, value, mult) in memory_entries {
-        let addr_qm31 = qm31_from_m31(addr);
-        let val_qm31 = qm31_from_m31(value);
-        let entry = addr_qm31 + alpha * val_qm31;
+        let entry = qm31_from_m31(addr) + alpha * qm31_from_m31(value);
         let denom = z - entry;
-        let inv = denom.inverse();
         let mult_qm31 = qm31_from_m31(M31(mult));
-        sum = sum - mult_qm31 * inv;
+        sum = sum - mult_qm31 * denom.inverse();
     }
+
+    // Instruction fetch accesses (extended denominator with inst_hi)
+    for &(pc, inst_lo, inst_hi, mult) in instr_entries {
+        let entry = qm31_from_m31(pc)
+            + alpha * qm31_from_m31(inst_lo)
+            + alpha_sq * qm31_from_m31(inst_hi);
+        let denom = z - entry;
+        let mult_qm31 = qm31_from_m31(M31(mult));
+        sum = sum - mult_qm31 * denom.inverse();
+    }
+
     sum
 }
 
 /// Extract memory table from an execution trace.
-/// Returns sorted unique (addr, value, multiplicity) entries.
+/// Returns:
+/// - data_entries: sorted unique (addr, value, multiplicity) for dst/op0/op1 accesses
+/// - instr_entries: sorted unique (pc, inst_lo, inst_hi, multiplicity) for instruction fetches
+///
+/// Instruction fetches use a separate entry type so the extended denominator
+/// (with inst_hi) can be applied during the memory table sum computation.
 pub fn extract_memory_table(
     trace_cols: &[Vec<u32>],
-    n_steps: usize,  // actual execution steps (may be < trace length due to padding)
-) -> Vec<(M31, M31, u32)> {
+    n_steps: usize,
+) -> (Vec<(M31, M31, u32)>, Vec<(M31, M31, M31, u32)>) {
     use std::collections::BTreeMap;
     use super::trace::*;
 
-    let mut mem_counts: BTreeMap<(u32, u32), u32> = BTreeMap::new();
+    let mut data_counts: BTreeMap<(u32, u32), u32> = BTreeMap::new();
+    let mut instr_counts: BTreeMap<(u32, u32, u32), u32> = BTreeMap::new();
 
     for i in 0..n_steps {
-        let accesses = [
-            (trace_cols[COL_PC][i], trace_cols[COL_INST_LO][i]),
+        // Instruction fetch: (pc, inst_lo, inst_hi) — extended entry
+        *instr_counts
+            .entry((trace_cols[COL_PC][i], trace_cols[COL_INST_LO][i], trace_cols[COL_INST_HI][i]))
+            .or_insert(0) += 1;
+
+        // Data accesses: (addr, value) — simple entry
+        for (addr, val) in [
             (trace_cols[COL_DST_ADDR][i], trace_cols[COL_DST][i]),
             (trace_cols[COL_OP0_ADDR][i], trace_cols[COL_OP0][i]),
             (trace_cols[COL_OP1_ADDR][i], trace_cols[COL_OP1][i]),
-        ];
-
-        for (addr, val) in accesses {
-            *mem_counts.entry((addr, val)).or_insert(0) += 1;
+        ] {
+            *data_counts.entry((addr, val)).or_insert(0) += 1;
         }
     }
 
-    mem_counts.into_iter()
+    let data = data_counts.into_iter()
         .map(|((addr, val), mult)| (M31(addr), M31(val), mult))
-        .collect()
+        .collect();
+    let instrs = instr_counts.into_iter()
+        .map(|((pc, lo, hi), mult)| (M31(pc), M31(lo), M31(hi), mult))
+        .collect();
+
+    (data, instrs)
 }
 
 /// Helper: embed M31 into QM31.
@@ -220,13 +266,13 @@ mod tests {
         };
 
         let (_, exec_sum) = compute_interaction_trace(&cols, n_steps, z, alpha);
-        let mem_table = extract_memory_table(&cols, n_steps);
-        let mem_sum = compute_memory_table_sum(&mem_table, z, alpha);
+        let (data_table, instr_table) = extract_memory_table(&cols, n_steps);
+        let mem_sum = compute_memory_table_sum(&data_table, &instr_table, z, alpha);
 
         let total = exec_sum + mem_sum;
         assert_eq!(total, QM31::ZERO,
-            "LogUp sums don't cancel for Fibonacci trace!\n  {} memory entries",
-            mem_table.len());
+            "LogUp sums don't cancel for Fibonacci trace!\n  {} data + {} instr entries",
+            data_table.len(), instr_table.len());
     }
 
     #[test]
@@ -258,11 +304,11 @@ mod tests {
         };
 
         // Compute execution trace LogUp sum
-        let (interaction, exec_sum) = compute_interaction_trace(&cols, 2, z, alpha);
+        let (_interaction, exec_sum) = compute_interaction_trace(&cols, 2, z, alpha);
 
         // Compute memory table LogUp sum
-        let mem_table = extract_memory_table(&cols, 2);
-        let mem_sum = compute_memory_table_sum(&mem_table, z, alpha);
+        let (data_table, instr_table) = extract_memory_table(&cols, 2);
+        let mem_sum = compute_memory_table_sum(&data_table, &instr_table, z, alpha);
 
         // The sums should cancel: exec_sum + mem_sum = 0
         let total = exec_sum + mem_sum;

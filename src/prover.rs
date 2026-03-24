@@ -58,15 +58,20 @@ fn ensure_pool_init() {
 }
 
 /// Blowup factor: evaluation domain is 2^BLOWUP_BITS times the trace domain.
-pub const BLOWUP_BITS: u32 = 1; // blowup factor = 2
+/// 4x blowup (BLOWUP_BITS=2) gives 2 bits of security per FRI query, matching
+/// STWO and other production circle STARK deployments. At 80 queries this yields
+/// ~160-bit conjectured security — comfortably above the 128-bit target.
+pub const BLOWUP_BITS: u32 = 2; // blowup factor = 4
 
-/// Number of queries for ~100-bit security (blowup=2, 1 bit/query).
-pub const N_QUERIES: usize = 100;
+/// Number of queries for ~160-bit security (blowup=4, 2 bits/query).
+/// Reduced from 100 to 80 to partially offset the 2x eval-domain cost.
+pub const N_QUERIES: usize = 80;
 
 /// Decommitment data for a set of queries against a Merkle commitment.
 /// Includes both the queried value and its fold-sibling (index ^ 1) for
 /// verifying FRI fold equations.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound = "T: Clone + serde::Serialize + serde::de::DeserializeOwned")]
 pub struct QueryDecommitment<T: Clone> {
     /// Leaf values at queried positions.
     pub values: Vec<T>,
@@ -79,6 +84,7 @@ pub struct QueryDecommitment<T: Clone> {
 }
 
 /// A STARK proof for the Fibonacci AIR.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct StarkProof {
     /// Merkle root of the trace commitment.
     pub trace_commitment: [u32; 8],
@@ -2230,51 +2236,12 @@ impl ProverPipeline {
         &self.cache
     }
 
-    /// Prove a batch of inputs with pipelined trace generation.
-    /// Returns proofs in order. Throughput is limited by max(trace_gen, gpu_work)
-    /// instead of trace_gen + gpu_work.
+    /// Prove a batch of inputs, returning proofs in order.
     pub fn prove_batch(&self, inputs: &[(M31, M31)]) -> Vec<StarkProof> {
-        if inputs.is_empty() {
-            return Vec::new();
-        }
-
-        let log_n = self.cache.log_n;
-        let n = 1usize << log_n;
-        let buffers = [self.cache.pinned_trace, self.pinned_trace_b];
-        let mut proofs = Vec::with_capacity(inputs.len());
-
-        // Generate first trace (no overlap possible for the first one)
-        unsafe { air::fibonacci_trace_parallel(inputs[0].0, inputs[0].1, log_n, buffers[0]) };
-
-        for i in 0..inputs.len() {
-            let current_buf = buffers[i % 2];
-
-            if i + 1 < inputs.len() {
-                // Overlap: generate next trace on CPU while GPU processes current proof
-                let next_buf = buffers[(i + 1) % 2];
-                let next_a = inputs[i + 1].0;
-                let next_b = inputs[i + 1].1;
-                let next_buf_addr = next_buf as usize;
-
-                std::thread::scope(|s| {
-                    // Background: generate next trace
-                    s.spawn(move || {
-                        let ptr = next_buf_addr as *mut u32;
-                        unsafe { air::fibonacci_trace_parallel(next_a, next_b, log_n, ptr) };
-                    });
-
-                    // Foreground: process current proof on GPU
-                    let proof = prove_from_pinned(current_buf, n, &self.cache);
-                    proofs.push(proof);
-                });
-            } else {
-                // Last proof: no overlap needed
-                let proof = prove_from_pinned(current_buf, n, &self.cache);
-                proofs.push(proof);
-            }
-        }
-
-        proofs
+        inputs
+            .iter()
+            .map(|&(a, b)| prove_with_cache(a, b, &self.cache, false))
+            .collect()
     }
 }
 
@@ -2286,21 +2253,6 @@ impl Drop for ProverPipeline {
     }
 }
 
-/// Prove from a pre-filled pinned trace buffer (used by pipeline).
-/// Copies the trace into the cache's pinned buffer, then delegates to prove_with_cache.
-fn prove_from_pinned(pinned_trace: *const u32, n: usize, cache: &ProverCache) -> StarkProof {
-    let a = M31(unsafe { *pinned_trace });
-    let b = M31(unsafe { *pinned_trace.add(1) });
-
-    // If the source buffer isn't the cache's own pinned buffer, copy it.
-    if pinned_trace != cache.pinned_trace as *const u32 {
-        unsafe {
-            std::ptr::copy_nonoverlapping(pinned_trace, cache.pinned_trace, n);
-        }
-    }
-
-    prove_with_cache(a, b, cache, false)
-}
 
 #[cfg(test)]
 mod tests {

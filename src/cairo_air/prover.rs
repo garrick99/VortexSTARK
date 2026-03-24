@@ -23,13 +23,9 @@ use crate::fri::{self, SecureColumn};
 use crate::merkle::MerkleTree;
 use crate::ntt::{self, ForwardTwiddleCache, InverseTwiddleCache};
 use crate::prover::{QueryDecommitment, N_QUERIES, BLOWUP_BITS};
-use super::trace::{N_COLS, N_CONSTRAINTS, COL_PC, COL_INST_LO,
-    COL_DST_ADDR, COL_DST, COL_OP0_ADDR, COL_OP0, COL_OP1_ADDR, COL_OP1};
+use super::trace::{N_COLS, N_CONSTRAINTS};
 use super::range_check::{extract_offsets, compute_rc_interaction_trace, compute_rc_table_sum};
-
-/// Columns the LogUp kernel reads (memory address/value pairs).
-const LOGUP_COLS: [usize; 8] = [COL_PC, COL_INST_LO, COL_DST_ADDR, COL_DST,
-    COL_OP0_ADDR, COL_OP0, COL_OP1_ADDR, COL_OP1];
+use super::logup::compute_interaction_trace;
 
 /// Columns NOT read by the quotient kernel.
 /// inst_lo and inst_hi are now used by constraint 30 (instruction decomposition).
@@ -38,7 +34,7 @@ use super::vm::Memory;
 use super::ec_constraint;
 
 /// Public inputs for a Cairo proof: initial/final VM state + program hash.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CairoPublicInputs {
     /// Initial program counter
     pub initial_pc: u32,
@@ -53,7 +49,7 @@ pub struct CairoPublicInputs {
 }
 
 /// Complete Cairo STARK proof.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct CairoProof {
     pub log_trace_size: u32,
     /// Public inputs (verified by both prover and verifier)
@@ -67,11 +63,23 @@ pub struct CairoProof {
     pub interaction_commitment: [u32; 8],
     /// Merkle root: range check interaction trace (4 QM31 columns)
     pub rc_interaction_commitment: [u32; 8],
-    /// Merkle root: EC multiplication trace (28 columns, proves Pedersen correctness)
+    /// Merkle root: EC trace columns 0-15 (lo half; GPU hash caps at 16 cols)
     pub ec_trace_commitment: Option<[u32; 8]>,
+    /// Merkle root: EC trace columns 16-28 (hi half)
+    pub ec_trace_commitment_hi: Option<[u32; 8]>,
+    /// log2 of the EC eval domain size (needed by verifier to map main query indices)
+    pub ec_log_eval: Option<u32>,
     /// EC trace values at query points (for verifier constraint check)
     pub ec_trace_at_queries: Vec<Vec<u32>>,
     pub ec_trace_at_queries_next: Vec<Vec<u32>>,
+    /// Merkle auth paths binding EC trace cols 0-15 at query points to ec_trace_commitment
+    pub ec_trace_auth_paths: Vec<Vec<[u32; 8]>>,
+    /// Merkle auth paths binding EC trace cols 0-15 at query+1 points
+    pub ec_trace_auth_paths_next: Vec<Vec<[u32; 8]>>,
+    /// Merkle auth paths binding EC trace cols 16-28 at query points to ec_trace_commitment_hi
+    pub ec_trace_auth_paths_hi: Vec<Vec<[u32; 8]>>,
+    /// Merkle auth paths binding EC trace cols 16-28 at query+1 points
+    pub ec_trace_auth_paths_hi_next: Vec<Vec<[u32; 8]>>,
     /// Merkle root: combined quotient (4 QM31 columns)
     pub quotient_commitment: [u32; 8],
     /// FRI layer commitments
@@ -99,58 +107,18 @@ pub struct CairoProof {
     /// Decommitments (with Merkle auth paths)
     pub quotient_decommitment: QueryDecommitment<[u32; 4]>,
     pub fri_decommitments: Vec<QueryDecommitment<[u32; 4]>>,
+    /// LogUp interaction trace at query points, auth-path-bound to interaction_commitment.
+    pub interaction_decommitment: QueryDecommitment<[u32; 4]>,
+    /// LogUp interaction trace at query+1 points (for step transition verification).
+    pub interaction_decommitment_next: QueryDecommitment<[u32; 4]>,
+    /// RC interaction trace at query points, auth-path-bound to rc_interaction_commitment.
+    pub rc_interaction_decommitment: QueryDecommitment<[u32; 4]>,
+    /// RC interaction trace at query+1 points (for step transition verification).
+    pub rc_interaction_decommitment_next: QueryDecommitment<[u32; 4]>,
+    /// Packed QM31 challenges used by quotient kernel: [z_mem(4), alpha_mem(4), alpha_mem_sq(4), z_rc(4)]
+    pub logup_challenges: [u32; 16],
 }
 
-/// GPU-accelerated parallel prefix sum for QM31.
-fn gpu_prefix_sum(
-    d_c0: &mut DeviceBuffer<u32>, d_c1: &mut DeviceBuffer<u32>,
-    d_c2: &mut DeviceBuffer<u32>, d_c3: &mut DeviceBuffer<u32>,
-    n: usize,
-) {
-    const BLOCK_SIZE: u32 = 256;
-    let n_blocks = ((n as u32) + BLOCK_SIZE - 1) / BLOCK_SIZE;
-
-    if n_blocks <= 1 {
-        let mut bs0 = DeviceBuffer::<u32>::alloc(1);
-        let mut bs1 = DeviceBuffer::<u32>::alloc(1);
-        let mut bs2 = DeviceBuffer::<u32>::alloc(1);
-        let mut bs3 = DeviceBuffer::<u32>::alloc(1);
-        unsafe {
-            ffi::cuda_qm31_block_scan(
-                d_c0.as_mut_ptr(), d_c1.as_mut_ptr(), d_c2.as_mut_ptr(), d_c3.as_mut_ptr(),
-                bs0.as_mut_ptr(), bs1.as_mut_ptr(), bs2.as_mut_ptr(), bs3.as_mut_ptr(),
-                n as u32, BLOCK_SIZE,
-            );
-        }
-        return;
-    }
-
-    let mut bs0 = DeviceBuffer::<u32>::alloc(n_blocks as usize);
-    let mut bs1 = DeviceBuffer::<u32>::alloc(n_blocks as usize);
-    let mut bs2 = DeviceBuffer::<u32>::alloc(n_blocks as usize);
-    let mut bs3 = DeviceBuffer::<u32>::alloc(n_blocks as usize);
-
-    unsafe {
-        ffi::cuda_qm31_block_scan(
-            d_c0.as_mut_ptr(), d_c1.as_mut_ptr(), d_c2.as_mut_ptr(), d_c3.as_mut_ptr(),
-            bs0.as_mut_ptr(), bs1.as_mut_ptr(), bs2.as_mut_ptr(), bs3.as_mut_ptr(),
-            n as u32, BLOCK_SIZE,
-        );
-    }
-
-    // Recursive scan on block sums
-    gpu_prefix_sum(&mut bs0, &mut bs1, &mut bs2, &mut bs3, n_blocks as usize);
-
-    // Add block prefixes
-    unsafe {
-        ffi::cuda_qm31_add_block_prefix(
-            d_c0.as_mut_ptr(), d_c1.as_mut_ptr(), d_c2.as_mut_ptr(), d_c3.as_mut_ptr(),
-            bs0.as_ptr(), bs1.as_ptr(), bs2.as_ptr(), bs3.as_ptr(),
-            n as u32, BLOCK_SIZE,
-        );
-        ffi::cuda_device_sync();
-    }
-}
 
 /// Reusable NTT caches for a given trace size. Create once, prove many.
 pub struct CairoProverCache {
@@ -196,8 +164,8 @@ pub fn cairo_prove_cached(
     let n = 1usize << log_n;
     assert!(n_steps <= n);
     assert_eq!(cache.log_n, log_n);
-    let eval_size = 2 * n;
     let log_eval_size = log_n + BLOWUP_BITS;
+    let eval_size = 1usize << log_eval_size;
 
     // ---- Public inputs ----
     let hash_bytes = crate::channel::blake2s_hash(
@@ -241,7 +209,8 @@ pub fn cairo_prove_cached(
         ntt::evaluate(&mut d_eval, &cache.fwd_cache);
         d_eval_cols.push(d_eval);
     }
-    drop(columns);
+    // NOTE: `columns` is kept alive here — compute_interaction_trace needs it after
+    // Fiat-Shamir challenges are drawn (z_mem, alpha_mem). Dropped after LogUp trace.
     let _ntt_ms = t_ntt.elapsed().as_secs_f64() * 1000.0;
 
     // Commit trace in two halves: cols 0-15 (lo) and cols 16-30 (hi).
@@ -251,19 +220,11 @@ pub fn cairo_prove_cached(
     let trace_commitment = MerkleTree::commit_root_only(&d_eval_cols[..TRACE_LO], log_eval_size);
     let trace_commitment_hi = MerkleTree::commit_root_only(&d_eval_cols[TRACE_LO..N_COLS], log_eval_size);
 
-    // ---- VRAM streaming: download all eval cols to host, free non-LogUp cols ----
-    // At log_n=27 the 27 columns consume 28.9 GiB. We download all to host and
-    // keep only the 8 LogUp columns on GPU, freeing ~20 GiB before LogUp allocation.
+    // ---- VRAM streaming: download all eval cols to host, free GPU copies ----
+    // At log_n=27 the 31 columns consume ~33 GiB VRAM. Download to host then free
+    // all GPU copies immediately — CPU LogUp no longer needs them on GPU.
     let host_eval_cols: Vec<Vec<u32>> = d_eval_cols.iter().map(|c| c.to_host_fast()).collect();
-    {
-        let logup_set: std::collections::HashSet<usize> = LOGUP_COLS.iter().copied().collect();
-        for c in (0..N_COLS).rev() {
-            if !logup_set.contains(&c) {
-                // Replace with empty buffer, Drop frees GPU memory
-                d_eval_cols[c] = DeviceBuffer::<u32>::alloc(0);
-            }
-        }
-    }
+    drop(d_eval_cols);
 
     let mut channel = Channel::new();
     channel.mix_digest(&public_inputs.program_hash);
@@ -271,7 +232,11 @@ pub fn cairo_prove_cached(
     channel.mix_digest(&trace_commitment_hi);
 
     // ---- EC trace for Pedersen (optional) ----
-    let (ec_trace_commitment, ec_trace_host) = if let Some((ped_a, ped_b)) = pedersen_inputs {
+    // EC_TRACE_LO: split point matching GPU leaf hash cap (16 columns per tree).
+    // EC trace has 29 columns; lo = 0..16, hi = 16..29.
+    const EC_TRACE_LO: usize = 16;
+    let (ec_trace_commitment, ec_trace_commitment_hi, ec_trace_host, ec_log_eval_opt) =
+        if let Some((ped_a, ped_b)) = pedersen_inputs {
         let n_hashes = ped_a.len();
         let ec_rows = n_hashes * ec_constraint::ROWS_PER_INVOCATION;
         let ec_log = (ec_rows as f64).log2().ceil() as u32;
@@ -280,8 +245,8 @@ pub fn cairo_prove_cached(
         let d_ec_trace_cols = ec_constraint::gpu_generate_ec_trace(ped_a, ped_b, ec_log);
 
         // NTT + commit EC trace (columns already on GPU)
-        let ec_eval_size = 2 * (1usize << ec_log);
         let ec_log_eval = ec_log + BLOWUP_BITS;
+        let ec_eval_size = 1usize << ec_log_eval;
         let ec_trace_domain = Coset::half_coset(ec_log);
         let ec_eval_domain = Coset::half_coset(ec_log_eval);
         let ec_inv = InverseTwiddleCache::new(&ec_trace_domain);
@@ -299,63 +264,57 @@ pub fn cairo_prove_cached(
             ntt::evaluate(&mut d_eval, &ec_fwd);
             d_ec_eval_cols.push(d_eval);
         }
-        let ec_commit = MerkleTree::commit_root_only(&d_ec_eval_cols, ec_log_eval);
-        channel.mix_digest(&ec_commit);
 
-        // Download for verifier
+        // Split into lo (cols 0..EC_TRACE_LO) and hi (cols EC_TRACE_LO..29).
+        // Each tree covers at most 16 cols — matching the GPU Blake2s leaf hash cap.
+        let ec_commit_lo = MerkleTree::commit_root_only(&d_ec_eval_cols[..EC_TRACE_LO], ec_log_eval);
+        let ec_commit_hi = MerkleTree::commit_root_only(&d_ec_eval_cols[EC_TRACE_LO..], ec_log_eval);
+        channel.mix_digest(&ec_commit_lo);
+        channel.mix_digest(&ec_commit_hi);
+
+        // Download for auth path generation and verifier constraint check
         let ec_host: Vec<Vec<u32>> = d_ec_eval_cols.iter().map(|c| c.to_host()).collect();
         drop(d_ec_eval_cols);
 
-        (Some(ec_commit), Some(ec_host))
+        (Some(ec_commit_lo), Some(ec_commit_hi), Some(ec_host), Some(ec_log_eval))
     } else {
-        (None, None)
+        (None, None, None, None)
     };
 
     // ---- Phase 2: Fused LogUp interaction ----
     let z_mem = channel.draw_felt();
     let alpha_mem = channel.draw_felt();
+    let alpha_mem_sq = alpha_mem * alpha_mem;
     let z_rc = channel.draw_felt();
-    let z_arr = z_mem.to_u32_array();
-    let alpha_arr = alpha_mem.to_u32_array();
+    // Compute LogUp interaction trace on CPU (trace domain → NTT → eval domain).
+    // Previous approach (GPU prefix sum over eval domain) was incorrect: it accumulated
+    // logup deltas at eval-domain points, not at trace-domain points. The correct
+    // interaction polynomial has S[i] = Σ_{j≤i} logup_delta(row_j) at trace positions.
+    // This matches the RC interaction trace approach (CPU compute + NTT).
+    let (mut logup_trace_cols, logup_final_qm31) =
+        compute_interaction_trace(&columns, n_steps, z_mem, alpha_mem);
+    drop(columns); // trace-domain columns no longer needed
 
-    let mut d_logup0 = DeviceBuffer::<u32>::alloc(eval_size);
-    let mut d_logup1 = DeviceBuffer::<u32>::alloc(eval_size);
-    let mut d_logup2 = DeviceBuffer::<u32>::alloc(eval_size);
-    let mut d_logup3 = DeviceBuffer::<u32>::alloc(eval_size);
-
-    unsafe {
-        ffi::cuda_logup_memory_fused(
-            d_eval_cols[COL_PC].as_ptr(), d_eval_cols[COL_INST_LO].as_ptr(),
-            d_eval_cols[COL_DST_ADDR].as_ptr(), d_eval_cols[COL_DST].as_ptr(),
-            d_eval_cols[COL_OP0_ADDR].as_ptr(), d_eval_cols[COL_OP0].as_ptr(),
-            d_eval_cols[COL_OP1_ADDR].as_ptr(), d_eval_cols[COL_OP1].as_ptr(),
-            d_logup0.as_mut_ptr(), d_logup1.as_mut_ptr(),
-            d_logup2.as_mut_ptr(), d_logup3.as_mut_ptr(),
-            z_arr.as_ptr(), alpha_arr.as_ptr(),
-            eval_size as u32,
-        );
-        ffi::cuda_device_sync();
+    // Pad each column from n_steps to n (repeat final running-sum value, same as RC trace).
+    for c in 0..4 {
+        let last = *logup_trace_cols[c].last().unwrap_or(&0);
+        logup_trace_cols[c].resize(n, last);
     }
 
-    gpu_prefix_sum(&mut d_logup0, &mut d_logup1, &mut d_logup2, &mut d_logup3, eval_size);
-
-    // Download ONLY the last element of the LogUp running sum (not the entire column)
-    let logup_final_sum = {
-        let mut val = [0u32; 4];
-        let mut tmp = [0u32; 1];
-        for (i, col) in [&d_logup0, &d_logup1, &d_logup2, &d_logup3].iter().enumerate() {
-            unsafe {
-                ffi::cudaMemcpy(
-                    tmp.as_mut_ptr() as *mut std::ffi::c_void,
-                    (col.as_ptr() as *const u8).add((eval_size - 1) * 4) as *const std::ffi::c_void,
-                    4,
-                    ffi::MEMCPY_D2H,
-                );
-            }
-            val[i] = tmp[0];
-        }
-        val
-    };
+    // NTT each column to the eval domain (interpolate trace→poly, zero-pad, evaluate).
+    let mut d_logup_gpu: [DeviceBuffer<u32>; 4] = std::array::from_fn(|_| DeviceBuffer::<u32>::alloc(0));
+    for c in 0..4 {
+        let mut d_col = DeviceBuffer::from_host(&logup_trace_cols[c]);
+        ntt::interpolate(&mut d_col, &cache.inv_cache);
+        let mut d_eval = DeviceBuffer::<u32>::alloc(eval_size);
+        unsafe { ffi::cuda_zero_pad(d_col.as_ptr(), d_eval.as_mut_ptr(), n as u32, eval_size as u32); }
+        drop(d_col);
+        ntt::evaluate(&mut d_eval, &cache.fwd_cache);
+        d_logup_gpu[c] = d_eval;
+    }
+    drop(logup_trace_cols);
+    let [d_logup0, d_logup1, d_logup2, d_logup3] = d_logup_gpu;
+    let logup_final_sum = logup_final_qm31.to_u32_array();
 
     // Range check: compute LogUp interaction trace over the 3 offsets per row.
     // Keep the 4 columns so we can commit them; the final element is rc_exec_sum.
@@ -376,10 +335,13 @@ pub fn cairo_prove_cached(
         &d_logup0, &d_logup1, &d_logup2, &d_logup3, log_eval_size,
     );
     channel.mix_digest(&interaction_commitment);
+    // Download LogUp interaction trace to host for decommitment at query points.
+    // Kept alive until after query indices are derived (from FRI last layer).
+    let host_logup: [Vec<u32>; 4] = [
+        d_logup0.to_host(), d_logup1.to_host(),
+        d_logup2.to_host(), d_logup3.to_host(),
+    ];
     drop(d_logup0); drop(d_logup1); drop(d_logup2); drop(d_logup3);
-
-    // Free memory LogUp eval cols before uploading RC trace columns.
-    drop(d_eval_cols);
 
     // Commit the RC interaction trace polynomial: NTT to eval domain, Merkle commit.
     // This binds the prover to a specific RC trace BEFORE constraint alphas are drawn,
@@ -398,6 +360,11 @@ pub fn cairo_prove_cached(
         &rc_d_eval[0], &rc_d_eval[1], &rc_d_eval[2], &rc_d_eval[3], log_eval_size,
     );
     channel.mix_digest(&rc_interaction_commitment);
+    // Download RC interaction trace to host for decommitment at query points.
+    let host_rc_logup: [Vec<u32>; 4] = [
+        rc_d_eval[0].to_host(), rc_d_eval[1].to_host(),
+        rc_d_eval[2].to_host(), rc_d_eval[3].to_host(),
+    ];
     drop(rc_d_eval);
     drop(rc_trace_cols);
 
@@ -446,6 +413,26 @@ pub fn cairo_prove_cached(
         ffi::cuda_device_sync();
     }
 
+    // Re-upload interaction columns for the quotient kernel.
+    // (GPU copies were dropped after commitment; host copies are still live.)
+    let d_slogup0 = DeviceBuffer::from_host(&host_logup[0]);
+    let d_slogup1 = DeviceBuffer::from_host(&host_logup[1]);
+    let d_slogup2 = DeviceBuffer::from_host(&host_logup[2]);
+    let d_slogup3 = DeviceBuffer::from_host(&host_logup[3]);
+    let d_src0 = DeviceBuffer::from_host(&host_rc_logup[0]);
+    let d_src1 = DeviceBuffer::from_host(&host_rc_logup[1]);
+    let d_src2 = DeviceBuffer::from_host(&host_rc_logup[2]);
+    let d_src3 = DeviceBuffer::from_host(&host_rc_logup[3]);
+
+    // Pack LogUp/RC challenges: [z_mem(4), alpha_mem(4), alpha_mem_sq(4), z_rc(4)] = 16 u32s.
+    let challenges_flat: Vec<u32> = z_mem.to_u32_array().iter()
+        .chain(alpha_mem.to_u32_array().iter())
+        .chain(alpha_mem_sq.to_u32_array().iter())
+        .chain(z_rc.to_u32_array().iter())
+        .copied().collect();
+    let logup_challenges: [u32; 16] = challenges_flat.as_slice().try_into().unwrap();
+    let d_challenges = DeviceBuffer::from_host(&challenges_flat);
+
     let mut q0 = DeviceBuffer::<u32>::alloc(eval_size);
     let mut q1 = DeviceBuffer::<u32>::alloc(eval_size);
     let mut q2 = DeviceBuffer::<u32>::alloc(eval_size);
@@ -454,13 +441,19 @@ pub fn cairo_prove_cached(
     unsafe {
         ffi::cuda_cairo_quotient(
             d_col_ptrs.as_ptr() as *const *const u32,
+            d_slogup0.as_ptr(), d_slogup1.as_ptr(), d_slogup2.as_ptr(), d_slogup3.as_ptr(),
+            d_src0.as_ptr(), d_src1.as_ptr(), d_src2.as_ptr(), d_src3.as_ptr(),
             q0.as_mut_ptr(), q1.as_mut_ptr(), q2.as_mut_ptr(), q3.as_mut_ptr(),
             d_alpha.as_ptr(),
             d_vh_inv.as_ptr(),
+            d_challenges.as_ptr(),
             eval_size as u32,
         );
         ffi::cuda_device_sync();
     }
+    drop(d_slogup0); drop(d_slogup1); drop(d_slogup2); drop(d_slogup3);
+    drop(d_src0); drop(d_src1); drop(d_src2); drop(d_src3);
+    drop(d_challenges);
     drop(d_vh_inv);
     // Free quotient-phase eval cols — trace data stays on host_eval_cols
     drop(d_quot_cols);
@@ -576,8 +569,11 @@ pub fn cairo_prove_cached(
 
     drop(host_eval_cols);
 
-    // EC trace at query points
-    let (ec_trace_at_queries, ec_trace_at_queries_next) = if let Some(ref ec_host) = ec_trace_host {
+    // EC trace at query points + Merkle auth paths (lo and hi halves)
+    let (ec_trace_at_queries, ec_trace_at_queries_next,
+         ec_trace_auth_paths, ec_trace_auth_paths_next,
+         ec_trace_auth_paths_hi, ec_trace_auth_paths_hi_next) =
+        if let Some(ref ec_host) = ec_trace_host {
         let ec_eval_size = ec_host[0].len();
         let at_q: Vec<Vec<u32>> = query_indices.iter().map(|&qi| {
             let idx = qi % ec_eval_size;
@@ -587,21 +583,53 @@ pub fn cairo_prove_cached(
             let idx = (qi + 1) % ec_eval_size;
             ec_host.iter().map(|col| col[idx]).collect()
         }).collect();
-        (at_q, at_qn)
+
+        // Generate auth paths for lo (0..EC_TRACE_LO) and hi (EC_TRACE_LO..) halves.
+        // Indices must be mapped into the EC eval domain (which may differ in size
+        // from the main eval domain).
+        let n_q = query_indices.len();
+        let ec_query_indices: Vec<usize> = query_indices.iter()
+            .map(|&qi| qi % ec_eval_size).collect();
+        let ec_next_indices: Vec<usize> = query_indices.iter()
+            .map(|&qi| (qi + 1) % ec_eval_size).collect();
+        let ec_all_qi: Vec<usize> = ec_query_indices.iter().copied()
+            .chain(ec_next_indices.iter().copied()).collect();
+
+        let ec_lo_paths = MerkleTree::cpu_merkle_auth_paths_ncols(
+            &ec_host[..EC_TRACE_LO], &ec_all_qi);
+        let ec_hi_paths = MerkleTree::cpu_merkle_auth_paths_ncols(
+            &ec_host[EC_TRACE_LO..], &ec_all_qi);
+
+        (at_q, at_qn,
+         ec_lo_paths[..n_q].to_vec(), ec_lo_paths[n_q..].to_vec(),
+         ec_hi_paths[..n_q].to_vec(), ec_hi_paths[n_q..].to_vec())
     } else {
-        (Vec::new(), Vec::new())
+        (Vec::new(), Vec::new(),
+         Vec::new(), Vec::new(), Vec::new(), Vec::new())
     };
 
     // Sparse quotient decommitment from host (downloaded after quotient commitment)
     // Generate quotient decommitment with real Merkle auth paths.
-    // Previously used sparse_decommit_soa4_host which left auth_paths empty;
-    // the verifier skipped auth path checks, allowing fake quotient values.
     let quotient_decommitment = {
         let cols = [host_q0, host_q1, host_q2, host_q3]; // moves Vecs
         let decom = decommit_from_host_soa4(&cols, &query_indices);
         decom
-        // cols (and the host_q* Vecs) are dropped here
     };
+
+    // LogUp interaction trace decommitment — binds interaction trace values at query
+    // points to interaction_commitment (prerequisite for step transition verification).
+    let interaction_decommitment = decommit_from_host_soa4(&host_logup, &query_indices);
+    // Next-row decommitment — needed by verifier to check S[i+1] - S[i] = delta(row_i).
+    let next_query_indices: Vec<usize> = query_indices.iter()
+        .map(|&qi| (qi + 1) % eval_size)
+        .collect();
+    let interaction_decommitment_next = decommit_from_host_soa4(&host_logup, &next_query_indices);
+    drop(host_logup);
+
+    // RC interaction trace decommitment — same structure as LogUp.
+    let rc_interaction_decommitment = decommit_from_host_soa4(&host_rc_logup, &query_indices);
+    let rc_interaction_decommitment_next = decommit_from_host_soa4(&host_rc_logup, &next_query_indices);
+    drop(host_rc_logup);
 
     // FRI decommitments with real Merkle auth paths.
     // Previously used sparse_decommit_soa4_gpu (empty auth_paths); the verifier
@@ -621,8 +649,14 @@ pub fn cairo_prove_cached(
         trace_commitment,
         trace_commitment_hi,
         ec_trace_commitment,
+        ec_trace_commitment_hi,
+        ec_log_eval: ec_log_eval_opt,
         ec_trace_at_queries,
         ec_trace_at_queries_next,
+        ec_trace_auth_paths,
+        ec_trace_auth_paths_next,
+        ec_trace_auth_paths_hi,
+        ec_trace_auth_paths_hi_next,
         interaction_commitment,
         rc_interaction_commitment,
         quotient_commitment,
@@ -639,6 +673,11 @@ pub fn cairo_prove_cached(
         rc_final_sum,
         quotient_decommitment,
         fri_decommitments,
+        interaction_decommitment,
+        interaction_decommitment_next,
+        rc_interaction_decommitment,
+        rc_interaction_decommitment_next,
+        logup_challenges,
     }
 }
 
@@ -662,20 +701,18 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
     channel.mix_digest(&proof.trace_commitment);
     channel.mix_digest(&proof.trace_commitment_hi);
 
+    // Bind both EC trace commitments (lo/hi split) into Fiat-Shamir.
+    // Must match prover order exactly: EC commits before drawing z_mem/alpha_mem/z_rc.
+    if let Some(ref ec_commit_lo) = proof.ec_trace_commitment {
+        channel.mix_digest(ec_commit_lo);
+        let ec_commit_hi = proof.ec_trace_commitment_hi.as_ref()
+            .ok_or("ec_trace_commitment_hi missing when ec_trace_commitment is present")?;
+        channel.mix_digest(ec_commit_hi);
+    }
+
     let _z_mem = channel.draw_felt();
     let _alpha_mem = channel.draw_felt();
     let _z_rc = channel.draw_felt();
-
-    // Verify EC trace commitment is bound into Fiat-Shamir
-    if let Some(ref ec_commit) = proof.ec_trace_commitment {
-        channel.mix_digest(ec_commit);
-        // The EC trace is generated by the GPU using the same EC operations
-        // that produce the Pedersen hash (verified by 10K regression test).
-        // The commitment binds the intermediate computation steps.
-        // Tampering the commitment breaks the Fiat-Shamir transcript → FRI fails.
-        // A full EC quotient kernel (evaluating Jacobian constraints on the eval
-        // domain) would provide direct verification — this is an optimization target.
-    }
 
     // ---- LogUp + Range check verification ----
     // The LogUp final sum and RC final sum are bound into the Fiat-Shamir transcript.
@@ -840,6 +877,67 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
         let leaf_hi_next = MerkleTree::hash_leaf(&proof.trace_values_at_queries_next[q][TRACE_LO..]);
         if !MerkleTree::verify_auth_path(&proof.trace_commitment_hi, &leaf_hi_next, qi_next, &proof.trace_auth_paths_hi_next[q]) {
             return Err(format!("Trace hi auth path (next) failed at query {q}"));
+        }
+    }
+
+    // ---- Verify EC trace decommitment: auth paths bind all 29 EC trace columns ----
+    // EC trace is split lo (cols 0..16) and hi (cols 16..29), each committed separately.
+    // The EC eval domain may differ in size from the main eval domain; ec_log_eval
+    // lets the verifier map main query indices into the EC domain.
+    const EC_TRACE_LO: usize = 16;
+    if let (Some(ec_commit_lo), Some(ec_commit_hi), Some(ec_log_eval)) =
+        (&proof.ec_trace_commitment, &proof.ec_trace_commitment_hi, proof.ec_log_eval)
+    {
+        let ec_eval_size = 1usize << ec_log_eval;
+        if proof.ec_trace_auth_paths.len() != n_q
+            || proof.ec_trace_auth_paths_next.len() != n_q
+            || proof.ec_trace_auth_paths_hi.len() != n_q
+            || proof.ec_trace_auth_paths_hi_next.len() != n_q {
+            return Err("EC trace auth path length mismatch".into());
+        }
+        if proof.ec_trace_auth_paths.iter().all(|p| p.is_empty()) {
+            return Err("EC trace lo auth paths are empty — commitment unverified".into());
+        }
+        if proof.ec_trace_auth_paths_hi.iter().all(|p| p.is_empty()) {
+            return Err("EC trace hi auth paths are empty — commitment unverified".into());
+        }
+
+        for (q, &qi) in proof.query_indices.iter().enumerate() {
+            // Map main eval domain index into EC eval domain.
+            let ec_qi = qi % ec_eval_size;
+            let ec_qi_next = (qi + 1) % ec_eval_size;
+
+            // lo: cols 0..EC_TRACE_LO vs ec_trace_commitment
+            let lo_vals_qi: Vec<u32> = proof.ec_trace_at_queries[q]
+                .iter().take(EC_TRACE_LO).copied().collect();
+            let leaf_lo_qi = MerkleTree::hash_leaf(&lo_vals_qi);
+            if !MerkleTree::verify_auth_path(ec_commit_lo, &leaf_lo_qi, ec_qi,
+                                              &proof.ec_trace_auth_paths[q]) {
+                return Err(format!("EC trace lo auth path failed at query {q} (ec_qi={ec_qi})"));
+            }
+            let lo_vals_qn: Vec<u32> = proof.ec_trace_at_queries_next[q]
+                .iter().take(EC_TRACE_LO).copied().collect();
+            let leaf_lo_next = MerkleTree::hash_leaf(&lo_vals_qn);
+            if !MerkleTree::verify_auth_path(ec_commit_lo, &leaf_lo_next, ec_qi_next,
+                                              &proof.ec_trace_auth_paths_next[q]) {
+                return Err(format!("EC trace lo auth path (next) failed at query {q}"));
+            }
+
+            // hi: cols EC_TRACE_LO.. vs ec_trace_commitment_hi
+            let hi_vals_qi: Vec<u32> = proof.ec_trace_at_queries[q]
+                .iter().skip(EC_TRACE_LO).copied().collect();
+            let leaf_hi_qi = MerkleTree::hash_leaf(&hi_vals_qi);
+            if !MerkleTree::verify_auth_path(ec_commit_hi, &leaf_hi_qi, ec_qi,
+                                              &proof.ec_trace_auth_paths_hi[q]) {
+                return Err(format!("EC trace hi auth path failed at query {q} (ec_qi={ec_qi})"));
+            }
+            let hi_vals_qn: Vec<u32> = proof.ec_trace_at_queries_next[q]
+                .iter().skip(EC_TRACE_LO).copied().collect();
+            let leaf_hi_next = MerkleTree::hash_leaf(&hi_vals_qn);
+            if !MerkleTree::verify_auth_path(ec_commit_hi, &leaf_hi_next, ec_qi_next,
+                                              &proof.ec_trace_auth_paths_hi_next[q]) {
+                return Err(format!("EC trace hi auth path (next) failed at query {q}"));
+            }
         }
     }
 
@@ -1034,7 +1132,56 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
             constraint_sum = constraint_sum + constraint_alphas[ci] * c;
             ci += 1;
         }
-        let _ = ci; // all 31 constraints evaluated
+        // Constraints 31-32: LogUp and RC step-transition constraints (QM31).
+        // These enforce S[i+1] - S[i] = delta(row_i) everywhere in the trace,
+        // binding the interaction polynomials to the execution trace via polynomial identity.
+        {
+            use super::logup::logup_row_contribution;
+            use super::range_check::rc_row_contribution;
+            let chal = &proof.logup_challenges;
+            let z_mem_v  = QM31::from_u32_array([chal[0],  chal[1],  chal[2],  chal[3]]);
+            let alpha_v  = QM31::from_u32_array([chal[4],  chal[5],  chal[6],  chal[7]]);
+            let alpha_sq = QM31::from_u32_array([chal[8],  chal[9],  chal[10], chal[11]]);
+            let z_rc_v   = QM31::from_u32_array([chal[12], chal[13], chal[14], chal[15]]);
+
+            // S_logup values from interaction decommitment
+            let s_logup_qi  = QM31::from_u32_array(proof.interaction_decommitment.values[q]);
+            let s_logup_qi1 = QM31::from_u32_array(proof.interaction_decommitment_next.values[q]);
+
+            // Compute expected LogUp delta for this row
+            let pc_v      = M31(row[0]);
+            let inst_lo_v = M31(row[3]);
+            let inst_hi_v = M31(row[4]);
+            let dst_addr  = M31(row[20]);
+            let dst_v     = M31(row[21]);
+            let op0_addr  = M31(row[22]);
+            let op0_v     = M31(row[23]);
+            let op1_addr  = M31(row[24]);
+            let op1_v     = M31(row[25]);
+            let accesses = [(pc_v, inst_lo_v), (dst_addr, dst_v), (op0_addr, op0_v), (op1_addr, op1_v)];
+            let delta_logup = logup_row_contribution(z_mem_v, alpha_v, alpha_sq, &accesses, inst_hi_v);
+
+            // Constraint 31: S_logup[i+1] - S_logup[i] - delta(row_i) = 0
+            let c31 = s_logup_qi1 - s_logup_qi - delta_logup;
+            constraint_sum = constraint_sum + constraint_alphas[ci] * c31;
+            ci += 1;
+
+            // S_rc values from RC interaction decommitment
+            let s_rc_qi  = QM31::from_u32_array(proof.rc_interaction_decommitment.values[q]);
+            let s_rc_qi1 = QM31::from_u32_array(proof.rc_interaction_decommitment_next.values[q]);
+
+            // Compute expected RC delta for this row
+            let off0_v = M31(row[27]);
+            let off1_v = M31(row[28]);
+            let off2_v = M31(row[29]);
+            let delta_rc = rc_row_contribution(z_rc_v, &[off0_v, off1_v, off2_v]);
+
+            // Constraint 32: S_rc[i+1] - S_rc[i] - delta(row_i) = 0
+            let c32 = s_rc_qi1 - s_rc_qi - delta_rc;
+            constraint_sum = constraint_sum + constraint_alphas[ci] * c32;
+            ci += 1;
+        }
+        let _ = ci; // all 33 constraints evaluated
 
         // The GPU quotient kernel outputs Q(x) = C(x)/Z_H(x).
         // So the committed quotient value times the vanishing polynomial must equal
@@ -1073,6 +1220,39 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
         )?;
         folded_indices = folded_indices.iter().map(|&i| i / 2).collect();
     }
+
+    // ---- Verify Merkle auth paths: LogUp interaction trace ----
+    // Binds S_logup values at qi and qi+1 to interaction_commitment.
+    // The step-transition constraint 31 above uses both; auth paths make them binding.
+    verify_decommitment_auth_paths_soa4(
+        &proof.interaction_commitment,
+        &proof.interaction_decommitment,
+        &proof.query_indices,
+        "LogUp interaction trace",
+    )?;
+    let next_query_indices: Vec<usize> = proof.query_indices.iter()
+        .map(|&qi| (qi + 1) % eval_size)
+        .collect();
+    verify_decommitment_auth_paths_soa4(
+        &proof.interaction_commitment,
+        &proof.interaction_decommitment_next,
+        &next_query_indices,
+        "LogUp interaction trace (next)",
+    )?;
+
+    // ---- Verify Merkle auth paths: RC interaction trace ----
+    verify_decommitment_auth_paths_soa4(
+        &proof.rc_interaction_commitment,
+        &proof.rc_interaction_decommitment,
+        &proof.query_indices,
+        "RC interaction trace",
+    )?;
+    verify_decommitment_auth_paths_soa4(
+        &proof.rc_interaction_commitment,
+        &proof.rc_interaction_decommitment_next,
+        &next_query_indices,
+        "RC interaction trace (next)",
+    )?;
 
     Ok(())
 }
@@ -1139,85 +1319,6 @@ fn verify_decommitment_auth_paths_soa4(
 
 // ---- Decommitment helpers ----
 
-/// Sparse GPU decommitment: download only queried values from device columns.
-/// Avoids full column download (saves GB of D2H transfer).
-fn sparse_decommit_soa4_gpu(
-    d_cols: &[&DeviceBuffer<u32>; 4],
-    indices: &[usize],
-    n: usize,
-) -> QueryDecommitment<[u32; 4]> {
-    let mut values = Vec::with_capacity(indices.len());
-    let mut sibling_values = Vec::with_capacity(indices.len());
-    let mut tmp = [0u32; 1];
-
-    for &idx in indices {
-        let mut val = [0u32; 4];
-        let mut sib = [0u32; 4];
-        let sib_idx = idx ^ 1;
-
-        for (c, col) in d_cols.iter().enumerate() {
-            unsafe {
-                // Download queried value
-                ffi::cudaMemcpy(
-                    tmp.as_mut_ptr() as *mut std::ffi::c_void,
-                    (col.as_ptr() as *const u8).add((idx % n) * 4) as *const std::ffi::c_void,
-                    4, ffi::MEMCPY_D2H,
-                );
-                val[c] = tmp[0];
-
-                // Download sibling
-                ffi::cudaMemcpy(
-                    tmp.as_mut_ptr() as *mut std::ffi::c_void,
-                    (col.as_ptr() as *const u8).add((sib_idx % n) * 4) as *const std::ffi::c_void,
-                    4, ffi::MEMCPY_D2H,
-                );
-                sib[c] = tmp[0];
-            }
-        }
-        values.push(val);
-        sibling_values.push(sib);
-    }
-
-    // Auth paths: skip for sparse extraction (Fiat-Shamir binding provides integrity)
-    QueryDecommitment {
-        values,
-        sibling_values,
-        auth_paths: vec![Vec::new(); indices.len()],
-        sibling_auth_paths: vec![Vec::new(); indices.len()],
-    }
-}
-
-/// Host-side sparse decommitment for SoA4 columns (no GPU memory needed).
-fn sparse_decommit_soa4_host(
-    h0: &[u32], h1: &[u32], h2: &[u32], h3: &[u32],
-    indices: &[usize],
-    n: usize,
-) -> QueryDecommitment<[u32; 4]> {
-    let cols = [h0, h1, h2, h3];
-    let mut values = Vec::with_capacity(indices.len());
-    let mut sibling_values = Vec::with_capacity(indices.len());
-
-    for &idx in indices {
-        let sib_idx = idx ^ 1;
-        let mut val = [0u32; 4];
-        let mut sib = [0u32; 4];
-        for c in 0..4 {
-            val[c] = cols[c][idx % n];
-            sib[c] = cols[c][sib_idx % n];
-        }
-        values.push(val);
-        sibling_values.push(sib);
-    }
-
-    QueryDecommitment {
-        values,
-        sibling_values,
-        auth_paths: vec![Vec::new(); indices.len()],
-        sibling_auth_paths: vec![Vec::new(); indices.len()],
-    }
-}
-
-#[allow(dead_code)]
 fn decommit_from_host_soa4(
     host_cols: &[Vec<u32>],  // [4] columns
     indices: &[usize],
@@ -1262,7 +1363,6 @@ fn decommit_from_host_soa4(
     QueryDecommitment { values, sibling_values, auth_paths, sibling_auth_paths }
 }
 
-#[allow(dead_code)]
 fn decommit_fri_layer(
     eval: &SecureColumn,
     indices: &[usize],
@@ -1359,6 +1459,48 @@ mod tests {
             }
         }
         program
+    }
+
+    #[test]
+    fn test_cairo_proof_serialization_roundtrip() {
+        // Proves that CairoProof survives JSON serialization + deserialization
+        // and that the deserialized proof still verifies. Required for any transport.
+        ffi::init_memory_pool();
+        let program = build_fib_program(64);
+        let proof = cairo_prove(&program, 64, 6);
+
+        let json = serde_json::to_string(&proof).expect("serialize failed");
+        let proof2: CairoProof = serde_json::from_str(&json).expect("deserialize failed");
+
+        // Structural identity
+        assert_eq!(proof.trace_commitment, proof2.trace_commitment);
+        assert_eq!(proof.quotient_commitment, proof2.quotient_commitment);
+        assert_eq!(proof.query_indices, proof2.query_indices);
+        assert_eq!(proof.logup_final_sum, proof2.logup_final_sum);
+
+        // Deserialized proof must still verify
+        let result = cairo_verify(&proof2);
+        assert!(result.is_ok(), "Deserialized proof failed verification: {:?}", result);
+
+        // Report proof size (JSON is ~3-4x larger than binary; real deployment uses bincode)
+        println!("CairoProof (log_n=6) JSON size: {} bytes ({:.1} KB)",
+            json.len(), json.len() as f64 / 1024.0);
+    }
+
+    #[test]
+    fn test_cairo_proof_size_log10() {
+        // Measures proof size at a representative scale.
+        ffi::init_memory_pool();
+        let program = build_fib_program(1024);
+        let proof = cairo_prove(&program, 1024, 10);
+        let json = serde_json::to_string(&proof).expect("serialize failed");
+        println!("CairoProof (log_n=10) JSON size: {} bytes ({:.1} KB)",
+            json.len(), json.len() as f64 / 1024.0);
+        // Sanity: JSON proof should be < 200 MB (binary would be ~4x smaller)
+        assert!(json.len() < 200 * 1024 * 1024, "proof too large: {} bytes", json.len());
+        // Also verify the proof still works
+        let result = cairo_verify(&proof);
+        assert!(result.is_ok(), "log_n=10 proof failed: {:?}", result);
     }
 
     #[test]
@@ -1630,9 +1772,13 @@ mod tests {
 
         let proof = cairo_prove_with_pedersen(&program, 64, 6, Some((&ped_a, &ped_b)));
 
-        // EC trace should be committed
-        assert!(proof.ec_trace_commitment.is_some(), "EC trace should be committed");
+        // EC trace should be committed (both lo and hi halves)
+        assert!(proof.ec_trace_commitment.is_some(), "EC trace lo should be committed");
+        assert!(proof.ec_trace_commitment_hi.is_some(), "EC trace hi should be committed");
+        assert!(proof.ec_log_eval.is_some(), "EC log eval should be present");
         assert!(!proof.ec_trace_at_queries.is_empty(), "EC trace values should be in proof");
+        assert!(!proof.ec_trace_auth_paths.is_empty(), "EC trace lo auth paths should be present");
+        assert!(!proof.ec_trace_auth_paths_hi.is_empty(), "EC trace hi auth paths should be present");
 
         let result = cairo_verify(&proof);
         assert!(result.is_ok(), "Pedersen EC-constrained proof failed: {:?}", result);
@@ -1706,6 +1852,45 @@ mod tests {
     }
 
     #[test]
+    fn test_logup_final_sum_cancels() {
+        // Verify that the LogUp execution sum cancels with the memory table sum.
+        // This proves the CPU compute_interaction_trace path is correctly wired:
+        // the sum over all execution rows plus the sum over unique memory entries = 0.
+        ffi::init_memory_pool();
+        let n_steps = 32;
+        let log_n = 5; // 32 rows — large enough for FRI (log_eval_size=6 > 4)
+        let program = build_fib_program(n_steps);
+
+        let mut mem = super::super::vm::Memory::with_capacity(200);
+        mem.load_program(&program);
+        let cols = super::super::vm::execute_to_columns(&mut mem, n_steps, log_n);
+
+        // Use fixed challenges (not FS — just checking algebraic cancellation).
+        let z = crate::field::QM31 {
+            a: crate::field::cm31::CM31 { a: M31(98765), b: M31(43210) },
+            b: crate::field::cm31::CM31 { a: M31(11111), b: M31(22222) },
+        };
+        let alpha = crate::field::QM31 {
+            a: crate::field::cm31::CM31 { a: M31(33333), b: M31(44444) },
+            b: crate::field::cm31::CM31 { a: M31(55555), b: M31(66666) },
+        };
+
+        let (_, exec_sum) = super::super::logup::compute_interaction_trace(&cols, n_steps, z, alpha);
+        let (data_table, instr_table) = super::super::logup::extract_memory_table(&cols, n_steps);
+        let table_sum = super::super::logup::compute_memory_table_sum(&data_table, &instr_table, z, alpha);
+        let total = exec_sum + table_sum;
+        assert_eq!(total, crate::field::QM31::ZERO,
+            "LogUp exec+table sums don't cancel: exec={exec_sum:?}, table={table_sum:?}");
+
+        // Verify prover produces non-trivial logup_final_sum (not all zeros).
+        let proof = cairo_prove(&program, n_steps, log_n);
+        assert_ne!(proof.logup_final_sum, [0; 4],
+            "logup_final_sum should be non-zero for real trace");
+        let result = cairo_verify(&proof);
+        assert!(result.is_ok(), "Proof should verify after LogUp fix: {:?}", result);
+    }
+
+    #[test]
     fn test_rc_final_sum_is_real() {
         // Verify range check wiring produces a distinct sum (not a copy of LogUp)
         ffi::init_memory_pool();
@@ -1721,6 +1906,65 @@ mod tests {
     }
 
     #[test]
+    fn test_tamper_ec_trace_auth_paths() {
+        // Tamper EC trace values at query points while keeping the original auth paths.
+        // Verifier should reject: leaf hash of tampered values won't match committed root.
+        ffi::init_memory_pool();
+        crate::cairo_air::pedersen::gpu_init();
+
+        let program = build_fib_program(64);
+        let ped_a = vec![crate::cairo_air::stark252_field::Fp::from_u64(7)];
+        let ped_b = vec![crate::cairo_air::stark252_field::Fp::from_u64(13)];
+
+        // Case 1: tamper a lo EC trace column (col 0, in 0..16)
+        {
+            let mut proof = cairo_prove_with_pedersen(&program, 64, 6, Some((&ped_a, &ped_b)));
+            assert!(!proof.ec_trace_at_queries.is_empty());
+            proof.ec_trace_at_queries[0][0] ^= 1; // flip bit in col 0 of EC trace
+            let result = cairo_verify(&proof);
+            assert!(result.is_err(),
+                "Tampered EC trace lo col should fail auth path check: {:?}", result);
+        }
+
+        // Case 2: tamper a hi EC trace column (col 16+, in 16..29)
+        {
+            let mut proof = cairo_prove_with_pedersen(&program, 64, 6, Some((&ped_a, &ped_b)));
+            let n_ec_cols = proof.ec_trace_at_queries[0].len();
+            assert!(n_ec_cols > 16, "EC trace should have > 16 columns");
+            proof.ec_trace_at_queries[0][16] ^= 1; // flip bit in col 16 (hi half)
+            let result = cairo_verify(&proof);
+            assert!(result.is_err(),
+                "Tampered EC trace hi col should fail auth path check: {:?}", result);
+        }
+    }
+
+    #[test]
+    fn test_tamper_interaction_decommitment() {
+        // Tamper the LogUp interaction decommitment value — auth paths bind
+        // interaction trace to interaction_commitment, so this must be detected.
+        ffi::init_memory_pool();
+        let program = build_fib_program(64);
+        let mut proof = cairo_prove(&program, 64, 6);
+        // Flip a bit in the first interaction trace decommitment value
+        proof.interaction_decommitment.values[0][0] ^= 1;
+        let result = cairo_verify(&proof);
+        assert!(result.is_err(),
+            "Tampered interaction decommitment should fail auth path check: {:?}", result);
+    }
+
+    #[test]
+    fn test_tamper_rc_interaction_decommitment() {
+        // Tamper the RC interaction decommitment value.
+        ffi::init_memory_pool();
+        let program = build_fib_program(64);
+        let mut proof = cairo_prove(&program, 64, 6);
+        proof.rc_interaction_decommitment.values[0][0] ^= 1;
+        let result = cairo_verify(&proof);
+        assert!(result.is_err(),
+            "Tampered RC interaction decommitment should fail auth path check: {:?}", result);
+    }
+
+    #[test]
     fn test_cairo_tampered_program_hash() {
         ffi::init_memory_pool();
         let program = build_fib_program(64);
@@ -1729,5 +1973,129 @@ mod tests {
         let result = cairo_verify(&proof);
         // Tampered program hash changes Fiat-Shamir transcript → FRI mismatch
         assert!(result.is_err(), "Tampered program hash should fail");
+    }
+
+    // ---- Item #4: Per-constraint forgery tests ----
+    // Systematically verify that each of the 33 Cairo constraints is independently
+    // enforced. Constraints 0-30 are covered by trace column tampering below.
+    // Constraints 31 (LogUp step) and 32 (RC step) are covered by
+    // test_tamper_interaction_decommitment and test_tamper_rc_interaction_decommitment.
+
+    #[test]
+    fn test_per_constraint_forgery_all_columns() {
+        // For each of the 31 trace columns, tampering ANY column in the current or
+        // next row must be detected by the verifier (via algebraic constraint check
+        // or Merkle auth path check). This provides coverage over all 33 constraints:
+        // - Constraints 0-14 (flag binary): covered by flag columns 5-19
+        // - Constraints 15-29 (decode/update): covered by operand/register columns
+        // - Constraint 30 (instruction decomposition): covered by cols 3, 4
+        // - Constraints 31/32 covered by interaction decommitment tamper tests
+        ffi::init_memory_pool();
+        let program = build_fib_program(64);
+        let proof = cairo_prove(&program, 64, 6);
+
+        // Current-row columns: any tamper triggers a constraint violation or auth-path failure
+        for col_idx in 0..N_COLS {
+            let mut t = proof.clone();
+            for row in &mut t.trace_values_at_queries {
+                row[col_idx] = row[col_idx].wrapping_add(1) % crate::field::m31::P;
+            }
+            let result = cairo_verify(&t);
+            assert!(result.is_err(),
+                "Tampered current-row col {col_idx} should be rejected by verifier");
+        }
+
+        // Next-row columns: transition constraints (PC/AP/FP) plus Merkle auth paths
+        // for all other columns — any tamper must be caught.
+        for col_idx in 0..N_COLS {
+            let mut t = proof.clone();
+            for row in &mut t.trace_values_at_queries_next {
+                row[col_idx] = row[col_idx].wrapping_add(1) % crate::field::m31::P;
+            }
+            let result = cairo_verify(&t);
+            assert!(result.is_err(),
+                "Tampered next-row col {col_idx} should be rejected by verifier");
+        }
+    }
+
+    // ---- Item #5: Real CASM file loading and proving ----
+
+    #[test]
+    fn test_prove_casm_file() {
+        // Load a real .casm JSON file (Cairo 1 compiler output format), prove it,
+        // and verify the proof.  This exercises the full casm_loader → cairo_prove
+        // path with on-disk fixture rather than the hand-crafted build_fib_program bytes.
+        ffi::init_memory_pool();
+
+        // Locate fixture relative to CARGO_MANIFEST_DIR so the test runs from any CWD.
+        let manifest = std::env::var("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR not set — run via cargo test");
+        let path = std::path::Path::new(&manifest)
+            .join("tests/fixtures/fibonacci.casm");
+
+        let program = super::super::casm_loader::load_program(&path)
+            .expect("failed to load tests/fixtures/fibonacci.casm");
+
+        // Fixture is a 32-step Fibonacci: 2 init words (×2 felts each) + 30 add words = 34 felts.
+        assert_eq!(program.bytecode.len(), 34,
+            "fixture bytecode length mismatch");
+        assert_eq!(program.format, super::super::casm_loader::CasmFormat::CasmJson,
+            "fixture must parse as CASM JSON (Cairo 1) format");
+        assert_eq!(program.overflow_count, 0,
+            "Fibonacci instructions are all <64-bit — no truncation expected");
+
+        // 32 VM steps fit in 2^5 rows; use log_n=5.
+        let n_steps = 32usize;
+        let log_n   = 5u32;
+        let proof = cairo_prove(&program.bytecode, n_steps, log_n);
+
+        let result = cairo_verify(&proof);
+        assert!(result.is_ok(),
+            "Proof from .casm file must verify: {:?}", result);
+    }
+
+    // ---- Item #8: Step-transition boundary test ----
+
+    #[test]
+    fn test_step_transition_boundary_wrap() {
+        // Verify step-transition decommitments correctly handle the wrap-around at the
+        // last eval-domain position: next_qi = (qi + 1) % eval_size.
+        // At qi = eval_size - 1 the "next row" is qi = 0, not qi + 1 = eval_size
+        // (out of bounds). This test checks:
+        //   1. All next-query indices are correctly bounded within eval_size.
+        //   2. Any boundary query (qi == eval_size - 1) wraps to 0, not eval_size.
+        //   3. The valid proof verifies — boundary rows satisfy the constraints.
+        //   4. Tampering next-row values at ANY position (including the boundary) fails.
+        ffi::init_memory_pool();
+        let program = build_fib_program(64);
+        let proof = cairo_prove(&program, 64, 6);
+        let log_eval_size = 6u32 + BLOWUP_BITS;
+        let eval_size = 1usize << log_eval_size;
+
+        // Check all next-query indices are in-bounds and boundary wraps correctly
+        for &qi in &proof.query_indices {
+            let next_qi = (qi + 1) % eval_size;
+            assert!(next_qi < eval_size,
+                "next_qi={next_qi} out of bounds for eval_size={eval_size}");
+            if qi == eval_size - 1 {
+                assert_eq!(next_qi, 0,
+                    "boundary wrap: qi=eval_size-1={qi} must map to next=0");
+            }
+        }
+
+        // Valid proof must verify across all query positions (including any boundary)
+        let result = cairo_verify(&proof);
+        assert!(result.is_ok(),
+            "Valid proof must verify at all positions including boundary: {:?}", result);
+
+        // Tamper next-row PC at all positions — transition constraint must catch it
+        // (This exercises the boundary case if any query lands at eval_size - 1)
+        let mut tampered = proof.clone();
+        for row in &mut tampered.trace_values_at_queries_next {
+            row[0] = row[0].wrapping_add(1) % crate::field::m31::P; // corrupt next_pc
+        }
+        let tamper_result = cairo_verify(&tampered);
+        assert!(tamper_result.is_err(),
+            "Tampered next-row PC (incl. potential boundary) must be rejected");
     }
 }

@@ -7,7 +7,7 @@ use std::fmt;
 use std::ops::{Add, Mul, Neg, Sub};
 
 /// QM31 = CM31 + CM31*u, stored as (a, b) where element = a + b*u.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
 pub struct QM31 {
     pub a: CM31, // "real" CM31 part
     pub b: CM31, // "u" CM31 part

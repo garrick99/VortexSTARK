@@ -5,7 +5,7 @@ use std::fmt;
 use std::ops::{Add, Mul, Neg, Sub};
 
 /// CM31 = M31[i] / (i^2 + 1)
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
 pub struct CM31 {
     pub a: M31, // real
     pub b: M31, // imaginary

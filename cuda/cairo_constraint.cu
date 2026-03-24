@@ -108,18 +108,64 @@ __global__ void compute_vanishing_inv_kernel(
     out_vh_inv[i] = m31_inv(zh);
 }
 
+// Helper: compute LogUp step delta for one row.
+// access0 uses extended denom: z - (pc + alpha*inst_lo + alpha_sq*inst_hi)
+// accesses 1-3 use simple denom: z - (addr + alpha*val)
+__device__ __forceinline__ QM31 logup_step_delta(
+    uint32_t pc, uint32_t inst_lo, uint32_t inst_hi,
+    uint32_t dst_addr, uint32_t dst,
+    uint32_t op0_addr, uint32_t op0,
+    uint32_t op1_addr, uint32_t op1,
+    QM31 z_mem, QM31 alpha_mem, QM31 alpha_mem_sq
+) {
+    // Access 0: instruction fetch (extended denom with inst_hi)
+    QM31 e0 = qm31_add(qm31_from_m31(pc),
+               qm31_add(qm31_mul(alpha_mem, qm31_from_m31(inst_lo)),
+                        qm31_mul(alpha_mem_sq, qm31_from_m31(inst_hi))));
+    QM31 d0 = qm31_sub(z_mem, e0);
+    // Access 1-3: data accesses
+    QM31 d1 = qm31_sub(z_mem, qm31_add(qm31_from_m31(dst_addr),  qm31_mul(alpha_mem, qm31_from_m31(dst))));
+    QM31 d2 = qm31_sub(z_mem, qm31_add(qm31_from_m31(op0_addr),  qm31_mul(alpha_mem, qm31_from_m31(op0))));
+    QM31 d3 = qm31_sub(z_mem, qm31_add(qm31_from_m31(op1_addr),  qm31_mul(alpha_mem, qm31_from_m31(op1))));
+    return qm31_add(qm31_add(qm31_add(qm31_inv(d0), qm31_inv(d1)), qm31_inv(d2)), qm31_inv(d3));
+}
+
+// Helper: compute RC step delta for one row.
+__device__ __forceinline__ QM31 rc_step_delta(
+    uint32_t off0, uint32_t off1, uint32_t off2, QM31 z_rc
+) {
+    QM31 r0 = qm31_sub(z_rc, qm31_from_m31(off0));
+    QM31 r1 = qm31_sub(z_rc, qm31_from_m31(off1));
+    QM31 r2 = qm31_sub(z_rc, qm31_from_m31(off2));
+    return qm31_add(qm31_add(qm31_inv(r0), qm31_inv(r1)), qm31_inv(r2));
+}
+
 __global__ void cairo_quotient_kernel(
     const uint32_t* const* __restrict__ trace_cols,  // [31] column pointers
+    // LogUp interaction trace (QM31 stored as 4 M31 cols, eval-domain order)
+    const uint32_t* __restrict__ s_logup0, const uint32_t* __restrict__ s_logup1,
+    const uint32_t* __restrict__ s_logup2, const uint32_t* __restrict__ s_logup3,
+    // RC interaction trace
+    const uint32_t* __restrict__ s_rc0, const uint32_t* __restrict__ s_rc1,
+    const uint32_t* __restrict__ s_rc2, const uint32_t* __restrict__ s_rc3,
     uint32_t* __restrict__ out0, uint32_t* __restrict__ out1,
     uint32_t* __restrict__ out2, uint32_t* __restrict__ out3,
     const uint32_t* __restrict__ alpha_coeffs,  // [N_CONSTRAINTS * 4] QM31 coefficients
     const uint32_t* __restrict__ vh_inv,        // [n] 1/Z_H at each eval point (NTT order)
+    // QM31 challenges packed as [z_mem(4), alpha_mem(4), alpha_mem_sq(4), z_rc(4)]
+    const uint32_t* __restrict__ challenges,
     uint32_t n  // eval domain size
 ) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
     uint32_t next_i = (i + 1) % n;
+
+    // Unpack QM31 challenges
+    QM31 z_mem       = {{challenges[0],  challenges[1],  challenges[2],  challenges[3]}};
+    QM31 alpha_mem   = {{challenges[4],  challenges[5],  challenges[6],  challenges[7]}};
+    QM31 alpha_mem_sq = {{challenges[8],  challenges[9],  challenges[10], challenges[11]}};
+    QM31 z_rc        = {{challenges[12], challenges[13], challenges[14], challenges[15]}};
 
     // Load current row values
     uint32_t pc  = trace_cols[COL_PC][i];
@@ -379,6 +425,37 @@ __global__ void cairo_quotient_kernel(
         quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
     }
 
+    // --- Constraint 31: LogUp step transition (QM31 constraint) ---
+    // S_logup[i+1] - S_logup[i] - logup_delta(row_i) = 0
+    {
+        QM31 s_curr = {{s_logup0[i],      s_logup1[i],      s_logup2[i],      s_logup3[i]}};
+        QM31 s_next = {{s_logup0[next_i], s_logup1[next_i], s_logup2[next_i], s_logup3[next_i]}};
+        uint32_t dst_addr_v = trace_cols[COL_DST_ADDR][i];
+        uint32_t op0_addr_v = trace_cols[COL_OP0_ADDR][i];
+        uint32_t op1_addr_v = trace_cols[COL_OP1_ADDR][i];
+        uint32_t inst_lo_v  = trace_cols[COL_INST_LO][i];
+        uint32_t inst_hi_v  = trace_cols[COL_INST_HI][i];
+        QM31 delta = logup_step_delta(pc, inst_lo_v, inst_hi_v,
+                                       dst_addr_v, dst, op0_addr_v, op0, op1_addr_v, op1,
+                                       z_mem, alpha_mem, alpha_mem_sq);
+        QM31 c31 = qm31_sub(qm31_sub(s_next, s_curr), delta);
+        QM31 alpha31 = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+        quotient = qm31_add(quotient, qm31_mul(alpha31, c31));
+        ci++;
+    }
+
+    // --- Constraint 32: RC step transition (QM31 constraint) ---
+    // S_rc[i+1] - S_rc[i] - rc_delta(row_i) = 0
+    {
+        QM31 s_curr_rc = {{s_rc0[i],      s_rc1[i],      s_rc2[i],      s_rc3[i]}};
+        QM31 s_next_rc = {{s_rc0[next_i], s_rc1[next_i], s_rc2[next_i], s_rc3[next_i]}};
+        QM31 delta_rc = rc_step_delta(off0, off1, off2, z_rc);
+        QM31 c32 = qm31_sub(qm31_sub(s_next_rc, s_curr_rc), delta_rc);
+        QM31 alpha32 = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+        quotient = qm31_add(quotient, qm31_mul(alpha32, c32));
+        ci++;
+    }
+
     // Divide by vanishing polynomial: Q(x) = C(x) / Z_H(x)
     quotient = qm31_mul_m31(quotient, vh_inv[i]);
 
@@ -391,10 +468,15 @@ __global__ void cairo_quotient_kernel(
 // Chunked variant for streaming
 __global__ void cairo_quotient_chunk_kernel(
     const uint32_t* const* __restrict__ trace_cols,
+    const uint32_t* __restrict__ s_logup0, const uint32_t* __restrict__ s_logup1,
+    const uint32_t* __restrict__ s_logup2, const uint32_t* __restrict__ s_logup3,
+    const uint32_t* __restrict__ s_rc0, const uint32_t* __restrict__ s_rc1,
+    const uint32_t* __restrict__ s_rc2, const uint32_t* __restrict__ s_rc3,
     uint32_t* __restrict__ out0, uint32_t* __restrict__ out1,
     uint32_t* __restrict__ out2, uint32_t* __restrict__ out3,
     const uint32_t* __restrict__ alpha_coeffs,
-    const uint32_t* __restrict__ vh_inv,  // [global_n] 1/Z_H in NTT order
+    const uint32_t* __restrict__ vh_inv,
+    const uint32_t* __restrict__ challenges,
     uint32_t offset, uint32_t chunk_n, uint32_t global_n
 ) {
     uint32_t local_i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -402,6 +484,11 @@ __global__ void cairo_quotient_chunk_kernel(
 
     uint32_t i = offset + local_i;
     uint32_t next_i = (i + 1) % global_n;
+
+    QM31 z_mem        = {{challenges[0],  challenges[1],  challenges[2],  challenges[3]}};
+    QM31 alpha_mem    = {{challenges[4],  challenges[5],  challenges[6],  challenges[7]}};
+    QM31 alpha_mem_sq = {{challenges[8],  challenges[9],  challenges[10], challenges[11]}};
+    QM31 z_rc         = {{challenges[12], challenges[13], challenges[14], challenges[15]}};
 
     // Same constraint logic as above, reading from global indices
     uint32_t pc  = trace_cols[COL_PC][i];
@@ -578,6 +665,33 @@ __global__ void cairo_quotient_chunk_kernel(
             QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
             quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
         }
+
+        // Constraint 31: LogUp step transition
+        {
+            QM31 s_curr = {{s_logup0[i],      s_logup1[i],      s_logup2[i],      s_logup3[i]}};
+            QM31 s_next = {{s_logup0[next_i], s_logup1[next_i], s_logup2[next_i], s_logup3[next_i]}};
+            uint32_t inst_lo_v  = trace_cols[COL_INST_LO][i];
+            uint32_t inst_hi_v  = trace_cols[COL_INST_HI][i];
+            uint32_t dst_addr_v = trace_cols[COL_DST_ADDR][i];
+            uint32_t op0_addr_v = trace_cols[COL_OP0_ADDR][i];
+            uint32_t op1_addr_v = trace_cols[COL_OP1_ADDR][i];
+            QM31 delta = logup_step_delta(pc, inst_lo_v, inst_hi_v,
+                                           dst_addr_v, dst, op0_addr_v, op0, op1_addr_v, op1,
+                                           z_mem, alpha_mem, alpha_mem_sq);
+            QM31 c31 = qm31_sub(qm31_sub(s_next, s_curr), delta);
+            QM31 alpha31 = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+            quotient = qm31_add(quotient, qm31_mul(alpha31, c31)); ci++;
+        }
+
+        // Constraint 32: RC step transition
+        {
+            QM31 s_curr_rc = {{s_rc0[i],      s_rc1[i],      s_rc2[i],      s_rc3[i]}};
+            QM31 s_next_rc = {{s_rc0[next_i], s_rc1[next_i], s_rc2[next_i], s_rc3[next_i]}};
+            QM31 delta_rc = rc_step_delta(off0_v, off1_v, off2_v, z_rc);
+            QM31 c32 = qm31_sub(qm31_sub(s_next_rc, s_curr_rc), delta_rc);
+            QM31 alpha32 = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+            quotient = qm31_add(quotient, qm31_mul(alpha32, c32)); ci++;
+        }
     }
 
     // Divide by vanishing polynomial: Q(x) = C(x) / Z_H(x)
@@ -609,29 +723,47 @@ void cuda_compute_vanishing_inv(
 
 void cuda_cairo_quotient(
     const uint32_t* const* trace_cols,
+    const uint32_t* s_logup0, const uint32_t* s_logup1,
+    const uint32_t* s_logup2, const uint32_t* s_logup3,
+    const uint32_t* s_rc0, const uint32_t* s_rc1,
+    const uint32_t* s_rc2, const uint32_t* s_rc3,
     uint32_t* out0, uint32_t* out1, uint32_t* out2, uint32_t* out3,
     const uint32_t* alpha_coeffs,
     const uint32_t* vh_inv,
+    const uint32_t* challenges,
     uint32_t n
 ) {
     uint32_t threads = 256;
     uint32_t blocks = (n + threads - 1) / threads;
     cairo_quotient_kernel<<<blocks, threads>>>(
-        trace_cols, out0, out1, out2, out3, alpha_coeffs, vh_inv, n
+        trace_cols,
+        s_logup0, s_logup1, s_logup2, s_logup3,
+        s_rc0, s_rc1, s_rc2, s_rc3,
+        out0, out1, out2, out3,
+        alpha_coeffs, vh_inv, challenges, n
     );
 }
 
 void cuda_cairo_quotient_chunk(
     const uint32_t* const* trace_cols,
+    const uint32_t* s_logup0, const uint32_t* s_logup1,
+    const uint32_t* s_logup2, const uint32_t* s_logup3,
+    const uint32_t* s_rc0, const uint32_t* s_rc1,
+    const uint32_t* s_rc2, const uint32_t* s_rc3,
     uint32_t* out0, uint32_t* out1, uint32_t* out2, uint32_t* out3,
     const uint32_t* alpha_coeffs,
     const uint32_t* vh_inv,
+    const uint32_t* challenges,
     uint32_t offset, uint32_t chunk_n, uint32_t global_n
 ) {
     uint32_t threads = 256;
     uint32_t blocks = (chunk_n + threads - 1) / threads;
     cairo_quotient_chunk_kernel<<<blocks, threads>>>(
-        trace_cols, out0, out1, out2, out3, alpha_coeffs, vh_inv,
+        trace_cols,
+        s_logup0, s_logup1, s_logup2, s_logup3,
+        s_rc0, s_rc1, s_rc2, s_rc3,
+        out0, out1, out2, out3,
+        alpha_coeffs, vh_inv, challenges,
         offset, chunk_n, global_n
     );
 }
