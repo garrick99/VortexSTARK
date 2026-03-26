@@ -7,7 +7,7 @@ GPU-native Circle STARK prover with end-to-end proof generation and verification
 ### End-to-end proven and verified on hardware
 
 - **Fibonacci STARK**: Full prove → verify pipeline, 100-bit conjectured security, 12 tamper-detection tests
-- **Cairo VM STARK**: 31-column trace, 31 transition constraints, verifier independently evaluates all constraints at query points
+- **Cairo VM STARK**: 34-column trace, 35 transition constraints, verifier independently evaluates all constraints at query points
 - **LogUp memory consistency**: Execution sum + memory table sum cancellation, final value bound into Fiat-Shamir
 - **Pedersen hash**: GPU windowed EC scalar multiplication, 37.7M hashes/sec, verified against CPU reference
 - **Poseidon2 hash**: GPU trace generation + NTT, 4.7M hashes/sec at log_n=28 (30 rows/perm, RF=8 RP=22)
@@ -29,7 +29,7 @@ GPU-native Circle STARK prover with end-to-end proof generation and verification
 
 ### Adversarial soundness (constraint coverage)
 
-31-column trace, 31 transition constraints. The following are now enforced:
+34-column trace, 35 transition constraints. The following are now enforced:
 
 - **Operand address verification**: dst_addr, op0_addr, op1_addr constrained against register + offset - bias
 - **JNZ fall-through**: dst_inv auxiliary column, fall-through constrained to pc + inst_size when dst=0
@@ -47,7 +47,7 @@ GPU-native Circle STARK prover with end-to-end proof generation and verification
 
 - **Felt252 arithmetic**: VM operates over M31 (2^31 − 1). `cairo_prove_program` now returns `Err(ProveError::Felt252Overflow)` for programs whose bytecode contains values wider than 64 bits, preventing silent misproofs. Values in the range (M31, u64] are still reduced mod M31 without error — proof output is wrong for programs that rely on Stark252 arithmetic in that range.
 - **Starknet syscalls**: `storage_read`, `emit_event`, `call_contract`, and other OS syscalls are not emulated. Programs that invoke these will stall or produce invalid traces.
-- **Dict consistency proofs**: Dict read/write execution is fully functional. An execution-side chain consistency check now runs at prove time and returns `Err(ProveError::DictConsistencyViolation)` if hint execution is internally inconsistent. The STARK proof does not yet include a formal dict consistency argument; proofs for dict-heavy programs are not sound against a *malicious* prover.
+- **Dict consistency proofs**: Dict read/write execution is fully functional. An execution-side chain consistency check runs at prove time (`ProveError::DictConsistencyViolation`). The S_dict step-transition LogUp (C34) links main trace dict columns to an authenticated exec trace; verifier checks `dict_link_final == exec_key_new_sum`. Soundness holds against a malicious prover for dict-heavy programs.
 
 See [SOUNDNESS.md](SOUNDNESS.md) for the full constraint-by-constraint analysis.
 
@@ -64,8 +64,8 @@ See [SOUNDNESS.md](SOUNDNESS.md) for the full constraint-by-constraint analysis.
 
 - **Instruction decoder**: 15 flags, 3 biased offsets, full Cairo encoding
 - **VM executor**: add, mul, jump, jnz, call, ret, assert_eq (26ns/step fused)
-- **31-column trace**: registers(3), instruction(2), flags(15), operands(7), offsets(3), dst_inv(1)
-- **31 transition constraints** evaluated on GPU (single CUDA kernel) and independently by verifier
+- **34-column trace**: registers(3), instruction(2), flags(15), operands(7), offsets(3), dst_inv(1), dict linkage(3)
+- **35 transition constraints** evaluated on GPU (single CUDA kernel) and independently by verifier
 - **LogUp memory consistency**: permutation argument with execution + table sum cancellation
 - **Range check argument**: 16-bit offset validation via LogUp bus, wired into prover pipeline
 - **Instruction decomposition**: algebraic constraint tying inst_lo/inst_hi to offsets and flags
@@ -97,14 +97,14 @@ Requires: Rust 1.85+ (stable), CUDA 13.0+, RTX 5090 (SM 12.0) or RTX 4090 (SM 8.
 
 ```bash
 cargo build --release
-cargo test -- --test-threads=1    # 188 tests
+cargo test -- --test-threads=1    # 216 tests
 cargo run --release --bin full_benchmark
 cargo run --release --bin gpu_bench     # pre-flight checks + per-section GPU telemetry
 ```
 
 ## Tests
 
-188 tests covering: M31/CM31/QM31 field arithmetic, Circle NTT, Merkle tree (commit, auth paths, tiled, SoA4), FRI (fold, circle fold, deterministic), STARK prover + verifier (multiple sizes, tamper detection), Cairo VM (decoder, executor, Fibonacci, constraints, LogUp, range checks, instruction decomposition), Poseidon, Pedersen (Stark252 field, EC ops, GPU vs CPU), Bitwise, GPU constraint eval (bytecode VM, warp-cooperative), GPU leaf hashing (Blake2s, domain separation), CASM loader, Cairo hints (AllocSegment, AllocFelt252Dict, dict entry lifecycle, squash, U256InvModN, multi-dict programs, isqrt edge cases).
+216 tests covering: M31/CM31/QM31 field arithmetic, Circle NTT, Merkle tree (commit, auth paths, tiled, SoA4), FRI (fold, circle fold, deterministic), STARK prover + verifier (multiple sizes, tamper detection), Cairo VM (decoder, executor, Fibonacci, constraints, LogUp, range checks, instruction decomposition), Poseidon, Pedersen (Stark252 field, EC ops, GPU vs CPU), Bitwise, GPU constraint eval (bytecode VM, warp-cooperative), GPU leaf hashing (Blake2s, domain separation), CASM loader, Cairo hints (AllocSegment, AllocFelt252Dict, dict entry lifecycle, squash, U256InvModN, multi-dict programs, isqrt edge cases).
 
 ## Break This System
 
@@ -114,14 +114,14 @@ If you can craft a malformed trace that the verifier accepts, that is a real bug
 
 - **Felt252 arithmetic**: values wider than 63 bits are truncated; M31 wrap-around replaces Stark252 arithmetic for overflowing programs
 - **Starknet syscalls**: not emulated — contracts that call OS syscalls will produce invalid traces
-- **Dict consistency**: dict operations execute and DictInfo state is fully tracked, but the proof does not include a formal dict consistency argument
+- **Felt252 dict values**: dict values are M31 elements; programs that store full Stark252 field elements in dicts are not supported
 
 ### Expected to hold (guarantees today)
 
 These should **not** break. If they do, that's a real soundness bug:
 
 - Honest prover produces proofs that verify for Fibonacci, add, mul, call/ret, and mixed programs
-- Verifier independently evaluates all 31 constraints at query points and rejects any mismatch
+- Verifier independently evaluates all 35 constraints at query points and rejects any mismatch
 - Operand addresses verified against register + offset for all three operands (dst, op0, op1)
 - JNZ fall-through constrained: dst_inv auxiliary column forces next_pc = pc + inst_size when dst = 0
 - Flag exclusivity enforced: op1 source, PC update mode, and opcode are pairwise mutually exclusive

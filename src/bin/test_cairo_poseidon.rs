@@ -4,7 +4,7 @@
 use vortexstark::cairo_air::{
     decode::Instruction,
     vm::{Memory, execute_to_columns},
-    trace::{self, N_COLS},
+    trace::{self, N_VM_COLS},
     builtins::{PoseidonBuiltin, POSEIDON_BUILTIN_BASE, vm_poseidon_invoke},
 };
 use vortexstark::poseidon::STATE_WIDTH;
@@ -96,12 +96,12 @@ fn main() {
         let inv_cache = InverseTwiddleCache::new(&trace_domain);
         let fwd_cache = ForwardTwiddleCache::new(&eval_domain);
 
-        let total_cols = N_COLS + builtin_n_cols; // 27 + 8 = 35
+        let total_cols = N_VM_COLS + builtin_n_cols; // 31 + 8 = 39
 
         let mut d_eval_cols: Vec<DeviceBuffer<u32>> = Vec::with_capacity(total_cols);
 
         // Process VM columns
-        for c in 0..N_COLS {
+        for c in 0..N_VM_COLS {
             let mut d_col = DeviceBuffer::from_host(&vm_cols[c]);
             ntt::interpolate(&mut d_col, &inv_cache);
             let mut d_eval = DeviceBuffer::<u32>::alloc(eval_size);
@@ -135,7 +135,7 @@ fn main() {
         let alpha_coeffs: Vec<QM31> = (0..n_constraints).map(|_| channel.draw_felt()).collect();
         let alpha_flat: Vec<u32> = alpha_coeffs.iter().flat_map(|a| a.to_u32_array()).collect();
 
-        let col_ptrs: Vec<*const u32> = d_eval_cols[..N_COLS].iter().map(|c| c.as_ptr()).collect();
+        let col_ptrs: Vec<*const u32> = d_eval_cols[..N_VM_COLS].iter().map(|c| c.as_ptr()).collect();
         let d_col_ptrs = DeviceBuffer::from_host(&col_ptrs);
         let d_alpha = DeviceBuffer::from_host(&alpha_flat);
 
@@ -182,7 +182,7 @@ fn main() {
         let d_rc = DeviceBuffer::from_host(&rc_flat);
         let d_poseidon_alpha = DeviceBuffer::from_host(&poseidon_alpha_flat);
 
-        let builtin_ptrs: Vec<*const u32> = d_eval_cols[N_COLS..].iter().map(|c| c.as_ptr()).collect();
+        let builtin_ptrs: Vec<*const u32> = d_eval_cols[N_VM_COLS..].iter().map(|c| c.as_ptr()).collect();
         let d_builtin_ptrs = DeviceBuffer::from_host(&builtin_ptrs);
 
         let mut pq0 = DeviceBuffer::<u32>::alloc(eval_size);

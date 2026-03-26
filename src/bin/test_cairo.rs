@@ -7,7 +7,7 @@
 use vortexstark::cairo_air::{
     decode::Instruction,
     vm::Memory,
-    trace::{N_COLS, N_CONSTRAINTS, COL_PC, COL_INST_LO, COL_DST_ADDR, COL_DST,
+    trace::{N_VM_COLS, N_CONSTRAINTS, COL_PC, COL_INST_LO, COL_DST_ADDR, COL_DST,
             COL_OP0_ADDR, COL_OP0, COL_OP1_ADDR, COL_OP1},
     pedersen::{PedersenBuiltin, gpu_init, N_LIMBS},
     builtins::gpu_pedersen_builtin_trace,
@@ -116,7 +116,7 @@ fn main() {
         // Pedersen invocations: skip at log_n>=27 to fit in VRAM.
         let n_ped = if log_n >= 27 { 0 } else { (n / 256).max(1024) };
         let ped_log_n = (n_ped as f64).log2().ceil() as u32;
-        let total_cols = N_COLS + 3 * N_LIMBS; // 27 VM + 27 Pedersen = 54
+        let total_cols = N_VM_COLS + 3 * N_LIMBS; // 31 VM + 27 Pedersen = 58
 
         print!("log_n={log_n} ({n} steps, {total_cols}+4 cols, {N_CONSTRAINTS} constraints + LogUp + {n_ped} Pedersen)... ");
 
@@ -172,14 +172,14 @@ fn main() {
         // VRAM per column: trace(n×4) + eval(2n×4) + twiddles(~2GB) ≈ 3n×4 + 2GB.
         // At log_n=28: 3×1GB + 2GB = 5GB per column. Fits easily.
         let mut d_eval_cols: Vec<DeviceBuffer<u32>> = Vec::with_capacity(8);
-        let mut col_roots: Vec<[u32; 8]> = Vec::with_capacity(N_COLS);
+        let mut col_roots: Vec<[u32; 8]> = Vec::with_capacity(N_VM_COLS);
 
         // At large log_n, only process LogUp columns to save CPU+GPU memory.
         // Other columns are committed but not retained.
         let cols_to_process: Vec<usize> = if log_n >= 28 {
             logup_cols.iter().copied().collect()
         } else {
-            (0..N_COLS).collect()
+            (0..N_VM_COLS).collect()
         };
 
         for &c in &cols_to_process {
