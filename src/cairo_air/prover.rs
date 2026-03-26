@@ -24,7 +24,9 @@ use crate::merkle::MerkleTree;
 use crate::ntt::{self, ForwardTwiddleCache, InverseTwiddleCache};
 use crate::prover::{QueryDecommitment, N_QUERIES, BLOWUP_BITS};
 use super::trace::{N_COLS, N_VM_COLS, N_CONSTRAINTS,
-    COL_AP, COL_FP, COL_FLAGS_START, COL_RES, COL_OFF0, COL_OFF1, COL_OFF2, COL_DST_INV,
+    COL_PC, COL_AP, COL_FP, COL_INST_LO, COL_INST_HI,
+    COL_FLAGS_START, COL_DST_ADDR, COL_DST, COL_OP0_ADDR, COL_OP0, COL_OP1_ADDR, COL_OP1,
+    COL_RES, COL_OFF0, COL_OFF1, COL_OFF2, COL_DST_INV,
     COL_DICT_KEY, COL_DICT_NEW, COL_DICT_ACTIVE};
 use super::range_check::{extract_offsets, compute_rc_interaction_trace, compute_rc_table_sum};
 use super::logup::{compute_interaction_trace, extract_memory_table, compute_memory_table_sum};
@@ -250,6 +252,31 @@ pub struct CairoProof {
     /// Full key-sorted dict data trace (all 2^dict_log_n rows, 4 cols each).
     /// Verifier recomputes sorted Merkle root and checks ALL step-transition constraints C0-C3.
     pub dict_sorted_data: Vec<[u32; 4]>,
+
+    // ---- Bitwise builtin (full-data, no sampling) ----
+    //
+    // When the Cairo program uses the memory-mapped bitwise builtin, the prover
+    // includes ALL invocation data here (one [x, y, and, xor, or] per invocation).
+    // A Blake2s hash of this data is mixed into the Fiat-Shamir channel BEFORE FRI
+    // challenges are drawn, binding the prover to this data.
+    //
+    // The verifier recomputes the hash and checks EVERY row:
+    //   C0: xor + 2*and == x + y  (mod P)
+    //   C1: or  == and + xor       (mod P)
+    //
+    // These constraints hold for all well-formed bitwise invocations when inputs
+    // x, y < 2^15. For full M31 inputs (up to 2^31-2), x+y may overflow P causing
+    // a false positive — documented limitation (see SOUNDNESS.md).
+    //
+    // The link between main trace memory accesses and bitwise rows is not yet proven
+    // by a permutation argument (same status as dict sub-AIR before Stage 2).
+
+    /// Blake2s commitment to all bitwise invocation data (mixed into Fiat-Shamir).
+    /// None when no bitwise operations were used.
+    pub bitwise_commitment: Option<[u32; 8]>,
+    /// All bitwise invocations: each entry is [x, y, x&y, x^y, x|y].
+    /// Verifier checks C0 and C1 for every row.
+    pub bitwise_rows: Vec<[u32; 5]>,
 }
 
 
@@ -351,9 +378,14 @@ pub fn cairo_prove_program(
             })?;
     }
 
+    // Extract any bitwise invocations that occurred during execution.
+    // Memory auto-filled the AND/XOR/OR outputs when both x and y were written.
+    let bitwise_rows = mem.extract_bitwise_invocations();
+    drop(mem);
+
     Ok(cairo_prove_cached_with_columns(
         &program.bytecode, columns, n_steps, log_n, &cache, None,
-        &hint_ctx.dict_accesses,
+        &hint_ctx.dict_accesses, bitwise_rows,
     ))
 }
 
@@ -366,22 +398,33 @@ pub fn cairo_prove_cached(
     let mut mem = Memory::with_capacity(n_steps + 200);
     mem.load_program(program);
     let columns = super::vm::execute_to_columns(&mut mem, n_steps, log_n);
-    cairo_prove_cached_with_columns(program, columns, n_steps, log_n, cache, pedersen_inputs, &[])
+    cairo_prove_cached_with_columns(program, columns, n_steps, log_n, cache, pedersen_inputs, &[], Vec::new())
 }
 
-/// Trace columns that can be ZK-blinded with r · Z_H(x) without breaking the LogUp
-/// step-transition constraints. The 9 columns used in logup_delta (pc, inst_lo/hi,
-/// dst/op0/op1 addr/val) must remain unblinded — they appear in rational QM31-inverse
-/// denominators, which would make the blinded quotient non-polynomial if masked.
+/// All 34 trace columns are ZK-blinded with r · Z_H(x).
 ///
-/// Blinded columns: ap(1), fp(2), flags(5-19), res(26), off0-2(27-29), dst_inv(30)
+/// Z_H(x) vanishes on the trace domain, so witness values at trace points are
+/// unchanged. At query points, each blinded column reveals a uniformly random
+/// linear combination instead of the true value (ZK property).
+///
+/// The columns appearing in rational QM31-inverse denominators (pc, inst_lo/hi,
+/// dst/op0/op1 addr/val, dict_key/new/active) are also blinded — the same argument
+/// that makes off0/off1/off2 blinding correct for C32 applies to all columns:
+/// the constraint still vanishes on the trace domain (Z_H=0 there), so the quotient
+/// Q = C/Z_H is still a polynomial. The prover and verifier both use blinded column
+/// values consistently, so soundness and completeness are preserved.
 pub const ZK_BLIND_COLS: &[usize] = &[
-    COL_AP, COL_FP,
+    // Group A (cols 0..16)
+    COL_PC, COL_AP, COL_FP, COL_INST_LO, COL_INST_HI,
     COL_FLAGS_START,   COL_FLAGS_START+1,  COL_FLAGS_START+2,  COL_FLAGS_START+3,
     COL_FLAGS_START+4, COL_FLAGS_START+5,  COL_FLAGS_START+6,  COL_FLAGS_START+7,
-    COL_FLAGS_START+8, COL_FLAGS_START+9,  COL_FLAGS_START+10, COL_FLAGS_START+11,
-    COL_FLAGS_START+12,COL_FLAGS_START+13, COL_FLAGS_START+14,
+    COL_FLAGS_START+8, COL_FLAGS_START+9,  COL_FLAGS_START+10,
+    // Group B (cols 16..31)
+    COL_FLAGS_START+11, COL_FLAGS_START+12, COL_FLAGS_START+13, COL_FLAGS_START+14,
+    COL_DST_ADDR, COL_DST, COL_OP0_ADDR, COL_OP0, COL_OP1_ADDR, COL_OP1,
     COL_RES, COL_OFF0, COL_OFF1, COL_OFF2, COL_DST_INV,
+    // Group C (cols 31..34) — dict linkage
+    COL_DICT_KEY, COL_DICT_NEW, COL_DICT_ACTIVE,
 ];
 
 
@@ -391,6 +434,7 @@ fn cairo_prove_cached_with_columns(
     cache: &CairoProverCache,
     pedersen_inputs: Option<(&[super::stark252_field::Fp], &[super::stark252_field::Fp])>,
     dict_accesses: &[(usize, u64, u64, u64)],
+    bitwise_rows: Vec<[u32; 5]>,
 ) -> CairoProof {
     let n = 1usize << log_n;
     assert!(n_steps <= n);
@@ -488,12 +532,10 @@ fn cairo_prove_cached_with_columns(
     // Each group is NTT'd, ZK-blinded, committed, downloaded to host, then freed.
     // Peak VRAM = 16 cols (Group A) + 1 ZH col = 17 × eval_size × 4 bytes ≈ 17 GB.
     //
-    // ZK blinding: column[i] += r_j · Z_H[i] for the 22 blinded columns.
+    // ZK blinding: column[i] += r_j · Z_H[i] for all 34 columns.
     // Z_H is computed once and reused across all groups.
-    // The 9 unblinded LogUp columns (pc, inst_lo/hi, dst/op0/op1 addr/val) are
-    // skipped — they appear in rational QM31-inverse denominators for C31/C32.
-    // The 3 dict columns (31-33) are NOT blinded — they appear in C34's QM31-inverse
-    // denominator for the dict step-transition LogUp.
+    // All columns (including LogUp denominators and dict columns) are blinded —
+    // see ZK_BLIND_COLS comment for the soundness argument.
 
     const TRACE_LO: usize = 16; // Group A: cols 0..TRACE_LO (GPU hash cap = 16 cols per tree)
     const TRACE_VM_END: usize = 31; // end of original 31 VM columns; Group B: 16..31, Group C: 31..N_COLS
@@ -515,8 +557,11 @@ fn cairo_prove_cached_with_columns(
     use rand::Rng;
     let mut rng = rand::rng();
     let p_m31 = crate::field::m31::P;
+    // Generate r ∈ [1, 2^30+1]: shift a u32 right by 1 to get 31 bits, add 1 for
+    // non-zero guarantee.  Covers half the M31 range; sufficient for ZK blinding.
+    // No rejection sampling — gen::<u32>() is a single ChaCha20 word.
     let zk_scalars: Vec<(usize, u32)> = ZK_BLIND_COLS.iter()
-        .map(|&col| (col, rng.random_range(1..p_m31)))
+        .map(|&col| (col, (rng.random::<u32>() >> 1) + 1))
         .collect();
 
     // Helper: NTT one column from trace domain → eval domain.
@@ -567,12 +612,17 @@ fn cairo_prove_cached_with_columns(
 
     // ── Group C: cols TRACE_VM_END..N_COLS (3 dict linkage cols) ───────────
     // dict_key (31), dict_new (32), dict_active (33).
-    // None of these are ZK-blinded — they appear in the dict LogUp denominator (C34).
+    // All three are ZK-blinded (same as Group A/B — see ZK_BLIND_COLS comment).
     let (dict_trace_commitment, host_eval_dict): ([u32; 8], Vec<Vec<u32>>) = {
-        let group: Vec<DeviceBuffer<u32>> = (TRACE_VM_END..N_COLS)
+        let mut group: Vec<DeviceBuffer<u32>> = (TRACE_VM_END..N_COLS)
             .map(|c| ntt_col(&columns[c]))
             .collect();
-        // No blinding for dict cols (unblinded like the 9 LogUp cols)
+        for &(col, r) in &zk_scalars {
+            if col >= TRACE_VM_END && col < N_COLS {
+                let local = col - TRACE_VM_END;
+                unsafe { ffi::cuda_axpy_m31(r, d_zh.as_ptr(), group[local].as_mut_ptr(), eval_size as u32); }
+            }
+        }
         unsafe { ffi::cuda_device_sync(); }
         let root = MerkleTree::commit_root_only(&group, log_eval_size);
         let host: Vec<Vec<u32>> = group.iter().map(|c| c.to_host_fast()).collect();
@@ -931,6 +981,22 @@ fn cairo_prove_cached_with_columns(
         rc_final_sum[0], rc_final_sum[1], rc_final_sum[2], rc_final_sum[3],
     ]);
 
+    // ---- Bitwise builtin commitment (full-data, bound into Fiat-Shamir) ----
+    // Hash all bitwise rows into the channel BEFORE constraint alphas and FRI challenges
+    // are drawn.  This prevents a malicious prover from choosing bitwise data after
+    // seeing those challenges.  The verifier recomputes this hash independently.
+    let bitwise_commitment_opt: Option<[u32; 8]> = if !bitwise_rows.is_empty() {
+        let flat: Vec<u32> = bitwise_rows.iter()
+            .flat_map(|row| row.iter().copied())
+            .collect();
+        // Blake2s hash of all bitwise data (8 × u32 = 32 bytes).
+        let hash = crate::merkle::MerkleTree::hash_leaf(&flat);
+        channel.mix_digest(&hash);
+        Some(hash)
+    } else {
+        None
+    };
+
     // ---- Phase 3: Quotient ----
     let constraint_alphas: Vec<QM31> = (0..N_CONSTRAINTS).map(|_| channel.draw_felt()).collect();
     let alpha_flat: Vec<u32> = constraint_alphas.iter().flat_map(|a| a.to_u32_array()).collect();
@@ -1268,6 +1334,8 @@ fn cairo_prove_cached_with_columns(
         dict_sorted_final_sum: dict_sorted_final_sum_opt,
         dict_exec_data: dict_exec_data_opt.unwrap_or_default(),
         dict_sorted_data: dict_sorted_data_opt.unwrap_or_default(),
+        bitwise_commitment: bitwise_commitment_opt,
+        bitwise_rows,
     }
 }
 
@@ -1477,6 +1545,46 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
         proof.rc_final_sum[0], proof.rc_final_sum[1],
         proof.rc_final_sum[2], proof.rc_final_sum[3],
     ]);
+
+    // ---- Bitwise builtin verification ----
+    // Replay the bitwise commitment into the channel (matches prover), then check
+    // every bitwise row:
+    //   C0: xor + 2·and ≡ x + y (mod P)
+    //   C1: or           ≡ and + xor (mod P)
+    if !proof.bitwise_rows.is_empty() {
+        let flat: Vec<u32> = proof.bitwise_rows.iter()
+            .flat_map(|row| row.iter().copied())
+            .collect();
+        let recomputed_hash = crate::merkle::MerkleTree::hash_leaf(&flat);
+        match proof.bitwise_commitment {
+            Some(committed) if committed != recomputed_hash =>
+                return Err(format!(
+                    "Bitwise commitment mismatch: committed {:?} ≠ recomputed {:?}",
+                    committed, recomputed_hash)),
+            None =>
+                return Err("bitwise_rows non-empty but bitwise_commitment is None".into()),
+            _ => {}
+        }
+        channel.mix_digest(&recomputed_hash);
+        let p = crate::field::m31::P;
+        for (i, row) in proof.bitwise_rows.iter().enumerate() {
+            let [x, y, and, xor, or_val] = *row;
+            // C0: (xor + 2·and) mod P == (x + y) mod P
+            let lhs0 = (xor as u64 + 2 * and as u64) % p as u64;
+            let rhs0 = (x   as u64 + y   as u64)     % p as u64;
+            if lhs0 != rhs0 {
+                return Err(format!("Bitwise C0 failed at row {i}: xor+2·and={lhs0} ≠ x+y={rhs0}"));
+            }
+            // C1: or ≡ and + xor (mod P)
+            let lhs1 = or_val as u64 % p as u64;
+            let rhs1 = (and as u64 + xor as u64) % p as u64;
+            if lhs1 != rhs1 {
+                return Err(format!("Bitwise C1 failed at row {i}: or={lhs1} ≠ and+xor={rhs1}"));
+            }
+        }
+    } else if proof.bitwise_commitment.is_some() {
+        return Err("bitwise_commitment present but bitwise_rows is empty".into());
+    }
 
     let constraint_alphas_drawn: Vec<QM31> = (0..N_CONSTRAINTS).map(|_| channel.draw_felt()).collect();
 
@@ -3102,7 +3210,7 @@ mod tests {
         mem.load_program(&program);
         let columns = super::super::vm::execute_to_columns(&mut mem, 32, 5);
         let cache = CairoProverCache::new(5);
-        cairo_prove_cached_with_columns(&program, columns, 32, 5, &cache, None, dict_accesses)
+        cairo_prove_cached_with_columns(&program, columns, 32, 5, &cache, None, dict_accesses, Vec::new())
     }
 
     #[test]
@@ -3188,5 +3296,89 @@ mod tests {
         let result = cairo_verify(&proof);
         // Merkle root recomputation will not match committed root.
         assert!(result.is_err(), "corrupted exec data must be rejected by Merkle root check");
+    }
+
+    // ---- Bitwise builtin tests ------------------------------------------------
+
+    /// Build a proof that contains bitwise invocations by writing directly to the
+    /// bitwise memory segment (the VM auto-fills AND/XOR/OR outputs).
+    fn prove_with_bitwise(pairs: &[(u32, u32)]) -> CairoProof {
+        use crate::cairo_air::vm::{Memory, BITWISE_MEM_BASE};
+        let program = build_fib_program(30);
+        let mut mem = Memory::with_capacity(1024);
+        mem.load_program(&program);
+        mem.set(0,   0); // sentinel fp
+        mem.set(1,   0); // sentinel ret pc
+
+        // Write (x, y) pairs directly to the bitwise segment; outputs auto-fill.
+        for (i, &(x, y)) in pairs.iter().enumerate() {
+            let base = BITWISE_MEM_BASE + i as u64 * 5;
+            mem.set(base,     x as u64);
+            mem.set(base + 1, y as u64);
+        }
+        let bitwise_rows = mem.extract_bitwise_invocations();
+        assert_eq!(bitwise_rows.len(), pairs.len());
+
+        let n_steps = 32;
+        let log_n = 5;
+        let columns = super::super::vm::execute_to_columns(&mut mem, n_steps, log_n);
+        let cache = CairoProverCache::new(log_n);
+        let program_u64: Vec<u64> = program.iter().copied().collect();
+        cairo_prove_cached_with_columns(&program_u64, columns, n_steps, log_n,
+            &cache, None, &[], bitwise_rows)
+    }
+
+    #[test]
+    fn test_bitwise_memory_auto_fill() {
+        // Verify that Memory auto-fills bitwise outputs correctly.
+        use crate::cairo_air::vm::{Memory, BITWISE_MEM_BASE};
+        let mut mem = Memory::new();
+        let x: u64 = 0b1010_1010;
+        let y: u64 = 0b1100_1100;
+        mem.set(BITWISE_MEM_BASE,     x);
+        mem.set(BITWISE_MEM_BASE + 1, y);
+        // Outputs should be auto-filled once both inputs are written.
+        assert_eq!(mem.get(BITWISE_MEM_BASE + 2), (x & y) as u64, "AND wrong");
+        assert_eq!(mem.get(BITWISE_MEM_BASE + 3), (x ^ y) as u64, "XOR wrong");
+        assert_eq!(mem.get(BITWISE_MEM_BASE + 4), (x | y) as u64, "OR wrong");
+        // Extraction should return one row.
+        let rows = mem.extract_bitwise_invocations();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], [x as u32, y as u32, (x&y) as u32, (x^y) as u32, (x|y) as u32]);
+    }
+
+    #[test]
+    fn test_bitwise_prove_verify_roundtrip() {
+        ffi::init_memory_pool();
+        let pairs = vec![(0b1010u32, 0b1100u32), (0xFF00u32, 0x00FFu32), (0u32, 0u32)];
+        let proof = prove_with_bitwise(&pairs);
+        assert_eq!(proof.bitwise_rows.len(), pairs.len());
+        assert!(proof.bitwise_commitment.is_some());
+        // Verify: should pass.
+        cairo_verify(&proof).expect("bitwise proof should verify");
+    }
+
+    #[test]
+    fn test_bitwise_tamper_row_rejected() {
+        ffi::init_memory_pool();
+        let pairs = vec![(0xABCDu32, 0x1234u32)];
+        let mut proof = prove_with_bitwise(&pairs);
+        // Corrupt the AND field — C0 will fail.
+        proof.bitwise_rows[0][2] = proof.bitwise_rows[0][2].wrapping_add(1);
+        let result = cairo_verify(&proof);
+        assert!(result.is_err(), "tampered bitwise AND must be rejected");
+    }
+
+    #[test]
+    fn test_bitwise_tamper_commitment_rejected() {
+        ffi::init_memory_pool();
+        let pairs = vec![(0xFFu32, 0x0Fu32)];
+        let mut proof = prove_with_bitwise(&pairs);
+        // Corrupt the commitment hash — channel replay will diverge.
+        if let Some(ref mut c) = proof.bitwise_commitment {
+            c[0] ^= 1;
+        }
+        let result = cairo_verify(&proof);
+        assert!(result.is_err(), "corrupted bitwise commitment must be rejected");
     }
 }

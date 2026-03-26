@@ -195,6 +195,86 @@ pub fn vm_pedersen_invoke(
     output
 }
 
+/// Bitwise builtin.
+///
+/// Memory layout per invocation (5 cells):
+///   base + inv*5 + 0: x
+///   base + inv*5 + 1: y
+///   base + inv*5 + 2: x & y  (AND)
+///   base + inv*5 + 3: x ^ y  (XOR)
+///   base + inv*5 + 4: x | y  (OR)
+///
+/// Algebraic constraints (2 per row, evaluated as M31 elements):
+///   C0: xor + 2*and - x - y = 0   (follows from bit-level identity)
+///   C1: or - and - xor = 0         (OR = AND + XOR, bitwise)
+///
+/// **Limitation:** These constraints hold as *integer* equalities and therefore
+/// hold mod P for inputs x, y < 2^15. For inputs in the full M31 range (up to
+/// 2^31-2), x+y may wrap around mod P, making the constraints satisfiable by
+/// incorrect and/xor/or values. Full soundness requires bit-decomposition into
+/// 16-bit chunks, which is not implemented here.
+pub struct BitwiseBuiltin {
+    /// Recorded (x, y) pairs in invocation order.
+    pub inputs: Vec<(u32, u32)>,
+    /// Computed (and, xor, or) results.
+    pub outputs: Vec<(u32, u32, u32)>,
+}
+
+/// Memory-mapped base address for the Bitwise builtin.
+pub const BITWISE_BUILTIN_BASE: u64 = 0x6000_0000;
+
+impl BitwiseBuiltin {
+    pub fn new() -> Self {
+        Self { inputs: Vec::new(), outputs: Vec::new() }
+    }
+
+    /// Register one bitwise operation and return (and, xor, or).
+    pub fn invoke(&mut self, x: u32, y: u32) -> (u32, u32, u32) {
+        let and = x & y;
+        let xor = x ^ y;
+        let or  = x | y;
+        self.inputs.push((x, y));
+        self.outputs.push((and, xor, or));
+        (and, xor, or)
+    }
+
+    pub fn n_invocations(&self) -> usize { self.inputs.len() }
+
+    /// Generate 5 trace columns (x, y, and, xor, or), padded to `n = 1<<log_n`.
+    pub fn generate_trace(&self, log_n: u32) -> Vec<Vec<u32>> {
+        let n = 1usize << log_n;
+        assert!(self.inputs.len() <= n, "bitwise trace too large for log_n={log_n}");
+        let mut cols: Vec<Vec<u32>> = (0..5).map(|_| vec![0u32; n]).collect();
+        for (i, ((x, y), (and, xor, or))) in self.inputs.iter().zip(&self.outputs).enumerate() {
+            cols[0][i] = *x;
+            cols[1][i] = *y;
+            cols[2][i] = *and;
+            cols[3][i] = *xor;
+            cols[4][i] = *or;
+        }
+        cols
+    }
+}
+
+/// Invoke the Bitwise builtin from the Cairo VM.
+/// Reads x and y from the builtin memory segment, computes AND/XOR/OR,
+/// and writes results back to memory.
+pub fn vm_bitwise_invoke(
+    memory: &mut super::vm::Memory,
+    builtin: &mut BitwiseBuiltin,
+    invocation_index: usize,
+) -> (u32, u32, u32) {
+    let stride = 5u64;
+    let base = BITWISE_BUILTIN_BASE + invocation_index as u64 * stride;
+    let x = memory.get(base) as u32;
+    let y = memory.get(base + 1) as u32;
+    let (and, xor, or) = builtin.invoke(x, y);
+    memory.set(base + 2, and as u64);
+    memory.set(base + 3, xor as u64);
+    memory.set(base + 4, or as u64);
+    (and, xor, or)
+}
+
 /// Generate Pedersen builtin trace columns on GPU.
 /// Uses stored Fp inputs from invoke() — fused hash + trace on GPU.
 /// Results never leave the GPU. Returns DeviceBuffers ready for NTT.
@@ -271,6 +351,50 @@ mod tests {
         for j in 0..STATE_WIDTH {
             assert_eq!(entries[STATE_WIDTH + j].1, output[j]);
         }
+    }
+
+    #[test]
+    fn test_bitwise_builtin_basic() {
+        let mut builtin = BitwiseBuiltin::new();
+        let x: u32 = 0b1010_1010;
+        let y: u32 = 0b1100_1100;
+        let (and, xor, or) = builtin.invoke(x, y);
+        assert_eq!(and, x & y);
+        assert_eq!(xor, x ^ y);
+        assert_eq!(or,  x | y);
+        // Check algebraic constraints hold
+        assert_eq!(xor.wrapping_add(2 * and), x.wrapping_add(y));
+        assert_eq!(or, and + xor);
+    }
+
+    #[test]
+    fn test_bitwise_builtin_trace() {
+        let mut builtin = BitwiseBuiltin::new();
+        builtin.invoke(0xFF, 0x0F);
+        builtin.invoke(0xAA, 0x55);
+        let cols = builtin.generate_trace(2); // n=4
+        assert_eq!(cols.len(), 5);
+        assert_eq!(cols[0][0], 0xFF);
+        assert_eq!(cols[1][0], 0x0F);
+        assert_eq!(cols[2][0], 0xFF & 0x0F);
+        assert_eq!(cols[3][0], 0xFF ^ 0x0F);
+        assert_eq!(cols[4][0], 0xFF | 0x0F);
+        assert_eq!(cols[0][2], 0, "padding row should be zero");
+    }
+
+    #[test]
+    fn test_vm_bitwise_invoke() {
+        let mut mem = super::super::vm::Memory::with_capacity(0x1000_0000);
+        let mut builtin = BitwiseBuiltin::new();
+        let x: u64 = 0b1111_0000;
+        let y: u64 = 0b1010_1010;
+        let base = BITWISE_BUILTIN_BASE;
+        mem.set(base, x);
+        mem.set(base + 1, y);
+        let (and, xor, or) = vm_bitwise_invoke(&mut mem, &mut builtin, 0);
+        assert_eq!(mem.get(base + 2), and as u64);
+        assert_eq!(mem.get(base + 3), xor as u64);
+        assert_eq!(mem.get(base + 4), or as u64);
     }
 
     #[test]

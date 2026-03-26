@@ -39,31 +39,85 @@ pub struct TraceRow {
     pub next_fp: u64,
 }
 
-/// Memory: flat array for O(1) access (no HashMap overhead).
-/// Pre-allocates to cover program + execution stack.
+/// Base address of the Bitwise builtin memory segment.
+/// Cairo programs write (x, y) to [base + inv*5 + 0..1]; the builtin auto-fills
+/// (x&y, x^y, x|y) to [base + inv*5 + 2..4] when both x and y are present.
+pub const BITWISE_MEM_BASE: u64 = super::builtins::BITWISE_BUILTIN_BASE;
+/// Max bitwise invocations supported in a single execution (64 Ki).
+pub const BITWISE_MAX_INV: usize = 65536;
+const BITWISE_PAGE_LEN: usize = BITWISE_MAX_INV * 5;
+
+/// Memory: flat array for O(1) access on the main address space, plus a
+/// dedicated page for the bitwise builtin segment (which lives at 0x6000_0000,
+/// too far to extend the main Vec without a multi-GB allocation).
+///
+/// The bitwise page auto-fills cells 2–4 (AND, XOR, OR) when both cells 0 (x)
+/// and 1 (y) of the same invocation have been written.
 #[derive(Clone)]
 pub struct Memory {
     data: Vec<u64>,
+    /// Dedicated storage for BITWISE_MAX_INV × 5 cells (lazily allocated).
+    bitwise: Vec<u64>,
+    /// Per-invocation write flags: bit 0 = x written, bit 1 = y written.
+    bitwise_flags: Vec<u8>,
 }
 
 impl Memory {
     pub fn new() -> Self {
-        Self { data: Vec::new() }
+        Self { data: Vec::new(), bitwise: Vec::new(), bitwise_flags: Vec::new() }
     }
 
     /// Create memory with pre-allocated capacity.
     pub fn with_capacity(size: usize) -> Self {
-        Self { data: vec![0u64; size] }
+        Self { data: vec![0u64; size], bitwise: Vec::new(), bitwise_flags: Vec::new() }
+    }
+
+    /// Allocate bitwise page on first use.
+    #[inline(never)]
+    fn ensure_bitwise(&mut self) {
+        if self.bitwise.is_empty() {
+            self.bitwise      = vec![0u64; BITWISE_PAGE_LEN];
+            self.bitwise_flags = vec![0u8;  BITWISE_MAX_INV];
+        }
     }
 
     #[inline(always)]
     pub fn get(&self, addr: u64) -> u64 {
+        if addr >= BITWISE_MEM_BASE {
+            let offset = (addr - BITWISE_MEM_BASE) as usize;
+            if offset < BITWISE_PAGE_LEN && !self.bitwise.is_empty() {
+                return self.bitwise[offset];
+            }
+            return 0;
+        }
         let idx = addr as usize;
         if idx < self.data.len() { self.data[idx] } else { 0 }
     }
 
     #[inline(always)]
     pub fn set(&mut self, addr: u64, val: u64) {
+        if addr >= BITWISE_MEM_BASE {
+            let offset = (addr - BITWISE_MEM_BASE) as usize;
+            if offset < BITWISE_PAGE_LEN {
+                self.ensure_bitwise();
+                self.bitwise[offset] = val;
+                let inv  = offset / 5;
+                let cell = offset % 5;
+                if cell < 2 {
+                    self.bitwise_flags[inv] |= 1 << cell;
+                    // Auto-fill outputs as soon as both inputs are written.
+                    if self.bitwise_flags[inv] == 0x03 {
+                        let b = inv * 5;
+                        let x = self.bitwise[b]     as u32;
+                        let y = self.bitwise[b + 1] as u32;
+                        self.bitwise[b + 2] = (x & y) as u64;
+                        self.bitwise[b + 3] = (x ^ y) as u64;
+                        self.bitwise[b + 4] = (x | y) as u64;
+                    }
+                }
+            }
+            return;
+        }
         let idx = addr as usize;
         if idx >= self.data.len() {
             self.data.resize(idx + 1, 0);
@@ -77,6 +131,30 @@ impl Memory {
             self.data.resize(program.len(), 0);
         }
         self.data[..program.len()].copy_from_slice(program);
+    }
+
+    /// Extract all completed bitwise invocations from the bitwise segment.
+    /// Returns one `[x, y, and, xor, or]` entry per invocation where both x and y
+    /// were written (indicated by flags == 0x03). Invocations are returned in the
+    /// order they were allocated (sequential inv index 0, 1, 2, …).
+    pub fn extract_bitwise_invocations(&self) -> Vec<[u32; 5]> {
+        if self.bitwise.is_empty() {
+            return Vec::new();
+        }
+        (0..BITWISE_MAX_INV)
+            .take_while(|&inv| self.bitwise_flags[inv] != 0)
+            .filter(|&inv| self.bitwise_flags[inv] == 0x03)
+            .map(|inv| {
+                let b = inv * 5;
+                [
+                    self.bitwise[b]     as u32,
+                    self.bitwise[b + 1] as u32,
+                    self.bitwise[b + 2] as u32,
+                    self.bitwise[b + 3] as u32,
+                    self.bitwise[b + 4] as u32,
+                ]
+            })
+            .collect()
     }
 }
 

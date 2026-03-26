@@ -87,7 +87,12 @@ pub fn build_dict_raw_traces(
     let mut sorted_key      = vec![0u32; dict_n];
     let mut sorted_prev_col = vec![0u32; dict_n];
     let mut sorted_new_col  = vec![0u32; dict_n];
-    // Padding rows start with is_first = 1 (each padding row is a "new group" with key 0)
+    // Padding rows beyond the real accesses use is_first=1.  This is safe: the verifier
+    // checks ALL sorted step-transition constraints (C0-C3) for every pair (i, i+1).
+    // For padding rows with is_first=1:
+    //   C2: is_first[i+1] * prev[i+1] = 1 * 0 = 0  ✓ (prev=0 for any first-access row)
+    //   C1: (1-is_first[i+1]) * (key[i+1]-key[i]) = 0 * ... = 0  ✓ trivially
+    // So padding with is_first=1 cannot be exploited to forge dict accesses.
     let mut sorted_is_first = vec![1u32; dict_n];
 
     for (i, &(k, p, nv)) in sorted.iter().enumerate() {

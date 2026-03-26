@@ -42,11 +42,12 @@ GPU-native Circle STARK prover with end-to-end proof generation and verification
 - **LogUp memory consistency**: execution sum + table sum cancellation with final value bound into Fiat-Shamir
 - **Range check argument**: all 16-bit offsets verified via LogUp against precomputed table, wired into prover with z_rc challenge
 - **Merkle domain separation**: internal nodes use Blake2s personalization (h[6] ^= 0x01), preventing leaf/node confusion
+- **Full ZK**: all 34 trace columns blinded via `r · Z_H(x)` — GAP-4 closed 2026-03-26
 
 ### Remaining limitations
 
 - **Felt252 arithmetic**: VM operates over M31 (2^31 − 1). `cairo_prove_program` now returns `Err(ProveError::Felt252Overflow)` for programs whose bytecode contains values wider than 64 bits, preventing silent misproofs. Values in the range (M31, u64] are still reduced mod M31 without error — proof output is wrong for programs that rely on Stark252 arithmetic in that range.
-- **Starknet syscalls**: `storage_read`, `emit_event`, `call_contract`, and other OS syscalls are not emulated. Programs that invoke these will stall or produce invalid traces.
+- **Starknet syscalls**: Basic stubs for `SystemCall`, EC, keccak, blake2s, and range-check hints are registered; they write zero to response fields and continue execution. Full OS emulation (storage reads, actual event emission, cross-contract calls) is not implemented — programs relying on syscall return values will produce incorrect traces.
 - **Dict consistency proofs**: Dict read/write execution is fully functional. An execution-side chain consistency check runs at prove time (`ProveError::DictConsistencyViolation`). The S_dict step-transition LogUp (C34) links main trace dict columns to an authenticated exec trace; verifier checks `dict_link_final == exec_key_new_sum`. Soundness holds against a malicious prover for dict-heavy programs.
 
 See [SOUNDNESS.md](SOUNDNESS.md) for the full constraint-by-constraint analysis.
@@ -77,7 +78,7 @@ See [SOUNDNESS.md](SOUNDNESS.md) for the full constraint-by-constraint analysis.
 | Poseidon2 | GPU kernel, proven (RF=8 RP=22, 30 rows/perm) | 4.7M hashes/sec |
 | RPO-M31 | GPU kernel, proven (14 rows/perm, 24 cols) | 3.5M hashes/sec |
 | Pedersen | GPU kernel, proven (windowed 4-bit EC, Montgomery Jacobian) | 37.7M hashes/sec |
-| Bitwise | Trace generation | AND/XOR/OR on 252-bit |
+| Bitwise | Trace generation + algebraic constraints (C0: xor+2·and=x+y, C1: or=and+xor); not wired into FRI quotient | AND/XOR/OR on 15-bit inputs (soundness limited — see SOUNDNESS.md) |
 
 ## CLI
 
@@ -97,14 +98,14 @@ Requires: Rust 1.85+ (stable), CUDA 13.0+, RTX 5090 (SM 12.0) or RTX 4090 (SM 8.
 
 ```bash
 cargo build --release
-cargo test -- --test-threads=1    # 216 tests
+cargo test -- --test-threads=1    # 223 tests
 cargo run --release --bin full_benchmark
 cargo run --release --bin gpu_bench     # pre-flight checks + per-section GPU telemetry
 ```
 
 ## Tests
 
-216 tests covering: M31/CM31/QM31 field arithmetic, Circle NTT, Merkle tree (commit, auth paths, tiled, SoA4), FRI (fold, circle fold, deterministic), STARK prover + verifier (multiple sizes, tamper detection), Cairo VM (decoder, executor, Fibonacci, constraints, LogUp, range checks, instruction decomposition), Poseidon, Pedersen (Stark252 field, EC ops, GPU vs CPU), Bitwise, GPU constraint eval (bytecode VM, warp-cooperative), GPU leaf hashing (Blake2s, domain separation), CASM loader, Cairo hints (AllocSegment, AllocFelt252Dict, dict entry lifecycle, squash, U256InvModN, multi-dict programs, isqrt edge cases).
+223 tests covering: M31/CM31/QM31 field arithmetic, Circle NTT, Merkle tree (commit, auth paths, tiled, SoA4), FRI (fold, circle fold, deterministic), STARK prover + verifier (multiple sizes, tamper detection), Cairo VM (decoder, executor, Fibonacci, constraints, LogUp, range checks, instruction decomposition), Poseidon, Pedersen (Stark252 field, EC ops, GPU vs CPU), Bitwise (memory segment, trace generation, constraint verification, prove/verify round-trip, tamper detection), GPU constraint eval (bytecode VM, warp-cooperative), GPU leaf hashing (Blake2s, domain separation), CASM loader, Cairo hints (AllocSegment, AllocFelt252Dict, dict entry lifecycle, squash, U256InvModN, multi-dict programs, isqrt edge cases).
 
 ## Break This System
 

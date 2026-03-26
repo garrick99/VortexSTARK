@@ -342,24 +342,56 @@ fn cmd_verify(path: &str) {
 
     eprintln!("Loaded proof: {} bytes ({:.1} KB)", bytes.len(), bytes.len() as f64 / 1024.0);
 
+    assert!(bytes.len() >= 4, "proof file too small");
+    let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+
     ffi::init_memory_pool();
 
-    let proof = deserialize_proof(&bytes);
-    let n: u64 = 1u64 << proof.log_trace_size;
-    eprintln!("  log_n={}, n={n}, public_inputs=({}, {})",
-        proof.log_trace_size, proof.public_inputs.0.0, proof.public_inputs.1.0);
-    eprintln!("  {} FRI layers, {} queries", proof.fri_commitments.len(), proof.query_indices.len());
+    if magic == MAGIC {
+        // Fibonacci STARK proof
+        let proof = deserialize_proof(&bytes);
+        let n: u64 = 1u64 << proof.log_trace_size;
+        eprintln!("  Fibonacci STARK: log_n={}, n={n}, public_inputs=({}, {})",
+            proof.log_trace_size, proof.public_inputs.0.0, proof.public_inputs.1.0);
+        eprintln!("  {} FRI layers, {} queries", proof.fri_commitments.len(), proof.query_indices.len());
 
-    let t0 = Instant::now();
-    match verifier::verify(&proof) {
-        Ok(()) => {
-            let ms = t0.elapsed().as_secs_f64() * 1000.0;
-            eprintln!("VERIFIED OK ({ms:.1}ms)");
+        let t0 = Instant::now();
+        match verifier::verify(&proof) {
+            Ok(()) => {
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                eprintln!("VERIFIED OK ({ms:.1}ms)");
+            }
+            Err(e) => {
+                eprintln!("VERIFICATION FAILED: {e}");
+                std::process::exit(1);
+            }
         }
-        Err(e) => {
-            eprintln!("VERIFICATION FAILED: {e}");
-            std::process::exit(1);
+    } else if magic == CAIRO_MAGIC {
+        // Cairo VM STARK proof
+        let proof = deserialize_cairo_proof(&bytes);
+        let n: u64 = 1u64 << proof.log_trace_size;
+        eprintln!("  Cairo STARK: log_n={}, n={n}, n_steps={}",
+            proof.log_trace_size, proof.public_inputs.n_steps);
+        eprintln!("  program_hash: {:08x}{:08x}...",
+            proof.public_inputs.program_hash[0], proof.public_inputs.program_hash[1]);
+        eprintln!("  {} FRI layers, {} queries",
+            proof.fri_commitments.len(), proof.query_indices.len());
+
+        let t0 = Instant::now();
+        match vortexstark::cairo_air::prover::cairo_verify(&proof) {
+            Ok(()) => {
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                eprintln!("VERIFIED OK ({ms:.1}ms)");
+            }
+            Err(e) => {
+                eprintln!("VERIFICATION FAILED: {e}");
+                std::process::exit(1);
+            }
         }
+    } else {
+        eprintln!("ERROR: unknown proof format (magic={magic:#010x})");
+        eprintln!("  Expected Fibonacci (0x{MAGIC:08x}) or Cairo (0x{CAIRO_MAGIC:08x})");
+        std::process::exit(1);
     }
 }
 
@@ -467,7 +499,7 @@ fn serialize_proof(proof: &StarkProof) -> Vec<u8> {
     w
 }
 
-// --- Cairo proof serialization (minimal) ---
+// --- Cairo proof serialization (complete, serde_json) ---
 
 const CAIRO_MAGIC: u32 = 0x4341_4952; // "CAIR"
 const CAIRO_VERSION: u32 = 1;
@@ -476,32 +508,18 @@ fn serialize_cairo_proof(proof: &vortexstark::cairo_air::prover::CairoProof) -> 
     let mut w = Vec::new();
     write_u32(&mut w, CAIRO_MAGIC);
     write_u32(&mut w, CAIRO_VERSION);
-    write_u32(&mut w, proof.log_trace_size);
-    write_u32(&mut w, proof.public_inputs.initial_pc);
-    write_u32(&mut w, proof.public_inputs.initial_ap);
-    write_u32(&mut w, proof.public_inputs.n_steps as u32);
-    write_u32_slice(&mut w, &proof.public_inputs.program_hash);
-    write_u32_slice(&mut w, &proof.trace_commitment);
-    write_u32_slice(&mut w, &proof.interaction_commitment);
-    write_u32_slice(&mut w, &proof.quotient_commitment);
-
-    write_u32(&mut w, proof.fri_commitments.len() as u32);
-    for c in &proof.fri_commitments { write_u32_slice(&mut w, c); }
-
-    write_u32(&mut w, proof.fri_last_layer.len() as u32);
-    for v in &proof.fri_last_layer {
-        write_u32_slice(&mut w, &v.to_u32_array());
-    }
-
-    write_u32(&mut w, proof.query_indices.len() as u32);
-    for &qi in &proof.query_indices { write_u32(&mut w, qi as u32); }
-
-    write_decommitment_4(&mut w, &proof.quotient_decommitment);
-
-    write_u32(&mut w, proof.fri_decommitments.len() as u32);
-    for d in &proof.fri_decommitments { write_decommitment_4(&mut w, d); }
-
+    let json = serde_json::to_vec(proof).expect("Cairo proof serialization failed");
+    w.extend_from_slice(&json);
     w
+}
+
+fn deserialize_cairo_proof(data: &[u8]) -> vortexstark::cairo_air::prover::CairoProof {
+    assert!(data.len() >= 8, "proof file too small");
+    let magic = u32::from_le_bytes(data[0..4].try_into().unwrap());
+    let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    assert_eq!(magic, CAIRO_MAGIC, "not a Cairo proof file (magic={magic:#010x})");
+    assert_eq!(version, CAIRO_VERSION, "unsupported Cairo proof version {version}");
+    serde_json::from_slice(&data[8..]).expect("Cairo proof deserialization failed")
 }
 
 // --- Fibonacci proof deserialization ---
