@@ -118,7 +118,7 @@ pub fn execute_to_columns(memory: &mut Memory, n_steps: usize, log_n: u32) -> Ve
         memory.data.resize(estimated_mem, 0);
     }
 
-    let mut cols: Vec<Vec<u32>> = (0..N_COLS).map(|_| vec![0u32; n]).collect();
+    let mut cols: Vec<Vec<u32>> = (0..N_VM_COLS).map(|_| vec![0u32; n]).collect();
     let mut state = CairoState { pc: 0, ap: 100, fp: 100 };
 
     #[inline(always)]
@@ -305,6 +305,153 @@ pub fn execute_to_columns(memory: &mut Memory, n_steps: usize, log_n: u32) -> Ve
     cols
 }
 
+/// Execute with hint support and write directly to columnar trace format.
+/// Same as `execute_to_columns` but runs hints before each instruction.
+///
+/// `initial_pc` — the program counter to start execution at (use `entry_point` from CasmProgram).
+/// `initial_ap` — the initial value for both AP and FP; the caller is responsible for setting
+///               up the Cairo calling convention in memory before this call:
+///               `memory[initial_ap - 2] = 0` (saved fp sentinel),
+///               `memory[initial_ap - 1] = 0` (return pc sentinel).
+pub fn execute_to_columns_with_hints(
+    memory: &mut Memory,
+    n_steps: usize,
+    log_n: u32,
+    hints: &[(usize, Vec<super::casm_loader::CasmHint>)],
+    initial_pc: u64,
+    initial_ap: u64,
+    hint_ctx: &mut super::hints::HintContext,
+) -> Vec<Vec<u32>> {
+    use crate::field::m31::P;
+    use super::trace::*;
+
+    let n = 1usize << log_n;
+    assert!(n_steps <= n);
+
+    let min_mem = initial_ap as usize + n_steps + 1000;
+    if memory.data.len() < min_mem {
+        memory.data.resize(min_mem, 0);
+    }
+
+    let mut cols: Vec<Vec<u32>> = (0..N_VM_COLS).map(|_| vec![0u32; n]).collect();
+    let mut state = CairoState { pc: initial_pc, ap: initial_ap, fp: initial_ap };
+
+    #[inline(always)]
+    fn to_m31(v: u64) -> u32 {
+        let lo = (v & 0x7FFF_FFFF) as u64;
+        let hi = v >> 31;
+        let r = lo + hi;
+        let lo2 = (r & 0x7FFF_FFFF) as u32;
+        let hi2 = (r >> 31) as u32;
+        let s = lo2 + hi2;
+        if s >= P { s - P } else { s }
+    }
+
+    for i in 0..n_steps {
+        // Run any hints registered at this PC before executing the instruction.
+        super::hints::run_hints(hints, state.pc, i, &state, memory, hint_ctx);
+
+        let encoded = memory.get(state.pc);
+        let instr = Instruction::decode(encoded);
+
+        let dst_base = if instr.dst_reg == 1 { state.fp } else { state.ap };
+        let dst_addr = dst_base.wrapping_add(instr.off0.wrapping_sub(0x8000) as i16 as i64 as u64);
+        let op0_base = if instr.op0_reg == 1 { state.fp } else { state.ap };
+        let op0_addr = op0_base.wrapping_add(instr.off1.wrapping_sub(0x8000) as i16 as i64 as u64);
+        let op0 = memory.get(op0_addr);
+        // Track data values that exceed M31 — these would be silently truncated, producing wrong proofs.
+        if op0 >= P as u64 { hint_ctx.execution_overflows += 1; }
+
+        let op1_base = if instr.op1_imm == 1 { state.pc }
+            else if instr.op1_fp == 1 { state.fp }
+            else if instr.op1_ap == 1 { state.ap }
+            else { op0 };
+        let op1_addr = op1_base.wrapping_add(instr.off2.wrapping_sub(0x8000) as i16 as i64 as u64);
+        let op1 = memory.get(op1_addr);
+        if op1 >= P as u64 { hint_ctx.execution_overflows += 1; }
+
+        let res = if instr.pc_jnz == 1 { 0 }
+            else if instr.res_add == 1 {
+                let sum = op0 + op1;
+                if sum >= P as u64 { sum - P as u64 } else { sum }
+            }
+            else if instr.res_mul == 1 {
+                let prod = op0 as u128 * op1 as u128;
+                let lo = (prod & P as u128) as u64;
+                let hi = (prod >> 31) as u64;
+                let r = lo + hi;
+                if r >= P as u64 { r - P as u64 } else { r }
+            }
+            else { op1 };
+
+        let dst = if instr.opcode_assert == 1 { memory.set(dst_addr, res); res }
+            else if instr.opcode_call == 1 {
+                memory.set(dst_addr, state.fp);
+                memory.set(dst_addr + 1, state.pc + instr.size());
+                state.fp
+            } else {
+                let v = memory.get(dst_addr);
+                if v >= P as u64 { hint_ctx.execution_overflows += 1; }
+                v
+            };
+
+        let next_pc = if instr.pc_jump_abs == 1 { res }
+            else if instr.pc_jump_rel == 1 { state.pc.wrapping_add(res) }
+            else if instr.pc_jnz == 1 {
+                if dst != 0 { state.pc.wrapping_add(op1) } else { state.pc + instr.size() }
+            } else { state.pc + instr.size() };
+
+        let next_ap = if instr.ap_add == 1 { state.ap.wrapping_add(res) }
+            else if instr.ap_add1 == 1 { state.ap + 1 }
+            else if instr.opcode_call == 1 { state.ap + 2 }
+            else { state.ap };
+
+        let next_fp = if instr.opcode_call == 1 { state.ap + 2 }
+            else if instr.opcode_ret == 1 { dst }
+            else { state.fp };
+
+        cols[COL_PC][i] = to_m31(state.pc);
+        cols[COL_AP][i] = to_m31(state.ap);
+        cols[COL_FP][i] = to_m31(state.fp);
+        cols[COL_INST_LO][i] = (encoded & 0x7FFF_FFFF) as u32;
+        cols[COL_INST_HI][i] = ((encoded >> 31) & 0x7FFF_FFFF) as u32;
+
+        cols[COL_FLAGS_START + 0][i] = instr.dst_reg;
+        cols[COL_FLAGS_START + 1][i] = instr.op0_reg;
+        cols[COL_FLAGS_START + 2][i] = instr.op1_imm;
+        cols[COL_FLAGS_START + 3][i] = instr.op1_fp;
+        cols[COL_FLAGS_START + 4][i] = instr.op1_ap;
+        cols[COL_FLAGS_START + 5][i] = instr.res_add;
+        cols[COL_FLAGS_START + 6][i] = instr.res_mul;
+        cols[COL_FLAGS_START + 7][i] = instr.pc_jump_abs;
+        cols[COL_FLAGS_START + 8][i] = instr.pc_jump_rel;
+        cols[COL_FLAGS_START + 9][i] = instr.pc_jnz;
+        cols[COL_FLAGS_START + 10][i] = instr.ap_add;
+        cols[COL_FLAGS_START + 11][i] = instr.ap_add1;
+        cols[COL_FLAGS_START + 12][i] = instr.opcode_call;
+        cols[COL_FLAGS_START + 13][i] = instr.opcode_ret;
+        cols[COL_FLAGS_START + 14][i] = instr.opcode_assert;
+
+        cols[COL_DST_ADDR][i] = to_m31(dst_addr);
+        cols[COL_DST][i] = to_m31(dst);
+        cols[COL_OP0_ADDR][i] = to_m31(op0_addr);
+        cols[COL_OP0][i] = to_m31(op0);
+        cols[COL_OP1_ADDR][i] = to_m31(op1_addr);
+        cols[COL_OP1][i] = to_m31(op1);
+        cols[COL_RES][i] = to_m31(res);
+
+        cols[COL_OFF0][i] = (encoded & 0xFFFF) as u32;
+        cols[COL_OFF1][i] = ((encoded >> 16) & 0xFFFF) as u32;
+        cols[COL_OFF2][i] = ((encoded >> 32) & 0xFFFF) as u32;
+        let dst_m31 = to_m31(dst);
+        cols[COL_DST_INV][i] = if dst_m31 == 0 { 0 } else { crate::field::M31(dst_m31).inverse().0 };
+
+        state = CairoState { pc: next_pc, ap: next_ap, fp: next_fp };
+    }
+
+    cols
+}
+
 /// Execute and write directly to pre-allocated column buffers.
 /// Accepts mutable slices (can point to pinned host memory or mapped GPU memory).
 /// Same logic as execute_to_columns but avoids Vec allocation.
@@ -316,7 +463,7 @@ pub fn execute_to_columns_into(
     use crate::field::m31::P;
     use super::trace::*;
 
-    assert!(cols.len() >= N_COLS);
+    assert!(cols.len() >= N_VM_COLS);
     let n = cols[0].len();
     assert!(n_steps <= n);
 

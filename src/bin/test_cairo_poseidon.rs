@@ -153,12 +153,14 @@ fn main() {
                 log_eval_size,
                 log_n,
             );
-            // Dummy interaction columns (LogUp/RC step transitions not tested here).
+            // Dummy interaction columns (LogUp/RC/dict step transitions not tested here).
             let d_dummy_interaction = DeviceBuffer::<u32>::alloc(eval_size);
-            let zeros16 = vec![0u32; 16];
-            let d_dummy_challenges = DeviceBuffer::from_host(&zeros16);
+            let zeros24 = vec![0u32; 24];
+            let d_dummy_challenges = DeviceBuffer::from_host(&zeros24);
             ffi::cuda_cairo_quotient(
                 d_col_ptrs.as_ptr() as *const *const u32,
+                d_dummy_interaction.as_ptr(), d_dummy_interaction.as_ptr(),
+                d_dummy_interaction.as_ptr(), d_dummy_interaction.as_ptr(),
                 d_dummy_interaction.as_ptr(), d_dummy_interaction.as_ptr(),
                 d_dummy_interaction.as_ptr(), d_dummy_interaction.as_ptr(),
                 d_dummy_interaction.as_ptr(), d_dummy_interaction.as_ptr(),

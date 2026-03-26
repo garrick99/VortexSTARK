@@ -6,6 +6,7 @@ resolver = "3"
 name = "vortexstark"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 description = "GPU-native Circle STARK prover for RTX 5090"
 
 [lib]
@@ -51,9 +52,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 clap = { version = "4", features = ["derive"] }
+rand = "0.9"
 
 [build-dependencies]
 cc = "1.2"
 
 [dev-dependencies]
-rand = "0.9"

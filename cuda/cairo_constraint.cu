@@ -15,9 +15,9 @@
 
 #include "include/qm31.cuh"
 
-#define CAIRO_N_COLS 31
+#define CAIRO_N_COLS 34
 #define CAIRO_N_FLAGS 15
-#define CAIRO_N_CONSTRAINTS 31
+#define CAIRO_N_CONSTRAINTS 35
 #define COL_INST_LO 3
 #define COL_INST_HI 4
 #define COL_PC 0
@@ -35,6 +35,10 @@
 #define COL_DST_ADDR 20
 #define COL_OP0_ADDR 22
 #define COL_OP1_ADDR 24
+// Dict linkage columns (GAP-1 closure)
+#define COL_DICT_KEY    31
+#define COL_DICT_NEW    32
+#define COL_DICT_ACTIVE 33
 
 // ── Vanishing polynomial helpers ───────────────────────────────────────────
 
@@ -141,18 +145,21 @@ __device__ __forceinline__ QM31 rc_step_delta(
 }
 
 __global__ void cairo_quotient_kernel(
-    const uint32_t* const* __restrict__ trace_cols,  // [31] column pointers
+    const uint32_t* const* __restrict__ trace_cols,  // [34] column pointers
     // LogUp interaction trace (QM31 stored as 4 M31 cols, eval-domain order)
     const uint32_t* __restrict__ s_logup0, const uint32_t* __restrict__ s_logup1,
     const uint32_t* __restrict__ s_logup2, const uint32_t* __restrict__ s_logup3,
     // RC interaction trace
     const uint32_t* __restrict__ s_rc0, const uint32_t* __restrict__ s_rc1,
     const uint32_t* __restrict__ s_rc2, const uint32_t* __restrict__ s_rc3,
+    // Dict step-transition interaction trace (QM31 stored as 4 M31 cols)
+    const uint32_t* __restrict__ s_dict0, const uint32_t* __restrict__ s_dict1,
+    const uint32_t* __restrict__ s_dict2, const uint32_t* __restrict__ s_dict3,
     uint32_t* __restrict__ out0, uint32_t* __restrict__ out1,
     uint32_t* __restrict__ out2, uint32_t* __restrict__ out3,
     const uint32_t* __restrict__ alpha_coeffs,  // [N_CONSTRAINTS * 4] QM31 coefficients
     const uint32_t* __restrict__ vh_inv,        // [n] 1/Z_H at each eval point (NTT order)
-    // QM31 challenges packed as [z_mem(4), alpha_mem(4), alpha_mem_sq(4), z_rc(4)]
+    // QM31 challenges: [z_mem(4), alpha_mem(4), alpha_mem_sq(4), z_rc(4), z_dict_link(4), alpha_dict_link(4)]
     const uint32_t* __restrict__ challenges,
     uint32_t n  // eval domain size
 ) {
@@ -162,10 +169,12 @@ __global__ void cairo_quotient_kernel(
     uint32_t next_i = (i + 1) % n;
 
     // Unpack QM31 challenges
-    QM31 z_mem       = {{challenges[0],  challenges[1],  challenges[2],  challenges[3]}};
-    QM31 alpha_mem   = {{challenges[4],  challenges[5],  challenges[6],  challenges[7]}};
-    QM31 alpha_mem_sq = {{challenges[8],  challenges[9],  challenges[10], challenges[11]}};
-    QM31 z_rc        = {{challenges[12], challenges[13], challenges[14], challenges[15]}};
+    QM31 z_mem          = {{challenges[0],  challenges[1],  challenges[2],  challenges[3]}};
+    QM31 alpha_mem      = {{challenges[4],  challenges[5],  challenges[6],  challenges[7]}};
+    QM31 alpha_mem_sq   = {{challenges[8],  challenges[9],  challenges[10], challenges[11]}};
+    QM31 z_rc           = {{challenges[12], challenges[13], challenges[14], challenges[15]}};
+    QM31 z_dict_link    = {{challenges[16], challenges[17], challenges[18], challenges[19]}};
+    QM31 alpha_dict_link = {{challenges[20], challenges[21], challenges[22], challenges[23]}};
 
     // Load current row values
     uint32_t pc  = trace_cols[COL_PC][i];
@@ -456,6 +465,41 @@ __global__ void cairo_quotient_kernel(
         ci++;
     }
 
+    // --- Constraint 33: dict_active binary (dict_active * (1 - dict_active) = 0) ---
+    {
+        uint32_t dict_active_v = trace_cols[COL_DICT_ACTIVE][i];
+        uint32_t c = m31_mul(dict_active_v, m31_sub(1, dict_active_v));
+        QM31 alpha33 = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+        quotient = qm31_add(quotient, qm31_mul_m31(alpha33, c));
+        ci++;
+    }
+
+    // --- Constraint 34: S_dict step-transition (QM31 constraint) ---
+    // S_dict[i+1] - S_dict[i] - dict_active[i] * inv(z_dict_link - (dict_key[i] + alpha_dict_link * dict_new[i])) = 0
+    // When dict_active[i] = 0: S_dict is constant at this row (no dict access).
+    // When dict_active[i] = 1: S_dict advances by one LogUp term.
+    {
+        QM31 s_curr_d = {{s_dict0[i],      s_dict1[i],      s_dict2[i],      s_dict3[i]}};
+        QM31 s_next_d = {{s_dict0[next_i], s_dict1[next_i], s_dict2[next_i], s_dict3[next_i]}};
+        uint32_t dict_active_v = trace_cols[COL_DICT_ACTIVE][i];
+        QM31 dict_delta;
+        if (dict_active_v == 0) {
+            dict_delta.v[0] = 0; dict_delta.v[1] = 0;
+            dict_delta.v[2] = 0; dict_delta.v[3] = 0;
+        } else {
+            uint32_t dict_key_v = trace_cols[COL_DICT_KEY][i];
+            uint32_t dict_new_v = trace_cols[COL_DICT_NEW][i];
+            QM31 entry = qm31_add(qm31_from_m31(dict_key_v),
+                         qm31_mul(alpha_dict_link, qm31_from_m31(dict_new_v)));
+            QM31 denom = qm31_sub(z_dict_link, entry);
+            dict_delta = qm31_inv(denom);
+        }
+        QM31 c34 = qm31_sub(qm31_sub(s_next_d, s_curr_d), dict_delta);
+        QM31 alpha34 = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+        quotient = qm31_add(quotient, qm31_mul(alpha34, c34));
+        ci++;
+    }
+
     // Divide by vanishing polynomial: Q(x) = C(x) / Z_H(x)
     quotient = qm31_mul_m31(quotient, vh_inv[i]);
 
@@ -472,6 +516,8 @@ __global__ void cairo_quotient_chunk_kernel(
     const uint32_t* __restrict__ s_logup2, const uint32_t* __restrict__ s_logup3,
     const uint32_t* __restrict__ s_rc0, const uint32_t* __restrict__ s_rc1,
     const uint32_t* __restrict__ s_rc2, const uint32_t* __restrict__ s_rc3,
+    const uint32_t* __restrict__ s_dict0, const uint32_t* __restrict__ s_dict1,
+    const uint32_t* __restrict__ s_dict2, const uint32_t* __restrict__ s_dict3,
     uint32_t* __restrict__ out0, uint32_t* __restrict__ out1,
     uint32_t* __restrict__ out2, uint32_t* __restrict__ out3,
     const uint32_t* __restrict__ alpha_coeffs,
@@ -485,10 +531,12 @@ __global__ void cairo_quotient_chunk_kernel(
     uint32_t i = offset + local_i;
     uint32_t next_i = (i + 1) % global_n;
 
-    QM31 z_mem        = {{challenges[0],  challenges[1],  challenges[2],  challenges[3]}};
-    QM31 alpha_mem    = {{challenges[4],  challenges[5],  challenges[6],  challenges[7]}};
-    QM31 alpha_mem_sq = {{challenges[8],  challenges[9],  challenges[10], challenges[11]}};
-    QM31 z_rc         = {{challenges[12], challenges[13], challenges[14], challenges[15]}};
+    QM31 z_mem           = {{challenges[0],  challenges[1],  challenges[2],  challenges[3]}};
+    QM31 alpha_mem       = {{challenges[4],  challenges[5],  challenges[6],  challenges[7]}};
+    QM31 alpha_mem_sq    = {{challenges[8],  challenges[9],  challenges[10], challenges[11]}};
+    QM31 z_rc            = {{challenges[12], challenges[13], challenges[14], challenges[15]}};
+    QM31 z_dict_link     = {{challenges[16], challenges[17], challenges[18], challenges[19]}};
+    QM31 alpha_dict_link = {{challenges[20], challenges[21], challenges[22], challenges[23]}};
 
     // Same constraint logic as above, reading from global indices
     uint32_t pc  = trace_cols[COL_PC][i];
@@ -692,6 +740,36 @@ __global__ void cairo_quotient_chunk_kernel(
             QM31 alpha32 = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
             quotient = qm31_add(quotient, qm31_mul(alpha32, c32)); ci++;
         }
+
+        // Constraint 33: dict_active binary
+        {
+            uint32_t dict_active_v = trace_cols[COL_DICT_ACTIVE][i];
+            uint32_t c = m31_mul(dict_active_v, m31_sub(1, dict_active_v));
+            QM31 alpha33 = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+            quotient = qm31_add(quotient, qm31_mul_m31(alpha33, c)); ci++;
+        }
+
+        // Constraint 34: S_dict step-transition
+        {
+            QM31 s_curr_d = {{s_dict0[i],      s_dict1[i],      s_dict2[i],      s_dict3[i]}};
+            QM31 s_next_d = {{s_dict0[next_i], s_dict1[next_i], s_dict2[next_i], s_dict3[next_i]}};
+            uint32_t dict_active_v = trace_cols[COL_DICT_ACTIVE][i];
+            QM31 dict_delta;
+            if (dict_active_v == 0) {
+                dict_delta.v[0] = 0; dict_delta.v[1] = 0;
+                dict_delta.v[2] = 0; dict_delta.v[3] = 0;
+            } else {
+                uint32_t dict_key_v = trace_cols[COL_DICT_KEY][i];
+                uint32_t dict_new_v = trace_cols[COL_DICT_NEW][i];
+                QM31 entry = qm31_add(qm31_from_m31(dict_key_v),
+                             qm31_mul(alpha_dict_link, qm31_from_m31(dict_new_v)));
+                QM31 denom = qm31_sub(z_dict_link, entry);
+                dict_delta = qm31_inv(denom);
+            }
+            QM31 c34 = qm31_sub(qm31_sub(s_next_d, s_curr_d), dict_delta);
+            QM31 alpha34 = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+            quotient = qm31_add(quotient, qm31_mul(alpha34, c34)); ci++;
+        }
     }
 
     // Divide by vanishing polynomial: Q(x) = C(x) / Z_H(x)
@@ -727,6 +805,8 @@ void cuda_cairo_quotient(
     const uint32_t* s_logup2, const uint32_t* s_logup3,
     const uint32_t* s_rc0, const uint32_t* s_rc1,
     const uint32_t* s_rc2, const uint32_t* s_rc3,
+    const uint32_t* s_dict0, const uint32_t* s_dict1,
+    const uint32_t* s_dict2, const uint32_t* s_dict3,
     uint32_t* out0, uint32_t* out1, uint32_t* out2, uint32_t* out3,
     const uint32_t* alpha_coeffs,
     const uint32_t* vh_inv,
@@ -739,6 +819,7 @@ void cuda_cairo_quotient(
         trace_cols,
         s_logup0, s_logup1, s_logup2, s_logup3,
         s_rc0, s_rc1, s_rc2, s_rc3,
+        s_dict0, s_dict1, s_dict2, s_dict3,
         out0, out1, out2, out3,
         alpha_coeffs, vh_inv, challenges, n
     );
@@ -750,6 +831,8 @@ void cuda_cairo_quotient_chunk(
     const uint32_t* s_logup2, const uint32_t* s_logup3,
     const uint32_t* s_rc0, const uint32_t* s_rc1,
     const uint32_t* s_rc2, const uint32_t* s_rc3,
+    const uint32_t* s_dict0, const uint32_t* s_dict1,
+    const uint32_t* s_dict2, const uint32_t* s_dict3,
     uint32_t* out0, uint32_t* out1, uint32_t* out2, uint32_t* out3,
     const uint32_t* alpha_coeffs,
     const uint32_t* vh_inv,
@@ -762,10 +845,88 @@ void cuda_cairo_quotient_chunk(
         trace_cols,
         s_logup0, s_logup1, s_logup2, s_logup3,
         s_rc0, s_rc1, s_rc2, s_rc3,
+        s_dict0, s_dict1, s_dict2, s_dict3,
         out0, out1, out2, out3,
         alpha_coeffs, vh_inv, challenges,
         offset, chunk_n, global_n
     );
+}
+
+// ── ZK Blinding helpers ───────────────────────────────────────────────────
+//
+// cuda_compute_vanishing: compute Z_H at each eval-domain position (not its
+//   inverse).  Z_H(x) = f_{log_n}(x)+1; same formula as vanishing_poly().
+//   Used to blind trace columns: column[i] += r * Z_H[i] before commitment.
+//
+// cuda_axpy_m31: fused multiply-add: y[i] = y[i] + scalar * x[i]  (mod P).
+
+__global__ void compute_vanishing_kernel(
+    uint32_t initial_x, uint32_t initial_y,
+    uint32_t step_x,    uint32_t step_y,
+    uint32_t* __restrict__ out_zh,
+    uint32_t log_eval,
+    uint32_t log_n
+) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t eval_n = 1u << log_eval;
+    if (i >= eval_n) return;
+
+    uint32_t j = cairo_bit_reverse(i, log_eval);
+
+    uint32_t rx = 1u, ry = 0u;
+    uint32_t bx = step_x, by = step_y;
+    uint32_t k = j;
+    for (uint32_t bit = 0; bit < log_eval; bit++) {
+        if (k & 1u) {
+            uint32_t nx = m31_sub(m31_mul(rx, bx), m31_mul(ry, by));
+            uint32_t ny = m31_add(m31_mul(rx, by), m31_mul(ry, bx));
+            rx = nx; ry = ny;
+        }
+        uint32_t nx = m31_sub(m31_add(m31_mul(bx, bx), m31_mul(bx, bx)), 1u);
+        uint32_t ny = m31_add(m31_mul(bx, by), m31_mul(bx, by));
+        bx = nx; by = ny;
+        k >>= 1;
+    }
+    uint32_t px = m31_sub(m31_mul(initial_x, rx), m31_mul(initial_y, ry));
+    out_zh[i] = vanishing_poly(px, log_n);   // Z_H, NOT its inverse
+}
+
+void cuda_compute_vanishing(
+    uint32_t initial_x, uint32_t initial_y,
+    uint32_t step_x, uint32_t step_y,
+    uint32_t* out_zh,
+    uint32_t log_eval,
+    uint32_t log_n
+) {
+    uint32_t eval_n = 1u << log_eval;
+    uint32_t threads = 256;
+    uint32_t blocks = (eval_n + threads - 1) / threads;
+    compute_vanishing_kernel<<<blocks, threads>>>(
+        initial_x, initial_y, step_x, step_y,
+        out_zh, log_eval, log_n
+    );
+}
+
+__global__ void axpy_m31_kernel(
+    uint32_t scalar,
+    const uint32_t* __restrict__ x,
+    uint32_t* __restrict__ y,
+    uint32_t n
+) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    y[i] = m31_add(y[i], m31_mul(scalar, x[i]));
+}
+
+void cuda_axpy_m31(
+    uint32_t scalar,
+    const uint32_t* x,
+    uint32_t* y,
+    uint32_t n
+) {
+    uint32_t threads = 256;
+    uint32_t blocks = (n + threads - 1) / threads;
+    axpy_m31_kernel<<<blocks, threads>>>(scalar, x, y, n);
 }
 
 } // extern "C"

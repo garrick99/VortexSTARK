@@ -93,28 +93,53 @@ fn main() {
         // Use an older MSVC (14.44 / VS 2022) and an older Windows SDK (22621) for CUDA
         // host compilation, which CUDA 13.x is known to support.
         if is_windows {
-            let preferred_ccbin = PathBuf::from(
-                r"C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64"
-            );
-            if preferred_ccbin.exists() {
-                cmd.arg("-ccbin").arg(&preferred_ccbin);
-            }
+            // Find the MSVC toolset: scan VS install dirs for any BuildTools\VC\Tools\MSVC\<ver>
+            // and pick the first (lowest = most CUDA-compatible).
+            let msvc_bin = (|| {
+                for vs_ver in &["2022", "2019", "18"] {
+                    for edition in &["BuildTools", "Community", "Professional", "Enterprise"] {
+                        let msvc_root = PathBuf::from(format!(
+                            r"C:\Program Files (x86)\Microsoft Visual Studio\{}\{}\VC\Tools\MSVC",
+                            vs_ver, edition
+                        ));
+                        if let Ok(entries) = std::fs::read_dir(&msvc_root) {
+                            let mut versions: Vec<PathBuf> = entries
+                                .filter_map(|e| e.ok().map(|e| e.path()))
+                                .filter(|p| p.join("bin").join("Hostx64").join("x64").join("cl.exe").exists())
+                                .collect();
+                            versions.sort();
+                            if let Some(v) = versions.first() {
+                                return Some(v.join("bin").join("Hostx64").join("x64"));
+                            }
+                        }
+                    }
+                }
+                None
+            })();
 
-            // Prefer an older Windows SDK for CUDA include paths
-            let sdk_base = PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10\Include");
-            for sdk_ver in &["10.0.22621.0", "10.0.22000.0", "10.0.26100.0"] {
-                let sdk_inc = sdk_base.join(sdk_ver);
-                if sdk_inc.exists() {
-                    let msvc_inc = r"C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.44.35207\include";
-                    let include = format!(
-                        "{};{};{};{}",
-                        msvc_inc,
-                        sdk_inc.join("ucrt").display(),
-                        sdk_inc.join("um").display(),
-                        sdk_inc.join("shared").display(),
-                    );
-                    cmd.env("INCLUDE", &include);
-                    break;
+            if let Some(ccbin) = &msvc_bin {
+                cmd.arg("-ccbin").arg(ccbin);
+
+                // Set INCLUDE for CUDA host compilation using the found MSVC
+                let sdk_base = PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10\Include");
+                let msvc_include = ccbin.parent().and_then(|p| p.parent())
+                    .and_then(|p| p.parent()).and_then(|p| p.parent())
+                    .map(|p| p.join("include"));
+                for sdk_ver in &["10.0.22621.0", "10.0.22000.0", "10.0.26100.0"] {
+                    let sdk_inc = sdk_base.join(sdk_ver);
+                    if sdk_inc.exists() {
+                        if let Some(msvc_inc) = &msvc_include {
+                            let include = format!(
+                                "{};{};{};{}",
+                                msvc_inc.display(),
+                                sdk_inc.join("ucrt").display(),
+                                sdk_inc.join("um").display(),
+                                sdk_inc.join("shared").display(),
+                            );
+                            cmd.env("INCLUDE", &include);
+                        }
+                        break;
+                    }
                 }
             }
         }

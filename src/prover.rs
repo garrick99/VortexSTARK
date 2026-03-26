@@ -320,8 +320,6 @@ fn prove_lean_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     // --- Step 7: FRI ---
     let t0 = Instant::now();
     let mut fri_commitments = Vec::new();
-    let _fri_trees: Vec<MerkleTree> = Vec::new();
-    let _fri_evals: Vec<SecureColumn> = Vec::new();
     let current_eval = quotient_col;
     let mut current_log_size = log_eval_size;
 
@@ -398,7 +396,7 @@ fn prove_lean_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
 
         // Wait for prefetched twiddle to finish
         twid_stream.sync();
-        let (_sources, d_twid) = prefetched_twid.take().unwrap();
+        let (_sources, d_twid) = prefetched_twid.take().expect("prefetched twiddle missing — loop guard invariant broken");
 
         // Start prefetching NEXT layer's twiddle (overlaps with this fold+commit)
         let next_log = current_log_size - 1;
@@ -408,7 +406,7 @@ fn prove_lean_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
         }
 
         // Fold on default stream
-        let folded = match fri_layer_data.last().unwrap() {
+        let folded = match fri_layer_data.last().expect("FRI layer data empty — no circle fold occurred") {
             FriLayerData::GpuTree(_, eval) => {
                 fri::fold_line_with_twiddles(eval, fold_alpha, &d_twid)
             }
@@ -459,7 +457,7 @@ fn prove_lean_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     drop(twid_stream);
 
     // CPU tail
-    let mut cpu_eval = match fri_layer_data.last().unwrap() {
+    let mut cpu_eval = match fri_layer_data.last().expect("FRI layer data empty — no circle fold occurred") {
         FriLayerData::GpuTree(_, eval) => eval.to_qm31(),
         FriLayerData::HostData(host, _) => {
             let n = host[0].len();
@@ -962,7 +960,7 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     drop(fri_gpu);
 
     // CPU tail
-    let mut cpu_eval = match fri_layer_data.last().unwrap() {
+    let mut cpu_eval = match fri_layer_data.last().expect("FRI layer data empty — no circle fold occurred") {
         FriLayerData::GpuTree(_, eval) | FriLayerData::GpuLean(eval, _) => eval.to_qm31(),
         FriLayerData::PinnedData(pinned, len, _) => {
             let nn = *len;

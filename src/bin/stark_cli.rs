@@ -208,10 +208,14 @@ fn cmd_prove_file(path: &PathBuf, output: &str, max_steps: Option<usize>, log_n_
     ffi::init_memory_pool();
 
     let t0 = Instant::now();
-    let proof = vortexstark::cairo_air::prover::cairo_prove(&program.bytecode, n_steps, log_n);
+    let proof = vortexstark::cairo_air::prover::cairo_prove_program(&program, n_steps, log_n)
+        .unwrap_or_else(|e| { eprintln!("ERROR: {e}"); std::process::exit(1); });
     let prove_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     eprintln!("  prove: {prove_ms:.1}ms");
+    if !program.hints.is_empty() {
+        eprintln!("  hints executed: {} hint sites", program.hints.len());
+    }
     eprintln!("  program hash: {:08x}{:08x}...",
         proof.public_inputs.program_hash[0],
         proof.public_inputs.program_hash[1]);
@@ -259,10 +263,14 @@ fn cmd_prove_starknet(class_hash: &str, rpc_url: &str, output: &str, max_steps: 
     ffi::init_memory_pool();
 
     let t0 = Instant::now();
-    let proof = vortexstark::cairo_air::prover::cairo_prove(&program.bytecode, n_steps, log_n);
+    let proof = vortexstark::cairo_air::prover::cairo_prove_program(&program, n_steps, log_n)
+        .unwrap_or_else(|e| { eprintln!("ERROR: {e}"); std::process::exit(1); });
     let prove_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     eprintln!("  prove: {prove_ms:.1}ms");
+    if !program.hints.is_empty() {
+        eprintln!("  hints executed: {} hint sites", program.hints.len());
+    }
 
     let bytes = serialize_cairo_proof(&proof);
     let proof_size = bytes.len();

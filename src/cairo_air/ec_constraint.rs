@@ -24,6 +24,15 @@
 
 use super::pedersen::N_LIMBS;
 
+/// Error type for EC trace generation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EcError {
+    /// A required base point is the point at infinity (should never happen with valid Pedersen params).
+    PointAtInfinity(&'static str),
+    /// EC trace would exceed the allocated trace length.
+    TraceTooLarge { rows: usize, capacity: usize },
+}
+
 /// Number of columns in the EC multiplication trace.
 /// Per row:
 ///   accumulated point (x, y) = 2 × 9 = 18 limbs
@@ -75,23 +84,20 @@ pub fn generate_ec_trace(
     inputs_a: &[super::stark252_field::Fp],
     inputs_b: &[super::stark252_field::Fp],
     log_trace_len: u32,
-) -> Vec<Vec<u32>> {
+) -> Result<Vec<Vec<u32>>, EcError> {
     use super::stark252_field::{Fp, CurvePoint, pedersen_points};
     use super::pedersen::{fp_to_stark252, N_LIMBS};
 
     let n_hashes = inputs_a.len();
     let trace_len = 1usize << log_trace_len;
     let n_rows = n_hashes * ROWS_PER_INVOCATION;
-    assert!(n_rows <= trace_len, "EC trace too large: {n_rows} rows > {trace_len}");
+    if n_rows > trace_len {
+        return Err(EcError::TraceTooLarge { rows: n_rows, capacity: trace_len });
+    }
 
     let mut cols: Vec<Vec<u32>> = (0..EC_TRACE_COLS_COMPACT).map(|_| vec![0u32; trace_len]).collect();
 
     let points = pedersen_points();
-    // Base points for the 4 scalars (P1..P4)
-    let _base_points: Vec<(Fp, Fp)> = (1..=4).map(|i| match points[i] {
-        CurvePoint::Affine(x, y) => (x, y),
-        _ => panic!("base point is infinity"),
-    }).collect();
 
     // Precompute window tables: table[point_idx][k] = k * P_i (affine)
     let mut tables: Vec<Vec<Option<(Fp, Fp)>>> = Vec::new();
@@ -113,7 +119,7 @@ pub fn generate_ec_trace(
 
     let (p0x, p0y) = match points[0] {
         CurvePoint::Affine(x, y) => (x, y),
-        _ => panic!("P0 is infinity"),
+        _ => return Err(EcError::PointAtInfinity("P0")),
     };
 
     let mut row = 0;
@@ -228,7 +234,7 @@ pub fn generate_ec_trace(
         }
     }
 
-    cols
+    Ok(cols)
 }
 
 /// Verify EC trace constraints at a specific row.

@@ -55,7 +55,7 @@ Input (Fibonacci or Cairo CASM)
 
 **Fibonacci STARK** (`src/prover.rs`, `src/verifier.rs`): 1-column trace, single transition constraint. Blowup factor 2×, 100 FRI queries.
 
-**Cairo VM STARK** (`src/cairo_air/`): 31-column trace with full VM execution semantics — decode, register updates, memory consistency (LogUp), range checks. Supports: add, mul, jump, jnz, call, ret, assert_eq. No hint execution (limits to straight-line Cairo code).
+**Cairo VM STARK** (`src/cairo_air/`): 31-column trace with full VM execution semantics — decode, register updates, memory consistency (LogUp), range checks. Supports: add, mul, jump, jnz, call, ret, assert_eq. Hint execution supported (AllocSegment, dict lifecycle, squash, U256InvModN). Starknet syscalls not emulated.
 
 ### Hash Functions in the Trace
 
@@ -111,4 +111,4 @@ SoA4 layout: 4 trees striped for cache efficiency. Domain separation between lea
 
 - GreenDragon (192.168.50.239, RTX 5090) runs driver 591.86 — update to 595.79 to fix OOM at log_n=30.
 - Poseidon2-Full (`src/poseidon2f.rs`, `cuda/poseidon2f_trace.cu`) has no formal security analysis — research only.
-- Cairo hint execution is not implemented; proofs are limited to straight-line CASM programs.
+- Cairo hint execution is implemented: AllocSegment, AllocFelt252Dict, Felt252DictEntryInit/Update, all squash hints, U256InvModN, GetSegmentArenaIndex (multi-dict), and DebugPrint. Starknet syscalls are not emulated.

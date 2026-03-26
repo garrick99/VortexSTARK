@@ -5,3 +5,8 @@
 *.exp
 gpu_log_*.csv
 gpu_monitor_output.txt
+vendor/
+.cargo/
+proof.bin
+*.ps1
+.claude/

@@ -154,6 +154,13 @@ fn parse_casm_json(json: &str, name: &str) -> Result<CasmProgram, String> {
     // Parse hints
     let hints = parse_hints(&file.hints);
 
+    if entry_point as usize > bytecode.len() {
+        return Err(format!(
+            "entry_point offset {} exceeds bytecode length {}",
+            entry_point, bytecode.len()
+        ));
+    }
+
     Ok(CasmProgram {
         bytecode,
         entry_point,
@@ -187,6 +194,13 @@ fn parse_cairo0_json(json: &str, name: &str) -> Result<CasmProgram, String> {
     }
 
     let entry_point = file.main.unwrap_or(0) as u64;
+
+    if entry_point as usize > bytecode.len() {
+        return Err(format!(
+            "entry_point offset {} exceeds bytecode length {}",
+            entry_point, bytecode.len()
+        ));
+    }
 
     Ok(CasmProgram {
         bytecode,
@@ -311,27 +325,37 @@ fn extract_hint_name(hint: &serde_json::Value) -> String {
 /// Auto-detect the number of steps needed to execute a program.
 /// Runs the VM until it hits a ret that would jump to address 0 (halt convention),
 /// or until max_steps is reached.
+///
+/// Uses the same initial state as `execute_to_columns_with_hints` / `cairo_prove_program`
+/// and runs hints so that hint-dependent control flow is counted correctly.
 pub fn detect_steps(program: &CasmProgram, max_steps: usize) -> usize {
     use super::vm::{Memory, CairoState};
     use super::decode::Instruction;
+    use super::hints::{HintContext, run_hints};
 
-    let mut memory = Memory::with_capacity(program.bytecode.len() + max_steps + 1000);
+    // Initial state must match cairo_prove_program exactly.
+    let initial_sp = program.bytecode.len() as u64 + 100;
+    let initial_ap = initial_sp + 2;
+
+    let mut memory = Memory::with_capacity(initial_ap as usize + max_steps + 1000);
     memory.load_program(&program.bytecode);
 
-    // Set up return address convention: push a sentinel return address (0)
-    // at the initial stack, so when the program's top-level ret fires,
-    // pc jumps to address 0 which we detect as halt.
-    let initial_ap = program.bytecode.len() as u64 + 100;
+    // Calling convention: sentinel frame below initial AP/FP.
+    memory.set(initial_sp,     0); // saved fp  = 0
+    memory.set(initial_sp + 1, 0); // return pc = 0 (halt)
+
     let mut state = CairoState {
         pc: program.entry_point,
-        ap: initial_ap + 2,
-        fp: initial_ap + 2,
+        ap: initial_ap,
+        fp: initial_ap,
     };
-    // Push return fp and return pc (both 0 = halt sentinel)
-    memory.set(initial_ap, 0);     // saved fp
-    memory.set(initial_ap + 1, 0); // return pc = 0 (halt)
+
+    let mut ctx = HintContext::new();
 
     for step in 0..max_steps {
+        // Run hints before executing the instruction (same order as prove path).
+        run_hints(&program.hints, state.pc, step, &state, &mut memory, &mut ctx);
+
         let encoded = memory.get(state.pc);
         if encoded == 0 && state.pc < program.entry_point {
             // Hit uninitialized memory before entry point — likely halted
@@ -340,7 +364,7 @@ pub fn detect_steps(program: &CasmProgram, max_steps: usize) -> usize {
 
         let instr = Instruction::decode(encoded);
 
-        // Execute one step (simplified — no hints)
+        // Execute one step
         let dst_base = if instr.dst_reg == 1 { state.fp } else { state.ap };
         let dst_addr = dst_base.wrapping_add(instr.off0.wrapping_sub(0x8000) as i16 as i64 as u64);
         let op0_base = if instr.op0_reg == 1 { state.fp } else { state.ap };

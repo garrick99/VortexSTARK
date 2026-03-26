@@ -111,7 +111,6 @@ pub fn verify(proof: &StarkProof) -> Result<(), String> {
         &proof.trace_decommitment.auth_paths,
         &proof.trace_decommitment.sibling_auth_paths,
         &proof.query_indices,
-        1, // n_cols = 1 for trace
         "trace",
     )?;
 
@@ -218,13 +217,17 @@ pub fn verify(proof: &StarkProof) -> Result<(), String> {
             let last_decom = &proof.fri_decommitments[n_fri_layers - 1];
             let actual = QM31::from_u32_array(last_decom.values[q]);
             let last_idx = current_idx; // index into the last layer
-            if last_idx < proof.fri_last_layer.len() {
-                let expected = proof.fri_last_layer[last_idx];
-                if actual != expected {
-                    return Err(format!(
-                        "FRI last layer mismatch at query {q} (index {last_idx})"
-                    ));
-                }
+            if last_idx >= proof.fri_last_layer.len() {
+                return Err(format!(
+                    "FRI last layer index {last_idx} out of bounds (layer size {})",
+                    proof.fri_last_layer.len()
+                ));
+            }
+            let expected = proof.fri_last_layer[last_idx];
+            if actual != expected {
+                return Err(format!(
+                    "FRI last layer mismatch at query {q} (index {last_idx})"
+                ));
             }
         }
     }
@@ -259,7 +262,6 @@ fn verify_decommitment_auth_paths(
     auth_paths: &[Vec<[u32; 8]>],
     sibling_auth_paths: &[Vec<[u32; 8]>],
     indices: &[usize],
-    _n_cols: usize,
     label: &str,
 ) -> Result<(), String> {
     if values.len() != N_QUERIES || auth_paths.len() != N_QUERIES {

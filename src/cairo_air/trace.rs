@@ -36,8 +36,15 @@
 use crate::field::m31::P;
 use super::vm::TraceRow;
 
-/// Number of trace columns.
-pub const N_COLS: usize = 31;
+/// Number of Cairo VM trace columns (before dict linkage columns are appended).
+/// Execution produces N_VM_COLS columns; the prover appends 3 dict columns to reach N_COLS.
+pub const N_VM_COLS: usize = 31;
+
+/// Total number of trace columns committed to the FRI polynomial.
+/// 31 Cairo VM columns + 3 dict-linkage columns (dict_key=31, dict_new=32, dict_active=33).
+/// The dict columns are filled for rows where a Felt252Dict access occurs (dict_active=1)
+/// and zero otherwise; they link dict operations into the FRI-committed trace (closing GAP-1).
+pub const N_COLS: usize = 34;
 
 /// Column indices.
 pub const COL_PC: usize = 0;
@@ -59,13 +66,22 @@ pub const COL_OFF1: usize = 28;
 pub const COL_OFF2: usize = 29;
 pub const COL_DST_INV: usize = 30;
 
+// Dict linkage columns (31-33): bind dict operations to the FRI-committed trace.
+// dict_active=1 flags rows where a Felt252Dict access occurred; zero elsewhere.
+// A step-transition LogUp over these columns links the main trace to the dict sub-AIR,
+// closing GAP-1: a malicious prover cannot forge dict_key/dict_new after committing.
+pub const COL_DICT_KEY:    usize = 31;
+pub const COL_DICT_NEW:    usize = 32;
+pub const COL_DICT_ACTIVE: usize = 33;
+
 /// Convert execution trace to columnar M31 format.
 /// Returns N_COLS vectors, each of length `trace.len()`, padded to power of 2.
 pub fn trace_to_columns(trace: &[TraceRow], log_n: u32) -> Vec<Vec<u32>> {
     let n = 1usize << log_n;
     assert!(trace.len() <= n, "trace too large for log_n={log_n}");
 
-    let mut cols: Vec<Vec<u32>> = (0..N_COLS).map(|_| vec![0u32; n]).collect();
+    // Allocate only the 31 VM columns; the 3 dict columns are appended by the prover.
+    let mut cols: Vec<Vec<u32>> = (0..N_VM_COLS).map(|_| vec![0u32; n]).collect();
 
     // Reduce u64 → M31: use bit trick instead of expensive % P division
     #[inline(always)]
@@ -272,7 +288,7 @@ pub fn eval_transition_constraints(
 
 /// Number of transition constraints.
 /// 31 main M31 constraints + 2 QM31 interaction step-transition constraints (LogUp + RC).
-pub const N_CONSTRAINTS: usize = 15 + 1 + 1 + 1 + 1 + 1 + 10 + 1 + 2; // 33
+pub const N_CONSTRAINTS: usize = 15 + 1 + 1 + 1 + 1 + 1 + 10 + 1 + 2 + 2; // 35
 
 #[cfg(test)]
 mod tests {
@@ -292,7 +308,7 @@ mod tests {
 
         let trace = execute(&mut mem, 2);
         let cols = trace_to_columns(&trace, 2); // pad to 4 rows
-        assert_eq!(cols.len(), N_COLS);
+        assert_eq!(cols.len(), N_VM_COLS);
         assert_eq!(cols[0].len(), 4);
     }
 

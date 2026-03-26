@@ -54,10 +54,9 @@ impl Channel {
                 bytes[i * 4 + 1],
                 bytes[i * 4 + 2],
                 bytes[i * 4 + 3],
-            ]) % crate::field::m31::P // reduce to M31 range [0, P)
+            ]) % crate::field::m31::P // reduce to [0, P)
         });
-        // Ensure values are in [0, P)
-        QM31::from_u32_array(std::array::from_fn(|i| if v[i] == 0x7FFF_FFFF { 0 } else { v[i] }))
+        QM31::from_u32_array(v)
     }
 
     /// Draw multiple random QM31 elements.

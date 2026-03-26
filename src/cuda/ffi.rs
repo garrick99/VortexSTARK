@@ -440,10 +440,25 @@ unsafe extern "C" {
         log_n: u32,
     );
 
+    /// Compute Z_H (vanishing polynomial, NOT its inverse) at every eval-domain position.
+    /// Used for ZK blinding: column[i] += r * Z_H[i] before trace commitment.
+    pub fn cuda_compute_vanishing(
+        initial_x: u32, initial_y: u32,
+        step_x: u32, step_y: u32,
+        out_zh: *mut u32,
+        log_eval: u32,
+        log_n: u32,
+    );
+
+    /// Fused multiply-add: y[i] = y[i] + scalar * x[i]  (mod P).
+    /// Used for ZK blinding: add r * Z_H to a trace column.
+    pub fn cuda_axpy_m31(scalar: u32, x: *const u32, y: *mut u32, n: u32);
+
     pub fn cuda_cairo_quotient(
         trace_cols: *const *const u32,
         s_logup0: *const u32, s_logup1: *const u32, s_logup2: *const u32, s_logup3: *const u32,
         s_rc0: *const u32, s_rc1: *const u32, s_rc2: *const u32, s_rc3: *const u32,
+        s_dict0: *const u32, s_dict1: *const u32, s_dict2: *const u32, s_dict3: *const u32,
         out0: *mut u32, out1: *mut u32, out2: *mut u32, out3: *mut u32,
         alpha_coeffs: *const u32,
         vh_inv: *const u32,
@@ -455,6 +470,7 @@ unsafe extern "C" {
         trace_cols: *const *const u32,
         s_logup0: *const u32, s_logup1: *const u32, s_logup2: *const u32, s_logup3: *const u32,
         s_rc0: *const u32, s_rc1: *const u32, s_rc2: *const u32, s_rc3: *const u32,
+        s_dict0: *const u32, s_dict1: *const u32, s_dict2: *const u32, s_dict3: *const u32,
         out0: *mut u32, out1: *mut u32, out2: *mut u32, out3: *mut u32,
         alpha_coeffs: *const u32,
         vh_inv: *const u32,

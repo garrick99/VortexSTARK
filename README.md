@@ -45,8 +45,9 @@ GPU-native Circle STARK prover with end-to-end proof generation and verification
 
 ### Remaining limitations
 
-- **Hint execution**: Not implemented — limits provable programs to straight-line arithmetic and simple loops
-- **Full Starknet programs**: Requires hints, high-address builtin memory segments, and full felt252 support
+- **Felt252 arithmetic**: VM operates over M31 (2^31 − 1). `cairo_prove_program` now returns `Err(ProveError::Felt252Overflow)` for programs whose bytecode contains values wider than 64 bits, preventing silent misproofs. Values in the range (M31, u64] are still reduced mod M31 without error — proof output is wrong for programs that rely on Stark252 arithmetic in that range.
+- **Starknet syscalls**: `storage_read`, `emit_event`, `call_contract`, and other OS syscalls are not emulated. Programs that invoke these will stall or produce invalid traces.
+- **Dict consistency proofs**: Dict read/write execution is fully functional. An execution-side chain consistency check now runs at prove time and returns `Err(ProveError::DictConsistencyViolation)` if hint execution is internally inconsistent. The STARK proof does not yet include a formal dict consistency argument; proofs for dict-heavy programs are not sound against a *malicious* prover.
 
 See [SOUNDNESS.md](SOUNDNESS.md) for the full constraint-by-constraint analysis.
 
@@ -96,14 +97,14 @@ Requires: Rust 1.85+ (stable), CUDA 13.0+, RTX 5090 (SM 12.0) or RTX 4090 (SM 8.
 
 ```bash
 cargo build --release
-cargo test -- --test-threads=1    # 149 tests
+cargo test -- --test-threads=1    # 188 tests
 cargo run --release --bin full_benchmark
 cargo run --release --bin gpu_bench     # pre-flight checks + per-section GPU telemetry
 ```
 
 ## Tests
 
-149 tests covering: M31/CM31/QM31 field arithmetic, Circle NTT, Merkle tree (commit, auth paths, tiled, SoA4), FRI (fold, circle fold, deterministic), STARK prover + verifier (multiple sizes, tamper detection), Cairo VM (decoder, executor, Fibonacci, constraints, LogUp, range checks, instruction decomposition), Poseidon, Pedersen (Stark252 field, EC ops, GPU vs CPU), Bitwise, GPU constraint eval (bytecode VM, warp-cooperative), GPU leaf hashing (Blake2s, domain separation), CASM loader.
+188 tests covering: M31/CM31/QM31 field arithmetic, Circle NTT, Merkle tree (commit, auth paths, tiled, SoA4), FRI (fold, circle fold, deterministic), STARK prover + verifier (multiple sizes, tamper detection), Cairo VM (decoder, executor, Fibonacci, constraints, LogUp, range checks, instruction decomposition), Poseidon, Pedersen (Stark252 field, EC ops, GPU vs CPU), Bitwise, GPU constraint eval (bytecode VM, warp-cooperative), GPU leaf hashing (Blake2s, domain separation), CASM loader, Cairo hints (AllocSegment, AllocFelt252Dict, dict entry lifecycle, squash, U256InvModN, multi-dict programs, isqrt edge cases).
 
 ## Break This System
 
@@ -111,8 +112,9 @@ If you can craft a malformed trace that the verifier accepts, that is a real bug
 
 ### Known remaining weak points
 
-- **Hint execution**: Not implemented — limits provable programs to straight-line arithmetic and simple loops
-- **Full Starknet programs**: Requires hints, high-address builtin memory segments, and full felt252 support
+- **Felt252 arithmetic**: values wider than 63 bits are truncated; M31 wrap-around replaces Stark252 arithmetic for overflowing programs
+- **Starknet syscalls**: not emulated — contracts that call OS syscalls will produce invalid traces
+- **Dict consistency**: dict operations execute and DictInfo state is fully tracked, but the proof does not include a formal dict consistency argument
 
 ### Expected to hold (guarantees today)
 

@@ -53,6 +53,7 @@ pub fn logup_row_contribution(
             addr_qm31 + alpha * val_qm31
         };
         let denom = z - entry;
+        assert!(denom != QM31::ZERO, "LogUp denominator is zero — Fiat-Shamir collision (negligible probability; retry with different inputs)");
         sum = sum + denom.inverse();
     }
     sum
@@ -136,6 +137,7 @@ pub fn compute_memory_table_sum(
     for &(addr, value, mult) in memory_entries {
         let entry = qm31_from_m31(addr) + alpha * qm31_from_m31(value);
         let denom = z - entry;
+        debug_assert!(denom != QM31::ZERO, "LogUp table denominator is zero — Fiat-Shamir collision");
         let mult_qm31 = qm31_from_m31(M31(mult));
         sum = sum - mult_qm31 * denom.inverse();
     }
@@ -146,6 +148,7 @@ pub fn compute_memory_table_sum(
             + alpha * qm31_from_m31(inst_lo)
             + alpha_sq * qm31_from_m31(inst_hi);
         let denom = z - entry;
+        debug_assert!(denom != QM31::ZERO, "LogUp instr denominator is zero — Fiat-Shamir collision");
         let mult_qm31 = qm31_from_m31(M31(mult));
         sum = sum - mult_qm31 * denom.inverse();
     }

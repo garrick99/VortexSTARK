@@ -22,4 +22,7 @@ pub mod stark252_field;
 pub mod prover;
 pub mod ec_constraint;
 pub mod casm_loader;
+pub mod hints;
+pub mod dict_consistency;
+pub mod dict_air;
 pub mod starknet_rpc;

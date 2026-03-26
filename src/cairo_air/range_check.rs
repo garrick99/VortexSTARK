@@ -35,6 +35,7 @@ pub fn rc_row_contribution(z_rc: QM31, offsets: &[M31; 3]) -> QM31 {
     for &off in offsets {
         let off_qm31 = qm31_from_m31(off);
         let denom = z_rc - off_qm31;
+        assert!(denom != QM31::ZERO, "RangeCheck exec denominator is zero — Fiat-Shamir collision (negligible probability; retry with different inputs)");
         sum = sum + denom.inverse();
     }
     sum
@@ -75,6 +76,7 @@ pub fn compute_rc_table_sum(
         if mult == 0 { continue; }
         let val_qm31 = qm31_from_m31(M31(val as u32));
         let denom = z_rc - val_qm31;
+        assert!(denom != QM31::ZERO, "RangeCheck table denominator is zero — Fiat-Shamir collision (negligible probability; retry with different inputs)");
         let inv = denom.inverse();
         let mult_qm31 = qm31_from_m31(M31(mult));
         sum = sum - mult_qm31 * inv;
