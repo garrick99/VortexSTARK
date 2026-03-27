@@ -105,10 +105,11 @@ pub struct Instruction {
 
 impl Instruction {
     /// Decode a 63-bit Cairo instruction word.
+    /// Offsets are stored biased by 2^15 (Cairo spec), so decode = stored - 2^15.
     pub fn decode(word: u64) -> Self {
-        let off_dst = (word & 0xFFFF) as u16 as i16;
-        let off_op0 = ((word >> 16) & 0xFFFF) as u16 as i16;
-        let off_op1 = ((word >> 32) & 0xFFFF) as u16 as i16;
+        let off_dst = ((word & 0xFFFF) as i64 - OFF_BIAS) as i16;
+        let off_op0 = (((word >> 16) & 0xFFFF) as i64 - OFF_BIAS) as i16;
+        let off_op1 = (((word >> 32) & 0xFFFF) as i64 - OFF_BIAS) as i16;
         let flags   = (word >> 48) as u16;
 
         Instruction {
@@ -132,10 +133,11 @@ impl Instruction {
     }
 
     /// Encode back to a 63-bit instruction word.
+    /// Offsets are stored biased by 2^15 (Cairo spec): stored = actual + 2^15.
     pub fn encode(&self) -> u64 {
-        let off_dst = (self.off_dst as u16) as u64;
-        let off_op0 = (self.off_op0 as u16) as u64;
-        let off_op1 = (self.off_op1 as u16) as u64;
+        let off_dst = (self.off_dst as i64 + OFF_BIAS) as u16 as u64;
+        let off_op0 = (self.off_op0 as i64 + OFF_BIAS) as u16 as u64;
+        let off_op1 = (self.off_op1 as i64 + OFF_BIAS) as u16 as u64;
         let flags   = (self.dst_reg as u64)
                     | ((self.op0_reg        as u64) << 1)
                     | ((self.op1_imm        as u64) << 2)
@@ -689,5 +691,129 @@ mod tests {
         for i in 13..cs.len() {
             assert_eq!(cs[i], Fp::ZERO, "Flag binary constraint {} should be zero", i);
         }
+    }
+}
+
+// ─────────────────────────────────────────────
+// CairoAir252 — MultiColumnAir implementation
+// ─────────────────────────────────────────────
+
+use super::multi_stark::MultiColumnAir;
+
+/// Multi-column AIR adapter for the Cairo VM over Stark252.
+///
+/// Wraps a pre-built trace (run the VM externally, pass the columns in).
+/// `log_n` must satisfy 2^log_n == trace.n_rows.
+///
+/// Public inputs: [initial_pc, initial_ap, initial_fp, final_pc, final_ap, final_fp].
+pub struct CairoAir252 {
+    /// The execution trace columns (N_COLS columns, each length 2^log_n).
+    pub trace: MultiTrace,
+    pub initial_pc: Fp,
+    pub initial_ap: Fp,
+    pub initial_fp: Fp,
+    pub final_pc: Fp,
+    pub final_ap: Fp,
+    pub final_fp: Fp,
+}
+
+impl CairoAir252 {
+    /// Build a `CairoAir252` by running `vm` for `n_steps` steps.
+    /// `n_steps` must be a power of two.
+    pub fn from_vm(vm: &mut CairoVm, n_steps: usize) -> Self {
+        assert!(n_steps.is_power_of_two(), "n_steps must be a power of two");
+        let initial_pc = Fp::from_u64(vm.state.pc);
+        let initial_ap = Fp::from_u64(vm.state.ap);
+        let initial_fp = Fp::from_u64(vm.state.fp);
+
+        let trace = generate_cairo_trace(vm, n_steps);
+
+        let last = trace.row(n_steps - 1);
+        let final_pc  = last[12]; // NEXT_PC of last row
+        let final_ap  = last[13]; // NEXT_AP of last row
+        let final_fp  = last[14]; // NEXT_FP of last row
+
+        Self { trace, initial_pc, initial_ap, initial_fp, final_pc, final_ap, final_fp }
+    }
+}
+
+impl MultiColumnAir for CairoAir252 {
+    fn n_cols(&self) -> usize { N_COLS }
+
+    fn generate_trace(&self, _log_n: u32) -> Vec<Vec<Fp>> {
+        // Trace is pre-built; just return the columns.
+        self.trace.columns.clone()
+    }
+
+    fn eval_constraints(&self, cur: &[Fp], next: &[Fp]) -> Vec<Fp> {
+        eval_cairo_constraints(cur, next)
+    }
+
+    fn n_constraints(&self) -> usize { N_CONSTRAINTS }
+
+    /// Two boundary rows: row 0 (initial state) and row n-1 (final next-state).
+    fn n_boundary_rows(&self) -> usize { 2 }
+
+    fn public_inputs(&self) -> Vec<Fp> {
+        vec![
+            self.initial_pc, self.initial_ap, self.initial_fp,
+            self.final_pc,   self.final_ap,   self.final_fp,
+        ]
+    }
+}
+
+#[cfg(test)]
+mod cairo_air252_tests {
+    use super::*;
+    use super::super::multi_stark::{prove_multi, verify_multi};
+
+    /// End-to-end prove/verify: a single-instruction Cairo loop.
+    ///
+    /// The "program": a tight loop that does [ap] = [fp] + [fp] (adds fp value to itself)
+    /// and increments ap each step.  We use a simple assert_eq + ap_add1 instruction
+    /// with no jumps, so pc increments by 1 each step.
+    ///
+    /// n_steps = 4 (log_n = 2) for speed in tests.
+    #[test]
+    fn test_cairo_air252_e2e() {
+        // Build a tiny program: n_steps copies of "assert [ap] = [fp-1] + [fp-1]"
+        // Instruction: dst=[ap+0], op0=[fp-1], op1=[fp-1] (op1_fp=1), res_add=1,
+        //              ap_add1=1, opcode_assert_eq=1, no jump.
+        let inst = Instruction {
+            off_dst:   0i16,
+            off_op0:  -1i16,
+            off_op1:  -1i16,
+            dst_reg: 0,
+            op0_reg: 1,
+            op1_imm: 0, op1_fp: 1, op1_ap: 0,
+            res_add: 1, res_mul: 0,
+            pc_jump_abs: 0, pc_jump_rel: 0, pc_jnz: 0,
+            ap_add: 0, ap_add1: 1,
+            opcode_call: 0, opcode_ret: 0, opcode_assert_eq: 1,
+        };
+        let word = inst.encode();
+
+        let pc0: u64 = 1000;
+        let ap0: u64 = 2000;
+        let fp0: u64 = 2000;
+
+        let mut vm = CairoVm::new(pc0, ap0, fp0);
+        // Fill program memory: 8 identical instructions (log_n=3 → 8 steps)
+        for i in 0u64..8 {
+            vm.write(pc0 + i, Fp { v: [word, 0, 0, 0] });
+        }
+        // [fp-1] = [1999] = 5  (op0 and op1 both read from here)
+        vm.write(fp0 - 1, Fp::from_u64(5));
+        // Pre-populate dst addresses so assert_eq witness is consistent:
+        // ap_k = ap0 + k, dst_k = res = op0+op1 = 5+5 = 10
+        for i in 0u64..8 {
+            vm.write(ap0 + i, Fp::from_u64(10));
+        }
+
+        let log_n: u32 = 3; // 8 steps; LDE domain = 32 > LOG_LAST_LAYER=4
+        let air = CairoAir252::from_vm(&mut vm, 1 << log_n);
+
+        let proof = prove_multi(&air, log_n);
+        verify_multi(&proof, &air).expect("Cairo e2e proof should verify");
     }
 }
