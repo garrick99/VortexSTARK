@@ -197,12 +197,25 @@ fn cmd_prove_file(path: &PathBuf, output: &str, max_steps: Option<usize>, log_n_
         std::process::exit(1);
     }
 
-    // Compute log_n (next power of 2)
+    // Compute log_n: smallest l such that 2^l >= n_steps.
     let log_n = log_n_override.unwrap_or_else(|| {
         let mut l = 0u32;
         while (1usize << l) < n_steps { l += 1; }
         l.max(4) // minimum log_n=4 for FRI
     });
+
+    // VortexSTARK requires n_steps == 2^log_n exactly (no padding support).
+    // If detect_steps returned a non-power-of-two count, the program must be
+    // padded to run exactly 2^log_n steps (e.g. append a self-loop).
+    let n = 1usize << log_n;
+    if n_steps != n {
+        eprintln!("ERROR: n_steps ({n_steps}) is not a power of two.");
+        eprintln!("  VortexSTARK requires the trace to be fully populated (n_steps == 2^log_n).");
+        eprintln!("  Pad the program to run exactly {n} steps, or use --log-n {} if the",
+            (n_steps as f64).log2().ceil() as u32);
+        eprintln!("  program can be made to run for that many steps exactly.");
+        std::process::exit(1);
+    }
 
     eprintln!("Proving Cairo STARK: {n_steps} steps, log_n={log_n}");
     ffi::init_memory_pool();
@@ -258,6 +271,14 @@ fn cmd_prove_starknet(class_hash: &str, rpc_url: &str, output: &str, max_steps: 
     let mut log_n = 0u32;
     while (1usize << log_n) < n_steps { log_n += 1; }
     log_n = log_n.max(4);
+
+    let n = 1usize << log_n;
+    if n_steps != n {
+        eprintln!("ERROR: n_steps ({n_steps}) is not a power of two.");
+        eprintln!("  VortexSTARK requires n_steps == 2^log_n (no padding support).");
+        eprintln!("  Pad the Starknet program to run exactly {n} steps.");
+        std::process::exit(1);
+    }
 
     eprintln!("Proving Cairo STARK: {n_steps} steps, log_n={log_n}");
     ffi::init_memory_pool();

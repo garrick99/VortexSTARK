@@ -8,21 +8,21 @@ GPU-native Circle STARK prover with end-to-end proof generation and verification
 
 - **Fibonacci STARK**: Full prove → verify pipeline, 100-bit conjectured security, 12 tamper-detection tests
 - **Cairo VM STARK**: 34-column trace, 35 transition constraints, verifier independently evaluates all constraints at query points
-- **LogUp memory consistency**: Execution sum + memory table sum cancellation, final value bound into Fiat-Shamir
+- **LogUp memory consistency**: Full cancellation check — memory table committed as explicit proof data (all unique entries), verifier independently checks exec_sum + table_sum == 0
 - **Pedersen hash**: GPU windowed EC scalar multiplication, 37.7M hashes/sec, verified against CPU reference
 - **Poseidon2 hash**: GPU trace generation + NTT, 4.7M hashes/sec at log_n=28 (30 rows/perm, RF=8 RP=22)
 - **RPO-M31 hash**: Circle STARK–native hash (eprint 2024/1635), 3.5M hashes/sec at log_n=28 (14 rows/perm, 24 cols)
 - **FRI**: Circle fold + line folds, GPU-resident decommitment, all fold equations verified
 
-### Benchmarked (RTX 5090, CUDA 13.2, driver 595.79, 2026-03-22)
+### Benchmarked (RTX 5090, CUDA 13.2, driver 595.79, 2026-03-26)
 
 | Workload | Scale | Prove | Verify |
 |----------|-------|-------|--------|
 | Fibonacci log_n=24 | 16.8M elements | 214ms | 6.2ms |
 | Fibonacci log_n=28 | 268M elements | 1.56s | 8.2ms |
 | Fibonacci log_n=30 | 1.07B elements | 9.79s | 10.7ms |
-| Cairo VM log_n=24 | 16.8M steps | 7.24s | 0.4ms |
-| Cairo VM log_n=26 | 67.1M steps | 29.2s | 0.5ms |
+| Cairo VM log_n=20 | 1.0M steps | 1.73s | 0.30s |
+| Cairo VM log_n=24 | 16.8M steps | 29.5s | 6.5s |
 | Poseidon2 trace+NTT log_n=28 | 8.9M hashes | 1.92s | — |
 | RPO-M31 trace+NTT log_n=28 | 19.2M hashes | 5.51s | — |
 | Pedersen GPU batch | 1M hashes | 26.6ms | — |
@@ -39,7 +39,7 @@ GPU-native Circle STARK prover with end-to-end proof generation and verification
 - **Opcode exclusivity**: pairwise products of call, ret, assert constrained to zero
 - **Flag binary**: all 15 flags constrained to {0, 1}
 - **Instruction decomposition**: all 63 bits verified — inst_lo + inst_hi ≡ off0 + off1·2^16 + off2·2^32 + flags·2^48 (mod P)
-- **LogUp memory consistency**: execution sum + table sum cancellation with final value bound into Fiat-Shamir
+- **LogUp memory consistency**: memory table committed as explicit proof data; verifier checks exec_sum + table_sum == 0
 - **Range check argument**: all 16-bit offsets verified via LogUp against precomputed table, wired into prover with z_rc challenge
 - **Merkle domain separation**: internal nodes use Blake2s personalization (h[6] ^= 0x01), preventing leaf/node confusion
 - **Full ZK**: all 34 trace columns blinded via `r · Z_H(x)` — GAP-4 closed 2026-03-26
@@ -98,14 +98,14 @@ Requires: Rust 1.85+ (stable), CUDA 13.0+, RTX 5090 (SM 12.0) or RTX 4090 (SM 8.
 
 ```bash
 cargo build --release
-cargo test -- --test-threads=1    # 223 tests
+cargo test -- --test-threads=1    # 228 tests
 cargo run --release --bin full_benchmark
 cargo run --release --bin gpu_bench     # pre-flight checks + per-section GPU telemetry
 ```
 
 ## Tests
 
-223 tests covering: M31/CM31/QM31 field arithmetic, Circle NTT, Merkle tree (commit, auth paths, tiled, SoA4), FRI (fold, circle fold, deterministic), STARK prover + verifier (multiple sizes, tamper detection), Cairo VM (decoder, executor, Fibonacci, constraints, LogUp, range checks, instruction decomposition), Poseidon, Pedersen (Stark252 field, EC ops, GPU vs CPU), Bitwise (memory segment, trace generation, constraint verification, prove/verify round-trip, tamper detection), GPU constraint eval (bytecode VM, warp-cooperative), GPU leaf hashing (Blake2s, domain separation), CASM loader, Cairo hints (AllocSegment, AllocFelt252Dict, dict entry lifecycle, squash, U256InvModN, multi-dict programs, isqrt edge cases).
+228 tests covering: M31/CM31/QM31 field arithmetic, Circle NTT, Merkle tree (commit, auth paths, tiled, SoA4), FRI (fold, circle fold, deterministic), STARK prover + verifier (multiple sizes, tamper detection), Cairo VM (decoder, executor, Fibonacci, constraints, LogUp, range checks, instruction decomposition), Poseidon, Pedersen (Stark252 field, EC ops, GPU vs CPU), Bitwise (memory segment, trace generation, constraint verification, prove/verify round-trip, tamper detection), LogUp/RC soundness (memory table commitment, cancellation check, RC counts commitment), GPU constraint eval (bytecode VM, warp-cooperative), GPU leaf hashing (Blake2s, domain separation), CASM loader, Cairo hints (AllocSegment, AllocFelt252Dict, dict entry lifecycle, squash, U256InvModN, multi-dict programs, isqrt edge cases).
 
 ## Break This System
 
@@ -144,6 +144,11 @@ These should **not** break. If they do, that's a real soundness bug:
 | `test_tamper_assert_eq` | Corrupt `dst != res` | REJECTED |
 | `test_tamper_logup_final_sum` | Corrupt LogUp sum | REJECTED |
 | `test_tamper_rc_final_sum` | Corrupt range check sum | REJECTED |
+| `test_tamper_memory_table_data` | Corrupt memory table entry | REJECTED |
+| `test_tamper_memory_table_commitment` | Corrupt memory table hash | REJECTED |
+| `test_tamper_logup_cancellation` | Corrupt exec_sum (cancellation fails) | REJECTED |
+| `test_tamper_rc_counts_data` | Corrupt RC multiplicity count | REJECTED |
+| `test_tamper_rc_counts_commitment` | Corrupt RC counts hash | REJECTED |
 | `test_cairo_tampered_program_hash` | Corrupt program hash | REJECTED |
 | `test_cairo_prove_verify_tampered_quotient` | Corrupt quotient value | REJECTED |
 | `test_cairo_prove_verify_tampered_fri` | Corrupt FRI value | REJECTED |

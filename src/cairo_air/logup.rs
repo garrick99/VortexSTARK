@@ -167,34 +167,49 @@ pub fn extract_memory_table(
     trace_cols: &[Vec<u32>],
     n_steps: usize,
 ) -> (Vec<(M31, M31, u32)>, Vec<(M31, M31, M31, u32)>) {
-    use std::collections::BTreeMap;
     use super::trace::*;
 
-    let mut data_counts: BTreeMap<(u32, u32), u32> = BTreeMap::new();
-    let mut instr_counts: BTreeMap<(u32, u32, u32), u32> = BTreeMap::new();
+    // Collect raw pairs then sort+dedup — cache-friendly and O(n log n),
+    // much faster than BTreeMap for large n (avoids tree pointer chasing).
+    let mut data_pairs: Vec<(u32, u32)> = Vec::with_capacity(n_steps * 3);
+    let mut instr_triples: Vec<(u32, u32, u32)> = Vec::with_capacity(n_steps);
 
     for i in 0..n_steps {
-        // Instruction fetch: (pc, inst_lo, inst_hi) — extended entry
-        *instr_counts
-            .entry((trace_cols[COL_PC][i], trace_cols[COL_INST_LO][i], trace_cols[COL_INST_HI][i]))
-            .or_insert(0) += 1;
-
-        // Data accesses: (addr, value) — simple entry
-        for (addr, val) in [
-            (trace_cols[COL_DST_ADDR][i], trace_cols[COL_DST][i]),
-            (trace_cols[COL_OP0_ADDR][i], trace_cols[COL_OP0][i]),
-            (trace_cols[COL_OP1_ADDR][i], trace_cols[COL_OP1][i]),
-        ] {
-            *data_counts.entry((addr, val)).or_insert(0) += 1;
-        }
+        instr_triples.push((
+            trace_cols[COL_PC][i],
+            trace_cols[COL_INST_LO][i],
+            trace_cols[COL_INST_HI][i],
+        ));
+        data_pairs.push((trace_cols[COL_DST_ADDR][i], trace_cols[COL_DST][i]));
+        data_pairs.push((trace_cols[COL_OP0_ADDR][i], trace_cols[COL_OP0][i]));
+        data_pairs.push((trace_cols[COL_OP1_ADDR][i], trace_cols[COL_OP1][i]));
     }
 
-    let data = data_counts.into_iter()
-        .map(|((addr, val), mult)| (M31(addr), M31(val), mult))
-        .collect();
-    let instrs = instr_counts.into_iter()
-        .map(|((pc, lo, hi), mult)| (M31(pc), M31(lo), M31(hi), mult))
-        .collect();
+    data_pairs.sort_unstable();
+    let data: Vec<(M31, M31, u32)> = {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < data_pairs.len() {
+            let key = data_pairs[i];
+            let start = i;
+            while i < data_pairs.len() && data_pairs[i] == key { i += 1; }
+            out.push((M31(key.0), M31(key.1), (i - start) as u32));
+        }
+        out
+    };
+
+    instr_triples.sort_unstable();
+    let instrs: Vec<(M31, M31, M31, u32)> = {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < instr_triples.len() {
+            let key = instr_triples[i];
+            let start = i;
+            while i < instr_triples.len() && instr_triples[i] == key { i += 1; }
+            out.push((M31(key.0), M31(key.1), M31(key.2), (i - start) as u32));
+        }
+        out
+    };
 
     (data, instrs)
 }

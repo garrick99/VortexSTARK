@@ -585,14 +585,37 @@ impl MerkleTree {
         assert!(n.is_power_of_two() && n >= 1);
         assert!(!host_cols.is_empty());
 
+        let effective = n_cols.min(16);
         let hash_leaf = |i: usize| -> [u32; HASH_WORDS] {
+            // Use a stack-allocated array to avoid per-leaf heap allocation.
             // Only the first min(n_cols, 16) columns are loaded by the GPU kernel.
-            let effective = n_cols.min(16);
-            let vals: Vec<u32> = (0..effective).map(|c| host_cols[c][i]).collect();
-            Self::hash_leaf(&vals)
+            let mut vals = [0u32; 16];
+            for c in 0..effective { vals[c] = host_cols[c][i]; }
+            Self::hash_leaf(&vals[..effective])
         };
 
         Self::targeted_auth_paths(n, indices, &hash_leaf)
+    }
+
+    /// Like `cpu_merkle_auth_paths_ncols` but uses pre-computed GPU tile roots.
+    /// O(n_queries × TILE_SIZE) instead of O(n) — use when tile roots are available
+    /// from the commit phase (`commit_root_only_with_subtrees`).
+    pub fn cpu_merkle_auth_paths_ncols_with_tile_roots(
+        host_cols: &[Vec<u32>],
+        tile_roots: &[[u32; HASH_WORDS]],
+        indices: &[usize],
+    ) -> Vec<Vec<[u32; HASH_WORDS]>> {
+        let n = host_cols[0].len();
+        let n_cols = host_cols.len();
+        assert!(n.is_power_of_two() && n >= 1);
+        assert!(!host_cols.is_empty());
+        let effective = n_cols.min(16);
+        let hash_leaf = |i: usize| -> [u32; HASH_WORDS] {
+            let mut vals = [0u32; 16];
+            for c in 0..effective { vals[c] = host_cols[c][i]; }
+            Self::hash_leaf(&vals[..effective])
+        };
+        Self::targeted_auth_paths_with_tile_roots(tile_roots, n, indices, &hash_leaf)
     }
 
     /// Build a CPU-side Merkle tree from single-column host data and extract auth paths.
@@ -697,13 +720,20 @@ impl MerkleTree {
     /// This is O(n_queries * 1024) instead of O(n).
     pub fn targeted_auth_paths_with_tile_roots(
         tile_roots: &[[u32; HASH_WORDS]],
-        _n_leaves: usize,
+        n_leaves: usize,
         indices: &[usize],
         hash_leaf: &(dyn Fn(usize) -> [u32; HASH_WORDS] + Sync),
     ) -> Vec<Vec<[u32; HASH_WORDS]>> {
         use std::collections::HashMap;
 
         const TILE_SIZE: usize = 1024;
+
+        // Small tree: fall back to full CPU tree build (no tiling).
+        if n_leaves <= TILE_SIZE {
+            let leaf_hashes: Vec<[u32; HASH_WORDS]> = (0..n_leaves).map(hash_leaf).collect();
+            let layers = Self::build_cpu_tree_layers(leaf_hashes);
+            return Self::extract_paths_from_layers(&layers, indices);
+        }
 
         // Collect which tiles we need
         let mut needed_tiles: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();

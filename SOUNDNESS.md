@@ -84,6 +84,15 @@
 - test_tamper_logup_final_sum: DETECTED (Fiat-Shamir binding)
 - Fiat-Shamir verifier ordering bug fixed: EC trace commitments now correctly bound before
   z_mem/alpha_mem/z_rc challenges (matching prover order).
+- **FIXED 2026-03-26: Memory table commitment closes LogUp soundness gap**
+  - Previously: verifier accepted any claimed exec_sum without checking cancellation.
+  - Now: prover serializes full memory table (unique (addr,val,mult) + (pc,lo,hi,mult) entries),
+    commits via chained Blake2s (`hash_words`), mixes into Fiat-Shamir BEFORE constraint_alphas.
+  - Verifier recomputes hash, checks match, independently computes table_sum,
+    and enforces exec_sum + table_sum == 0. Malicious exec_sum is now detected.
+  - test_tamper_memory_table_data: DETECTED (hash mismatch)
+  - test_tamper_memory_table_commitment: DETECTED (channel diverges → FRI fails)
+  - test_tamper_logup_cancellation: DETECTED (cancellation check fails)
 
 ### Range check argument
 - extract_offsets() extracts 3x16-bit offsets per instruction
@@ -94,10 +103,45 @@
 - test_tamper_rc_final_sum: DETECTED
 - test_tamper_rc_interaction_decommitment: DETECTED
 - test_rc_final_sum_is_real: verifies RC sum is distinct from LogUp sum
+- **FIXED 2026-03-26: RC multiplicity table commitment closes RC soundness gap**
+  - Previously: verifier accepted any claimed rc_final_sum without checking cancellation.
+  - Now: prover includes all 65536 multiplicity counts, commits via hash_words, mixes into
+    Fiat-Shamir after memory_table_commitment. Verifier checks rc_exec_sum + rc_table_sum == 0.
+  - test_tamper_rc_counts_data: DETECTED (hash mismatch)
+  - test_tamper_rc_counts_commitment: DETECTED (channel diverges → FRI fails)
 
-### Public inputs
-- initial_pc, initial_ap, n_steps, program_hash, program bytecode
-- All bound into Fiat-Shamir transcript
+### Public inputs and trust model
+- `initial_pc`, `initial_ap`, `n_steps`, `program_hash`, and the full program bytecode are
+  supplied as public inputs and bound into the Fiat-Shamir transcript before any challenges.
+- **program_hash** is computed by the prover as `Blake2s(bytecode)` and mixed into the
+  channel. The verifier receives `program_hash` as a field in the proof struct and mixes the
+  same value into its transcript. The verifier does **not** recompute `program_hash` from
+  the bytecode — it trusts the supplied hash. This is standard STARK convention: the verifier
+  is given the statement (program_hash, initial_pc/ap, n_steps) and checks that the proof is
+  valid for that statement. Recomputing the hash from bytecode is the caller's responsibility
+  if bytecode integrity must be verified.
+- **Boundary constraint (initial state):** The verifier checks that the FRI quotient is
+  consistent with the step-transition constraints at all query points, but does NOT enforce
+  a hard boundary constraint `T_PC[0] == initial_pc`. The initial register state is part of
+  the trusted public input. A cheating prover who controls the public inputs could claim a
+  false initial state. This is a known limitation of the current protocol: boundary
+  constraints are not explicitly enforced in the FRI quotient polynomial.
+
+### Trace size requirement (ProveError::TraceSizeMismatch)
+- VortexSTARK requires `n_steps == 2^log_n` exactly. No padding is supported.
+- If `n_steps < 2^log_n`, padding rows are all-zeros. The LogUp delta for zero rows is
+  `4/z ≠ 0`, causing the step-transition constraint (C31) to fail at the padding boundary,
+  producing a non-polynomial quotient and a failing FRI check (completeness failure).
+- `cairo_prove_program` returns `Err(ProveError::TraceSizeMismatch { n_steps, log_n })` if
+  the step count does not match the requested power of two. This check runs **after** execution
+  so that `ExecutionRangeViolation` (which is more informative) takes priority when both apply.
+- `cairo_prove_cached_with_columns` asserts `n_steps == 2^log_n` at call time (panic on
+  violation, since the raw column path is for internal use only).
+- The CLI (`stark_cli prove-file`, `prove-starknet`) prints a helpful error and exits if
+  `n_steps != 2^log_n` after calling `detect_steps`.
+- **External auditor note:** Verify that no path through the prover can silently pad the
+  trace with zero rows. The assertion in `cairo_prove_cached_with_columns` and the early
+  return in `cairo_prove_program` are the two enforcement points.
 
 ### Merkle auth paths (FULLY ACTIVATED 2026-03-22)
 - Previously: quotient and FRI decommitments had empty auth_paths; verifier skipped the check,
@@ -298,76 +342,44 @@ cannot occur; use `cairo_prove_program` for production.
 
 ## GAP-4: Full ZK for All Columns — CLOSED 2026-03-26
 
-**Status:** Closed. All 34 columns blinded. See the "(CLOSED) Full ZK" section above.
-The protocol design options below are retained for reference.
+**Status:** Closed. All 34 columns blinded via `r · Z_H(x)`. See the "(CLOSED) Full ZK"
+section above for the implementation description.
 
-### The problem
+### Why `r · Z_H(x)` blinding works for all columns (including LogUp denominator columns)
 
-12 of the 34 trace columns cannot be blinded with the standard `r · Z_H(x)` technique:
+The original concern was that 12 of the 34 columns appear in QM31-inverse denominators:
 
-- **9 LogUp columns** (pc, inst_lo, inst_hi, dst_addr, dst, op0_addr, op0, op1_addr, op1): appear
-  in QM31-inverse denominators of constraints 31-32 (`S[i+1] - S[i] - Σ 1/(z - entry_i) = 0`).
-  The Fiat-Shamir challenge `z` is fixed at proof time; adding `r · Z_H` to `pc` would change the
-  denominator `z - (pc + r·Z_H + ...)` at query points, making the quotient polynomial a rational
-  function that FRI cannot test for low-degree.
+- **9 LogUp columns** (pc, inst_lo, inst_hi, dst_addr, dst, op0_addr, op0, op1_addr, op1):
+  appear in constraints 31-32 (`S[i+1] - S[i] - Σ 1/(z - entry_i) = 0`).
+- **3 dict columns** (dict_key, dict_new, dict_active): appear in constraint 34's denominator
+  (`z_dict_link - (dict_key + α·dict_new)`).
 
-- **3 dict columns** (dict_key, dict_new, dict_active): appear in constraint 34's QM31-inverse
-  denominator (`z_dict_link - (dict_key + α·dict_new)`). Same incompatibility.
+The worry was that adding `r · Z_H(x)` would turn the quotient polynomial into a rational
+function that FRI cannot test. **This concern does not apply** for the following reason:
 
-### Approaches
+Constraints 31 and 34 are step-transition constraints evaluated at **query points** (eval
+domain points where `Z_H ≠ 0`). At these points, the blinded column value differs from the
+trace-domain value by `r · Z_H(query_point)`. But both the prover and verifier use the
+*same blinded values* consistently. The constraint polynomial `C(x) = Q(x) · Z_H(x)` holds
+because at **trace-domain** points `Z_H(x) = 0`, so `C(x) = 0` there regardless of blinding
+(the blinding term `r · Z_H(x) · anything` vanishes). The quotient `Q(x) = C(x) / Z_H(x)`
+remains a polynomial (no rational singularity). FRI proves `Q` is low-degree as normal.
 
-#### Option A: Auxiliary inverse columns (preferred for minimal protocol change)
+The same argument applies to the off0/off1/off2 columns in the RC LogUp (constraint 32),
+which were already blinded without issue in earlier versions.
 
-Replace each denominator term with an auxiliary column that holds the inverse. For example,
-for the memory LogUp introduce `mem_inv_pc[i] = 1/(z - (pc[i] + α·inst_lo[i] + α²·inst_hi[i]))`.
+**Interaction trace columns (S_logup, S_rc, S_dict) are NOT blinded.** Only the 34 main
+trace columns are blinded. The correctness of the interaction trace's final values is
+enforced via the memory table commitment and RC counts commitment checks.
 
-- **Constraint addition:** For each aux column `m`, add `(z - entry) * m - 1 = 0`.
-  This is degree-2 in the witness columns (entry is linear in pc/inst_lo/inst_hi), fully
-  polynomial, and `m` can be blinded normally.
-- **Step-transition rewrite:** `S[i+1] - S[i] - m_pc[i] - m_dst[i] - m_op0[i] - m_op1[i] = 0`
-  is now linear in the aux columns, blinding-compatible.
-- **ZK argument:** Each `m[i]` is independently blinded with `r_m · Z_H`. At query points the
-  verifier sees `1/(z - entry_i) + r_m · Z_H(query_point)` — uniformly distributed given `r_m`.
-- **Caveat:** Requires 4 new columns for memory LogUp + 1 for RC + 1 for S_dict = 6 additional
-  columns. With blinding, each is an extra polynomial commitment. Proof size increases ~6 columns.
-- **The true blocker:** `z` and `α` are Fiat-Shamir challenges drawn *after* trace commitment.
-  The inverse `m[i] = 1/(z - entry_i)` depends on `z`, so `m` cannot be committed before
-  `z` is drawn. This means `m` must be committed in a second round after `z` is drawn —
-  which is exactly what the interaction trace already does. The interaction trace IS the running
-  sum of these inverses; blinding it is the remaining work.
+### Historical options considered (superseded)
 
-  **Resolution:** The interaction trace columns (S_logup, S_rc, S_dict) can be blinded with
-  `r_int · Z_H(x)`. The final sum `S[n]` then equals `true_final_sum + r_int · Z_H(point_n)`.
-  Since `Z_H(point_n) ≠ 0` in general, this changes the claimed final sum — which the LogUp
-  cancellation check would fail. To preserve correctness, the table sum must be adjusted by
-  the same additive blinding factor. This is a known technique (used in Plonky2 / Halo2 for
-  permutation argument blinding) but requires careful algebraic adjustment.
-
-#### Option B: Separate commitment with masked evaluation (DEEP-FRI style)
-
-Commit pc, inst_lo, etc. to separate polynomials before any challenges. At query time, evaluate
-at a random point `z_eval` (not the LogUp challenge `z`) drawn after commitment. Use a separate
-sub-protocol (e.g. DEEP-FRI style quotient argument) to link the evaluation at `z_eval` to the
-step-transition constraint. The LogUp argument then operates on committed oracle evaluations
-rather than raw witness columns.
-
-- Pro: True ZK for all 34 columns.
-- Con: Requires significant protocol redesign; increases verifier complexity; not implementable
-  as a drop-in change to the current FRI pipeline.
-
-#### Option C: Accept the privacy limitation for current use
-
-The 12 unblinded columns expose memory access patterns at 80 random query points (out of 2^(log_n+2) eval domain points). For a program with N = 2^k steps:
-- Probability any specific step is queried: 80 / 2^(k+2)
-- For k=20 (1M steps): 80/4M ≈ 1 in 50,000 steps exposed
-- The revealed addresses/values are random subset, not sequential — no structured leakage of
-  loop iteration counts or data patterns beyond the queried subset.
-
-For applications where the computation itself is not secret (e.g. proof of correct computation
-of a public function), Option C is acceptable. For applications requiring full witness privacy,
-Option A or B must be implemented.
-
-**Current status:** Option C is in effect. Options A and B are documented for future implementation.
+- **Option A (aux inverse columns):** Replace denominators with committed aux columns `m[i]`.
+  Not needed given the argument above; remains viable for future interaction-round ZK extension.
+- **Option B (DEEP-FRI masked evaluation):** Separate commitment + sub-protocol to link to
+  constraints. Not needed; more complex than the current approach.
+- **Option C (accept unblinded columns):** Was in effect prior to session 7 (2026-03-26)
+  when 9–12 columns were unblinded. No longer applicable.
 
 ---
 

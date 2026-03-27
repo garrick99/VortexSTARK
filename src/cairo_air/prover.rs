@@ -54,6 +54,19 @@ pub enum ProveError {
     /// Use only programs whose runtime values stay within M31.
     ExecutionRangeViolation { count: usize },
 
+    /// n_steps is not equal to 2^log_n.
+    ///
+    /// VortexSTARK requires the trace to be fully populated: n_steps must equal exactly 2^log_n.
+    /// When n_steps < 2^log_n, padding rows are all-zero, which causes the LogUp and Cairo
+    /// step-transition constraints to fail at the padding boundary, producing an invalid quotient
+    /// polynomial that FRI rejects. There is no silent failure — this error is returned so callers
+    /// can correct the mismatch before proving.
+    ///
+    /// Fix: choose log_n = ceil(log2(n_steps)) and pad the program to run exactly 2^log_n steps
+    /// (e.g. append a self-loop that runs the remaining steps), or structure the program so that
+    /// its step count is always a power of two.
+    TraceSizeMismatch { n_steps: usize, log_n: u32 },
+
     /// The requested log_n requires more VRAM than is currently free on the GPU.
     /// Peak VRAM during NTT = N_COLS × 4 × eval_size bytes (all eval columns live simultaneously).
     /// Fix: lower log_n, free GPU memory held by other processes, or use a larger GPU.
@@ -72,6 +85,12 @@ impl std::fmt::Display for ProveError {
             ProveError::ExecutionRangeViolation { count } =>
                 write!(f, "{count} data value(s) read during execution exceeded M31 (P = 2^31-1); \
                            these would be silently truncated — program must use only M31 arithmetic"),
+            ProveError::TraceSizeMismatch { n_steps, log_n } =>
+                write!(f, "n_steps ({n_steps}) ≠ 2^log_n ({}): trace padding is unsupported — \
+                           ensure n_steps == 2^log_n by choosing log_n = {} and padding the program \
+                           to run exactly that many steps",
+                    1usize << log_n,
+                    (*n_steps as f64).log2().ceil() as u32),
             ProveError::InsufficientVRAM { required_gb, free_gb } =>
                 write!(f, "insufficient VRAM: proof needs {required_gb:.1} GB but only {free_gb:.1} GB \
                            is free — lower log_n, stop other GPU processes, or use a larger GPU"),
@@ -277,6 +296,34 @@ pub struct CairoProof {
     /// All bitwise invocations: each entry is [x, y, x&y, x^y, x|y].
     /// Verifier checks C0 and C1 for every row.
     pub bitwise_rows: Vec<[u32; 5]>,
+
+    // ---- Memory table commitment (closes LogUp soundness gap) ----
+    //
+    // The prover includes the full memory table (all unique (addr, val, mult) entries)
+    // as explicit proof data, committed via Blake2s before constraint_alphas are drawn.
+    // The verifier independently recomputes the Blake2s hash, then computes table_sum
+    // and checks: exec_sum + table_sum == 0.
+    //
+    // This mirrors the dict sub-AIR approach and the bitwise commitment pattern,
+    // closing the gap where the verifier previously accepted any claimed exec_sum.
+
+    /// Blake2s commitment to memory_table_data ++ memory_instr_data (mixed into Fiat-Shamir).
+    pub memory_table_commitment: [u32; 8],
+    /// Unique data memory entries from execution: [addr, val, mult] per entry.
+    pub memory_table_data: Vec<[u32; 3]>,
+    /// Unique instruction fetch entries from execution: [pc, inst_lo, inst_hi, mult] per entry.
+    pub memory_instr_data: Vec<[u32; 4]>,
+
+    // ---- RC multiplicity table commitment (closes RC soundness gap) ----
+    //
+    // The prover includes all 65536 multiplicity counts for range check values 0..2^16.
+    // The verifier recomputes the Blake2s hash, then computes rc_table_sum and checks:
+    // rc_exec_sum + rc_table_sum == 0.
+
+    /// Blake2s commitment to rc_counts_data (mixed into Fiat-Shamir after memory_table_commitment).
+    pub rc_counts_commitment: [u32; 8],
+    /// Multiplicity counts for range check values 0..2^16 (65536 entries).
+    pub rc_counts_data: Vec<u32>,
 }
 
 
@@ -334,13 +381,13 @@ pub fn cairo_prove_program(
         return Err(ProveError::Felt252Overflow { count: program.overflow_count });
     }
 
+    let n = 1usize << log_n;
+
     // ── Height check: can the GPU fit this proof? ──────────────────────────
     // Allocate the twiddle caches first so that vram_query() reflects their
     // footprint; the remaining free VRAM is what the NTT loop needs.
     let cache = CairoProverCache::new(log_n);
     cairo_check_vram(log_n)?;
-    let n = 1usize << log_n;
-    assert!(n_steps <= n);
 
     // Set up the Cairo calling convention: place a return sentinel (pc=0, fp=0) below the
     // initial frame so that the program's top-level `ret` instruction halts cleanly.
@@ -364,6 +411,16 @@ pub fn cairo_prove_program(
     // a different computation. Closing GAP-2: reject at prove time rather than silently mismatch.
     if hint_ctx.execution_overflows > 0 {
         return Err(ProveError::ExecutionRangeViolation { count: hint_ctx.execution_overflows });
+    }
+
+    // ── Trace size check ─────────────────────────────────────────────────────
+    // n_steps must exactly equal 2^log_n. Padding (n_steps < 2^log_n) is not supported:
+    // all-zero padding rows violate the LogUp and Cairo step-transition constraints at
+    // the boundary, producing a non-polynomial quotient that FRI rejects.
+    // Checked after execution (and after overflow detection) so that ExecutionRangeViolation
+    // takes priority — both represent invalid programs, but overflow is more informative.
+    if n_steps != n {
+        return Err(ProveError::TraceSizeMismatch { n_steps, log_n });
     }
 
     // Verify dict access chain consistency (CPU-side check).
@@ -437,7 +494,14 @@ fn cairo_prove_cached_with_columns(
     bitwise_rows: Vec<[u32; 5]>,
 ) -> CairoProof {
     let n = 1usize << log_n;
-    assert!(n_steps <= n);
+    // n_steps MUST equal n exactly. When n_steps < n, padding rows are all-zero which violates
+    // the LogUp and Cairo step-transition constraints at the boundary, producing a non-polynomial
+    // quotient that FRI rejects. Use ProveError::TraceSizeMismatch on the public API instead of
+    // panicking here — internal callers already check at the public boundary.
+    assert_eq!(n_steps, n,
+        "VortexSTARK: n_steps ({n_steps}) must equal 2^log_n ({n}). \
+         Padding is not supported — ensure the program runs for exactly 2^log_n steps. \
+         See ProveError::TraceSizeMismatch.");
     assert_eq!(cache.log_n, log_n);
     let log_eval_size = log_n + BLOWUP_BITS;
     let eval_size = 1usize << log_eval_size;
@@ -514,8 +578,6 @@ fn cairo_prove_cached_with_columns(
     // This is O(n_steps) bit manipulation — fast even at log_n=26.
     let (rc_offsets, rc_counts) = extract_offsets(&columns, n_steps);
 
-    let t_ntt = std::time::Instant::now();
-
     // ---- Group-batched NTT + ZK Blinding + Commit ────────────────────────
     //
     // Instead of computing all N_COLS eval columns simultaneously (which peaks at
@@ -576,7 +638,7 @@ fn cairo_prove_cached_with_columns(
     };
 
     // ── Group A: cols 0..TRACE_LO ──────────────────────────────────────────
-    let (trace_commitment, host_eval_lo): ([u32; 8], Vec<Vec<u32>>) = {
+    let (trace_commitment, tile_roots_lo, host_eval_lo): ([u32; 8], Vec<[u32; 8]>, Vec<Vec<u32>>) = {
         let mut group: Vec<DeviceBuffer<u32>> = (0..TRACE_LO)
             .map(|c| ntt_col(&columns[c]))
             .collect();
@@ -586,14 +648,13 @@ fn cairo_prove_cached_with_columns(
             }
         }
         unsafe { ffi::cuda_device_sync(); }
-        let root = MerkleTree::commit_root_only(&group, log_eval_size);
+        let (root, tile_roots) = MerkleTree::commit_root_only_with_subtrees(&group, log_eval_size);
         let host: Vec<Vec<u32>> = group.iter().map(|c| c.to_host_fast()).collect();
-        (root, host)
-        // group (GPU buffers) freed here
+        (root, tile_roots, host)
     };
 
     // ── Group B: cols TRACE_LO..TRACE_VM_END (15 Cairo VM hi cols) ─────────
-    let (trace_commitment_hi, host_eval_hi): ([u32; 8], Vec<Vec<u32>>) = {
+    let (trace_commitment_hi, tile_roots_hi, host_eval_hi): ([u32; 8], Vec<[u32; 8]>, Vec<Vec<u32>>) = {
         let mut group: Vec<DeviceBuffer<u32>> = (TRACE_LO..TRACE_VM_END)
             .map(|c| ntt_col(&columns[c]))
             .collect();
@@ -604,16 +665,13 @@ fn cairo_prove_cached_with_columns(
             }
         }
         unsafe { ffi::cuda_device_sync(); }
-        let root = MerkleTree::commit_root_only(&group, log_eval_size);
+        let (root, tile_roots) = MerkleTree::commit_root_only_with_subtrees(&group, log_eval_size);
         let host: Vec<Vec<u32>> = group.iter().map(|c| c.to_host_fast()).collect();
-        (root, host)
-        // group (GPU buffers) freed here
+        (root, tile_roots, host)
     };
 
     // ── Group C: cols TRACE_VM_END..N_COLS (3 dict linkage cols) ───────────
-    // dict_key (31), dict_new (32), dict_active (33).
-    // All three are ZK-blinded (same as Group A/B — see ZK_BLIND_COLS comment).
-    let (dict_trace_commitment, host_eval_dict): ([u32; 8], Vec<Vec<u32>>) = {
+    let (dict_trace_commitment, tile_roots_dict, host_eval_dict): ([u32; 8], Vec<[u32; 8]>, Vec<Vec<u32>>) = {
         let mut group: Vec<DeviceBuffer<u32>> = (TRACE_VM_END..N_COLS)
             .map(|c| ntt_col(&columns[c]))
             .collect();
@@ -624,10 +682,9 @@ fn cairo_prove_cached_with_columns(
             }
         }
         unsafe { ffi::cuda_device_sync(); }
-        let root = MerkleTree::commit_root_only(&group, log_eval_size);
+        let (root, tile_roots) = MerkleTree::commit_root_only_with_subtrees(&group, log_eval_size);
         let host: Vec<Vec<u32>> = group.iter().map(|c| c.to_host_fast()).collect();
-        (root, host)
-        // group (GPU buffers) freed here
+        (root, tile_roots, host)
     };
 
     drop(d_zh);
@@ -638,8 +695,6 @@ fn cairo_prove_cached_with_columns(
     host_eval_cols.extend(host_eval_lo);
     host_eval_cols.extend(host_eval_hi);
     host_eval_cols.extend(host_eval_dict);
-
-    let _ntt_ms = t_ntt.elapsed().as_secs_f64() * 1000.0;
 
     let mut channel = Channel::new();
     channel.mix_digest(&public_inputs.program_hash);
@@ -697,12 +752,10 @@ fn cairo_prove_cached_with_columns(
     }
     let [d_sdict0, d_sdict1, d_sdict2, d_sdict3] = d_sdict_gpu;
 
-    let dict_main_interaction_commitment = MerkleTree::commit_root_soa4(
+    let (dict_main_interaction_commitment, tile_roots_sdict) = MerkleTree::commit_root_soa4_with_subtrees(
         &d_sdict0, &d_sdict1, &d_sdict2, &d_sdict3, log_eval_size,
     );
     channel.mix_digest(&dict_main_interaction_commitment);
-    // Bind S_dict_final into Fiat-Shamir — prover commits to the claimed final sum.
-    // The verifier independently recomputes exec_key_new_sum and checks equality.
     channel.mix_digest(&[
         dict_link_final_arr[0], dict_link_final_arr[1],
         dict_link_final_arr[2], dict_link_final_arr[3],
@@ -890,12 +943,11 @@ fn cairo_prove_cached_with_columns(
     let (mut logup_trace_cols, logup_final_qm31) =
         compute_interaction_trace(&columns, n_steps, z_mem, alpha_mem);
 
-    // Assert memory LogUp cancellation: exec_sum + table_sum == 0.
-    // Matches the RC cancellation check (rc_exec_sum + rc_table_sum == 0) already in place.
-    // This ensures the interaction trace is correct before committing to it.
+    // Extract memory table (needed both for the cancellation assert and for the
+    // memory_table_commitment that is mixed into Fiat-Shamir before constraint_alphas).
+    let (mem_data_table, mem_instr_table) = extract_memory_table(&columns, n_steps);
     {
-        let (data_table, instr_table) = extract_memory_table(&columns, n_steps);
-        let table_sum = compute_memory_table_sum(&data_table, &instr_table, z_mem, alpha_mem);
+        let table_sum = compute_memory_table_sum(&mem_data_table, &mem_instr_table, z_mem, alpha_mem);
         assert_eq!(logup_final_qm31 + table_sum, QM31::ZERO,
             "memory LogUp sums don't cancel — execution trace or memory table is inconsistent");
     }
@@ -938,12 +990,11 @@ fn cairo_prove_cached_with_columns(
         rc_trace_cols[c].resize(n, last);
     }
 
-    let interaction_commitment = MerkleTree::commit_root_soa4(
+    let (interaction_commitment, tile_roots_logup) = MerkleTree::commit_root_soa4_with_subtrees(
         &d_logup0, &d_logup1, &d_logup2, &d_logup3, log_eval_size,
     );
     channel.mix_digest(&interaction_commitment);
     // Download LogUp interaction trace to host for decommitment at query points.
-    // Kept alive until after query indices are derived (from FRI last layer).
     let host_logup: [Vec<u32>; 4] = [
         d_logup0.to_host(), d_logup1.to_host(),
         d_logup2.to_host(), d_logup3.to_host(),
@@ -951,8 +1002,6 @@ fn cairo_prove_cached_with_columns(
     drop(d_logup0); drop(d_logup1); drop(d_logup2); drop(d_logup3);
 
     // Commit the RC interaction trace polynomial: NTT to eval domain, Merkle commit.
-    // This binds the prover to a specific RC trace BEFORE constraint alphas are drawn,
-    // closing the gap where rc_final_sum was previously an unconstrained claim.
     let mut rc_d_eval: [DeviceBuffer<u32>; 4] = std::array::from_fn(|_| DeviceBuffer::<u32>::alloc(0));
     for c in 0..4usize {
         let mut d_col = DeviceBuffer::from_host(&rc_trace_cols[c]);
@@ -963,11 +1012,10 @@ fn cairo_prove_cached_with_columns(
         ntt::evaluate(&mut d_eval, &cache.fwd_cache);
         rc_d_eval[c] = d_eval;
     }
-    let rc_interaction_commitment = MerkleTree::commit_root_soa4(
+    let (rc_interaction_commitment, tile_roots_rc) = MerkleTree::commit_root_soa4_with_subtrees(
         &rc_d_eval[0], &rc_d_eval[1], &rc_d_eval[2], &rc_d_eval[3], log_eval_size,
     );
     channel.mix_digest(&rc_interaction_commitment);
-    // Download RC interaction trace to host for decommitment at query points.
     let host_rc_logup: [Vec<u32>; 4] = [
         rc_d_eval[0].to_host(), rc_d_eval[1].to_host(),
         rc_d_eval[2].to_host(), rc_d_eval[3].to_host(),
@@ -996,6 +1044,28 @@ fn cairo_prove_cached_with_columns(
     } else {
         None
     };
+
+    // ---- Memory table commitment (closes LogUp soundness gap) ----
+    // Serialize memory table as flat u32 array, hash it, and mix into Fiat-Shamir.
+    // This commits the prover to a specific memory table BEFORE constraint_alphas are drawn.
+    // The verifier independently recomputes this hash and checks exec_sum + table_sum == 0.
+    let memory_table_data: Vec<[u32; 3]> = mem_data_table.iter()
+        .map(|&(addr, val, mult)| [addr.0, val.0, mult])
+        .collect();
+    let memory_instr_data: Vec<[u32; 4]> = mem_instr_table.iter()
+        .map(|&(pc, lo, hi, mult)| [pc.0, lo.0, hi.0, mult])
+        .collect();
+    let mem_flat: Vec<u32> = memory_table_data.iter()
+        .flat_map(|&[a, v, m]| [a, v, m])
+        .chain(memory_instr_data.iter().flat_map(|&[p, lo, hi, m]| [p, lo, hi, m]))
+        .collect();
+    let memory_table_commitment = crate::channel::hash_words(&mem_flat);
+    channel.mix_digest(&memory_table_commitment);
+
+    // ---- RC counts commitment (closes RC soundness gap) ----
+    let rc_counts_data: Vec<u32> = rc_counts.to_vec();
+    let rc_counts_commitment = crate::channel::hash_words(&rc_counts_data);
+    channel.mix_digest(&rc_counts_commitment);
 
     // ---- Phase 3: Quotient ----
     let constraint_alphas: Vec<QM31> = (0..N_CONSTRAINTS).map(|_| channel.draw_felt()).collect();
@@ -1082,7 +1152,8 @@ fn cairo_prove_cached_with_columns(
     drop(d_col_ptrs);
     drop(d_alpha);
 
-    let quotient_commitment = MerkleTree::commit_root_soa4(&q0, &q1, &q2, &q3, log_eval_size);
+    let (quotient_commitment, tile_roots_quotient) =
+        MerkleTree::commit_root_soa4_with_subtrees(&q0, &q1, &q2, &q3, log_eval_size);
     channel.mix_digest(&quotient_commitment);
 
     // Download quotient to host for sparse extraction (replaces clone_device).
@@ -1172,24 +1243,27 @@ fn cairo_prove_cached_with_columns(
         let n_q = query_indices.len();
 
         // lo: cols 0..TRACE_LO
-        let lo_paths = MerkleTree::cpu_merkle_auth_paths_ncols(
+        let lo_paths = MerkleTree::cpu_merkle_auth_paths_ncols_with_tile_roots(
             &host_eval_cols[..TRACE_LO],
+            &tile_roots_lo,
             &all_indices,
         );
         let paths_lo_qi:  Vec<Vec<[u32; 8]>> = lo_paths[..n_q].to_vec();
         let paths_lo_qi1: Vec<Vec<[u32; 8]>> = lo_paths[n_q..].to_vec();
 
         // hi: cols TRACE_LO..TRACE_VM_END (16..31 = 15 Cairo VM hi cols)
-        let hi_paths = MerkleTree::cpu_merkle_auth_paths_ncols(
+        let hi_paths = MerkleTree::cpu_merkle_auth_paths_ncols_with_tile_roots(
             &host_eval_cols[TRACE_LO..TRACE_VM_END],
+            &tile_roots_hi,
             &all_indices,
         );
         let paths_hi_qi:  Vec<Vec<[u32; 8]>> = hi_paths[..n_q].to_vec();
         let paths_hi_qi1: Vec<Vec<[u32; 8]>> = hi_paths[n_q..].to_vec();
 
         // dict: cols TRACE_VM_END..N_COLS (31..34 = 3 dict linkage cols)
-        let dict_paths = MerkleTree::cpu_merkle_auth_paths_ncols(
+        let dict_paths = MerkleTree::cpu_merkle_auth_paths_ncols_with_tile_roots(
             &host_eval_cols[TRACE_VM_END..N_COLS],
+            &tile_roots_dict,
             &all_indices,
         );
         let paths_dict_qi:  Vec<Vec<[u32; 8]>> = dict_paths[..n_q].to_vec();
@@ -1244,28 +1318,28 @@ fn cairo_prove_cached_with_columns(
     // Generate quotient decommitment with real Merkle auth paths.
     let quotient_decommitment = {
         let cols = [host_q0, host_q1, host_q2, host_q3]; // moves Vecs
-        let decom = decommit_from_host_soa4(&cols, &query_indices);
+        let decom = decommit_from_host_soa4(&cols, &tile_roots_quotient, &query_indices);
         decom
     };
 
     // LogUp interaction trace decommitment — binds interaction trace values at query
     // points to interaction_commitment (prerequisite for step transition verification).
-    let interaction_decommitment = decommit_from_host_soa4(&host_logup, &query_indices);
+    let interaction_decommitment = decommit_from_host_soa4(&host_logup, &tile_roots_logup, &query_indices);
     // Next-row decommitment — needed by verifier to check S[i+1] - S[i] = delta(row_i).
     let next_query_indices: Vec<usize> = query_indices.iter()
         .map(|&qi| (qi + 1) % eval_size)
         .collect();
-    let interaction_decommitment_next = decommit_from_host_soa4(&host_logup, &next_query_indices);
+    let interaction_decommitment_next = decommit_from_host_soa4(&host_logup, &tile_roots_logup, &next_query_indices);
     drop(host_logup);
 
     // RC interaction trace decommitment — same structure as LogUp.
-    let rc_interaction_decommitment = decommit_from_host_soa4(&host_rc_logup, &query_indices);
-    let rc_interaction_decommitment_next = decommit_from_host_soa4(&host_rc_logup, &next_query_indices);
+    let rc_interaction_decommitment = decommit_from_host_soa4(&host_rc_logup, &tile_roots_rc, &query_indices);
+    let rc_interaction_decommitment_next = decommit_from_host_soa4(&host_rc_logup, &tile_roots_rc, &next_query_indices);
     drop(host_rc_logup);
 
     // S_dict interaction trace decommitment at query points and query+1 points.
-    let dict_main_interaction_decommitment = decommit_from_host_soa4(&host_sdict, &query_indices);
-    let dict_main_interaction_decommitment_next = decommit_from_host_soa4(&host_sdict, &next_query_indices);
+    let dict_main_interaction_decommitment = decommit_from_host_soa4(&host_sdict, &tile_roots_sdict, &query_indices);
+    let dict_main_interaction_decommitment_next = decommit_from_host_soa4(&host_sdict, &tile_roots_sdict, &next_query_indices);
     drop(host_sdict);
 
     // Dict sub-AIR: full trace data is included in the proof (dict_exec_data_opt /
@@ -1283,7 +1357,6 @@ fn cairo_prove_cached_with_columns(
         fri_decommitments.push(decom);
         folded_indices = folded_indices.iter().map(|&i| i / 2).collect();
     }
-
     CairoProof {
         log_trace_size: log_n,
         public_inputs,
@@ -1336,6 +1409,11 @@ fn cairo_prove_cached_with_columns(
         dict_sorted_data: dict_sorted_data_opt.unwrap_or_default(),
         bitwise_commitment: bitwise_commitment_opt,
         bitwise_rows,
+        memory_table_commitment,
+        memory_table_data,
+        memory_instr_data,
+        rc_counts_commitment,
+        rc_counts_data,
     }
 }
 
@@ -1584,6 +1662,63 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
         }
     } else if proof.bitwise_commitment.is_some() {
         return Err("bitwise_commitment present but bitwise_rows is empty".into());
+    }
+
+    // ---- Memory table commitment verification (closes LogUp soundness gap) ----
+    // Recompute Blake2s hash from proof data, verify it matches the committed value,
+    // then independently compute table_sum and check exec_sum + table_sum == 0.
+    {
+        let mem_flat: Vec<u32> = proof.memory_table_data.iter()
+            .flat_map(|&[a, v, m]| [a, v, m])
+            .chain(proof.memory_instr_data.iter().flat_map(|&[p, lo, hi, m]| [p, lo, hi, m]))
+            .collect();
+        let recomputed = crate::channel::hash_words(&mem_flat);
+        if recomputed != proof.memory_table_commitment {
+            return Err(format!(
+                "Memory table commitment mismatch: committed {:?} ≠ recomputed {:?}",
+                proof.memory_table_commitment, recomputed));
+        }
+        channel.mix_digest(&proof.memory_table_commitment);
+
+        let data_entries: Vec<(M31, M31, u32)> = proof.memory_table_data.iter()
+            .map(|&[a, v, m]| (M31(a), M31(v), m)).collect();
+        let instr_entries: Vec<(M31, M31, M31, u32)> = proof.memory_instr_data.iter()
+            .map(|&[p, lo, hi, m]| (M31(p), M31(lo), M31(hi), m)).collect();
+        let table_sum = compute_memory_table_sum(&data_entries, &instr_entries, _z_mem, _alpha_mem);
+        let exec_sum = QM31::from_u32_array(proof.logup_final_sum);
+        if exec_sum + table_sum != QM31::ZERO {
+            return Err(format!(
+                "LogUp memory cancellation failed: exec_sum + table_sum = {:?} (expected zero)",
+                (exec_sum + table_sum).to_u32_array()));
+        }
+    }
+
+    // ---- RC counts commitment verification (closes RC soundness gap) ----
+    {
+        let recomputed = crate::channel::hash_words(&proof.rc_counts_data);
+        if recomputed != proof.rc_counts_commitment {
+            return Err(format!(
+                "RC counts commitment mismatch: committed {:?} ≠ recomputed {:?}",
+                proof.rc_counts_commitment, recomputed));
+        }
+        channel.mix_digest(&proof.rc_counts_commitment);
+
+        use super::range_check::RC_TABLE_SIZE;
+        if proof.rc_counts_data.len() != RC_TABLE_SIZE {
+            return Err(format!(
+                "RC counts data wrong length: {} ≠ {RC_TABLE_SIZE}",
+                proof.rc_counts_data.len()));
+        }
+        let rc_counts_arr: [u32; RC_TABLE_SIZE] = proof.rc_counts_data.as_slice()
+            .try_into()
+            .map_err(|_| "RC counts data wrong length".to_string())?;
+        let rc_table_sum = compute_rc_table_sum(&rc_counts_arr, _z_rc);
+        let rc_exec_sum = QM31::from_u32_array(proof.rc_final_sum);
+        if rc_exec_sum + rc_table_sum != QM31::ZERO {
+            return Err(format!(
+                "RC LogUp cancellation failed: rc_exec_sum + rc_table_sum = {:?} (expected zero)",
+                (rc_exec_sum + rc_table_sum).to_u32_array()));
+        }
     }
 
     let constraint_alphas_drawn: Vec<QM31> = (0..N_CONSTRAINTS).map(|_| channel.draw_felt()).collect();
@@ -2228,8 +2363,11 @@ fn verify_decommitment_auth_paths_soa4(
 
 // ---- Decommitment helpers ----
 
+/// Decommit 4 SoA columns at the given query indices using pre-computed GPU tile roots.
+/// O(n_queries × TILE_SIZE) instead of O(n) — avoids full tree rebuild on CPU.
 fn decommit_from_host_soa4(
     host_cols: &[Vec<u32>],  // [4] columns
+    tile_roots: &[[u32; 8]],
     indices: &[usize],
 ) -> QueryDecommitment<[u32; 4]> {
     let n = host_cols[0].len();
@@ -2255,12 +2393,17 @@ fn decommit_from_host_soa4(
         ]);
     }
 
-    // Generate Merkle auth paths for both values and siblings
+    // Use pre-computed tile roots to skip the O(n) tree rebuild.
     let cols4: [Vec<u32>; 4] = [
         host_cols[0].clone(), host_cols[1].clone(),
         host_cols[2].clone(), host_cols[3].clone(),
     ];
-    let all_paths = MerkleTree::cpu_merkle_auth_paths_soa4(&cols4, &all_indices);
+    let hash_leaf = |i: usize| MerkleTree::hash_leaf(&[
+        cols4[0][i], cols4[1][i], cols4[2][i], cols4[3][i],
+    ]);
+    let all_paths = MerkleTree::targeted_auth_paths_with_tile_roots(
+        tile_roots, n, &all_indices, &hash_leaf,
+    );
 
     let mut auth_paths = Vec::with_capacity(indices.len());
     let mut sibling_auth_paths = Vec::with_capacity(indices.len());
@@ -2277,7 +2420,12 @@ fn decommit_fri_layer(
     indices: &[usize],
 ) -> QueryDecommitment<[u32; 4]> {
     let host_cols: Vec<Vec<u32>> = eval.cols.iter().map(|c| c.to_host()).collect();
-    decommit_from_host_soa4(&host_cols, indices)
+    // Get tile roots from the GPU commit (same tree as was committed during FRI folding).
+    let (_root, tile_roots) = MerkleTree::commit_root_soa4_with_subtrees(
+        &eval.cols[0], &eval.cols[1], &eval.cols[2], &eval.cols[3],
+        (eval.len.trailing_zeros()) as u32,
+    );
+    decommit_from_host_soa4(&host_cols, &tile_roots, indices)
 }
 
 #[cfg(test)]
@@ -3380,5 +3528,64 @@ mod tests {
         }
         let result = cairo_verify(&proof);
         assert!(result.is_err(), "corrupted bitwise commitment must be rejected");
+    }
+
+    #[test]
+    fn test_tamper_memory_table_data() {
+        // Corrupt memory_table_data — commitment recomputation will mismatch.
+        ffi::init_memory_pool();
+        let program = build_fib_program(64);
+        let mut proof = cairo_prove(&program, 64, 6);
+        if !proof.memory_table_data.is_empty() {
+            proof.memory_table_data[0][2] = proof.memory_table_data[0][2].wrapping_add(1);
+        }
+        let result = cairo_verify(&proof);
+        assert!(result.is_err(), "Tampered memory_table_data should fail commitment check");
+    }
+
+    #[test]
+    fn test_tamper_memory_table_commitment() {
+        // Corrupt the memory_table_commitment hash — channel replay diverges, breaking FRI.
+        ffi::init_memory_pool();
+        let program = build_fib_program(64);
+        let mut proof = cairo_prove(&program, 64, 6);
+        proof.memory_table_commitment[0] ^= 1;
+        let result = cairo_verify(&proof);
+        assert!(result.is_err(), "Corrupted memory_table_commitment should be rejected");
+    }
+
+    #[test]
+    fn test_tamper_logup_cancellation() {
+        // Corrupt logup_final_sum to a wrong value while keeping memory_table_data honest.
+        // The cancellation check (exec_sum + table_sum == 0) must catch this.
+        ffi::init_memory_pool();
+        let program = build_fib_program(64);
+        let mut proof = cairo_prove(&program, 64, 6);
+        // Flip a bit in exec_sum — cancellation will fail.
+        proof.logup_final_sum[0] ^= 0xFF;
+        let result = cairo_verify(&proof);
+        assert!(result.is_err(), "Corrupted logup_final_sum should fail cancellation check");
+    }
+
+    #[test]
+    fn test_tamper_rc_counts_data() {
+        // Corrupt rc_counts_data — commitment recomputation will mismatch.
+        ffi::init_memory_pool();
+        let program = build_fib_program(64);
+        let mut proof = cairo_prove(&program, 64, 6);
+        proof.rc_counts_data[0] = proof.rc_counts_data[0].wrapping_add(1);
+        let result = cairo_verify(&proof);
+        assert!(result.is_err(), "Tampered rc_counts_data should fail commitment check");
+    }
+
+    #[test]
+    fn test_tamper_rc_counts_commitment() {
+        // Corrupt the rc_counts_commitment hash — channel replay diverges, breaking FRI.
+        ffi::init_memory_pool();
+        let program = build_fib_program(64);
+        let mut proof = cairo_prove(&program, 64, 6);
+        proof.rc_counts_commitment[0] ^= 1;
+        let result = cairo_verify(&proof);
+        assert!(result.is_err(), "Corrupted rc_counts_commitment should be rejected");
     }
 }

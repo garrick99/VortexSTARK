@@ -80,6 +80,27 @@ impl Channel {
     }
 }
 
+/// Commitment hash for an arbitrary-length u32 slice.
+///
+/// Processes data in 8-word (32-byte) chunks using `Channel::mix_digest` in sequence,
+/// then returns the final channel state as [u32; 8].
+///
+/// This is used to commit large data arrays (memory table, RC counts) into the
+/// Fiat-Shamir transcript before FRI challenges are drawn.
+pub fn hash_words(words: &[u32]) -> [u32; 8] {
+    let mut ch = Channel::new();
+    for chunk in words.chunks(8) {
+        let mut buf = [0u32; 8];
+        buf[..chunk.len()].copy_from_slice(chunk);
+        ch.mix_digest(&buf);
+    }
+    let mut out = [0u32; 8];
+    for (i, b) in ch.state.chunks_exact(4).enumerate() {
+        out[i] = u32::from_le_bytes(b.try_into().unwrap());
+    }
+    out
+}
+
 /// Blake2s hash with domain separation for internal Merkle nodes.
 /// Identical to `blake2s_hash` except h[6] is XORed with 0x01 (personalization).
 pub(crate) fn blake2s_hash_node(input: &[u8]) -> [u8; 32] {
