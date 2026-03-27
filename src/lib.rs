@@ -14,3 +14,4 @@ pub mod cairo_air;
 pub mod prover;
 pub mod verifier;
 pub mod oods;
+pub mod stark252;

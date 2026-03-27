@@ -123,6 +123,9 @@ impl Channel {
         tz >= pow_bits
     }
 
+    /// Expose raw 32-byte squeeze for Stark252 field element generation.
+    pub fn squeeze_raw(&mut self) -> [u8; 32] { self.squeeze() }
+
     fn squeeze(&mut self) -> [u8; 32] {
         let mut input = [0u8; 40];
         input[..32].copy_from_slice(&self.state);
@@ -155,13 +158,13 @@ pub fn hash_words(words: &[u32]) -> [u32; 8] {
 
 /// Blake2s hash with domain separation for internal Merkle nodes.
 /// Identical to `blake2s_hash` except h[6] is XORed with 0x01 (personalization).
-pub(crate) fn blake2s_hash_node(input: &[u8]) -> [u8; 32] {
+pub fn blake2s_hash_node(input: &[u8]) -> [u8; 32] {
     blake2s_hash_domain(input, 0x01)
 }
 
 /// Minimal Blake2s hash (single block, up to 64 bytes input).
 /// Used for leaf hashing and Fiat-Shamir (domain = 0x00, no personalization change).
-pub(crate) fn blake2s_hash(input: &[u8]) -> [u8; 32] {
+pub fn blake2s_hash(input: &[u8]) -> [u8; 32] {
     blake2s_hash_domain(input, 0x00)
 }
 

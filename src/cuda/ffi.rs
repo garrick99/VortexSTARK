@@ -206,6 +206,22 @@ unsafe extern "C" {
     pub fn cuda_device_sync();
 }
 
+// Stark252 NTT kernels (SoA layout: 4*n u64s per array, one block per limb)
+unsafe extern "C" {
+    /// Forward NTT over Stark252. d_data and d_tw are SoA u64 device pointers.
+    /// d_data: 4*n u64s (modified in-place). d_tw: 4*(n/2) u64s of twiddles ω_N^j.
+    pub fn cuda_stark252_ntt_forward(d_data: *mut u64, d_tw: *const u64, log_n: u32);
+
+    /// Inverse NTT over Stark252 (includes 1/N scaling).
+    /// d_inv_n: pointer to 4 u64s representing 1/N in standard form.
+    pub fn cuda_stark252_ntt_inverse(
+        d_data: *mut u64,
+        d_tw: *const u64,
+        log_n: u32,
+        d_inv_n: *const u64,
+    );
+}
+
 // Stwo-compatible Circle NTT kernels (flat twiddle format)
 unsafe extern "C" {
     /// Forward NTT using stwo's flat twiddle buffer.
