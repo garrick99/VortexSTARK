@@ -181,6 +181,10 @@ pub struct CairoProof {
     pub ec_trace_auth_paths_hi_next: Vec<Vec<[u32; 8]>>,
     /// Merkle root: combined quotient (4 QM31 columns)
     pub quotient_commitment: [u32; 8],
+    /// Merkle commitment to the OODS quotient polynomial (FRI input).
+    /// Committed after the OODS block so the channel state includes it before fri_alpha.
+    #[serde(default)]
+    pub oods_quotient_commitment: [u32; 8],
     /// FRI layer commitments
     pub fri_commitments: Vec<[u32; 8]>,
     /// Final FRI polynomial (2^3 = 8 QM31 values)
@@ -212,6 +216,9 @@ pub struct CairoProof {
     pub rc_final_sum: [u32; 4],
     /// Decommitments (with Merkle auth paths)
     pub quotient_decommitment: QueryDecommitment<[u32; 4]>,
+    /// Decommitment for the OODS quotient polynomial at FRI query points.
+    #[serde(default)]
+    pub oods_quotient_decommitment: QueryDecommitment<[u32; 4]>,
     pub fri_decommitments: Vec<QueryDecommitment<[u32; 4]>>,
     /// LogUp interaction trace at query points, auth-path-bound to interaction_commitment.
     pub interaction_decommitment: QueryDecommitment<[u32; 4]>,
@@ -351,6 +358,14 @@ pub struct CairoProof {
     /// Evaluations of all 34 trace columns at z_next = z * step (next-row OODS point).
     #[serde(default)]
     pub oods_trace_at_z_next: Vec<[u32; 4]>,
+    /// Evaluations of the 4 AIR quotient columns (q0..q3) at z.
+    /// Each qk is an M31-valued polynomial evaluated at the QM31 OODS point z.
+    #[serde(default)]
+    pub oods_quotient_at_z: [[u32; 4]; 4],
+    /// OODS linear combination alpha, drawn after all sampled_values are mixed into channel.
+    /// Used to combine all (column, sample_point) pairs into the OODS quotient polynomial for FRI.
+    #[serde(default)]
+    pub oods_alpha: [u32; 4],
 }
 
 
@@ -359,6 +374,9 @@ pub struct CairoProverCache {
     pub log_n: u32,
     pub inv_cache: InverseTwiddleCache,
     pub fwd_cache: ForwardTwiddleCache,
+    /// Inverse twiddles for the eval domain — used to INTT the AIR quotient polynomial
+    /// back to coefficient form for OODS evaluation at the QM31 point z.
+    pub eval_inv_cache: InverseTwiddleCache,
 }
 
 impl CairoProverCache {
@@ -370,6 +388,7 @@ impl CairoProverCache {
             log_n,
             inv_cache: InverseTwiddleCache::new(&trace_domain),
             fwd_cache: ForwardTwiddleCache::new(&eval_domain),
+            eval_inv_cache: InverseTwiddleCache::new(&eval_domain),
         }
     }
 }
@@ -1241,58 +1260,225 @@ fn cairo_prove_cached_with_columns(
     let host_q3 = q3.to_host_fast();
 
     // ---- OODS: Out-Of-Domain Sampling (stwo wire format) ----
-    // Draw OODS point z after ALL polynomial commitments are in channel.
-    // Evaluate each of the 34 trace columns at z and z_next = z * step.
-    // Mix into channel BEFORE FRI alpha — binds prover to polynomial values at z.
-    let (oods_z, oods_trace_at_z, oods_trace_at_z_next) = {
-        use crate::oods::{OodsPoint, eval_at_oods_from_coeffs, qm31_from_m31, oods_vanishing};
+    // Phase 1: evaluate trace at z and z_next; mix into channel.
+    // Phase 2: evaluate AIR quotient at z; draw OODS alpha; compute OODS quotient for FRI.
+    let (oods_z, oods_trace_at_z, oods_trace_at_z_next, oods_quotient_at_z, oods_alpha, oods_quotient_col) = {
+        use crate::oods::{OodsPoint, eval_at_oods_from_coeffs, qm31_from_m31, oods_vanishing, compute_line_coeffs};
         use std::collections::HashMap;
 
         let z = OodsPoint::from_channel(&mut channel);
         let step = crate::circle::CirclePoint::GENERATOR.repeated_double(31 - log_n);
         let z_next = z.next_step(step);
 
-        // Z_H at OODS points (for ZK blinding correction)
         let zh_z      = oods_vanishing(z, log_n);
         let zh_z_next = oods_vanishing(z_next, log_n);
-
-        // ZK scalar lookup: col_idx → blinding scalar r
         let zk_map: HashMap<usize, u32> = zk_scalars.iter().cloned().collect();
 
+        // ── Phase 1: evaluate 34 trace columns at z and z_next ───────────────
         let mut at_z    = Vec::with_capacity(N_COLS);
         let mut at_next = Vec::with_capacity(N_COLS);
-
         for col_idx in 0..N_COLS {
-            // Polynomial coefficients were saved during Group A/B/C INTT above.
             let coeffs = &trace_poly_coeffs[col_idx];
-
-            // Evaluate at OODS points using the fold algorithm (stwo-compatible).
-            let mut val_z    = eval_at_oods_from_coeffs(&coeffs, z);
-            let mut val_next = eval_at_oods_from_coeffs(&coeffs, z_next);
-
-            // ZK blinding correction: p_blinded(z) = p(z) + r * Z_H(z)
+            let mut val_z    = eval_at_oods_from_coeffs(coeffs, z);
+            let mut val_next = eval_at_oods_from_coeffs(coeffs, z_next);
             if let Some(&r) = zk_map.get(&col_idx) {
                 let r_q = qm31_from_m31(crate::field::M31(r));
                 val_z    = val_z    + r_q * zh_z;
                 val_next = val_next + r_q * zh_z_next;
             }
-
             at_z.push(val_z);
             at_next.push(val_next);
         }
-
-        // Mix OODS evaluations into Fiat-Shamir channel (before FRI alpha).
         channel.mix_felts(&at_z);
         channel.mix_felts(&at_next);
 
-        let z_arr  = z.to_u32_array();
+        // ── Phase 2a: evaluate AIR quotient columns at z ─────────────────────
+        // INTT each qk from eval domain → coefficients (first n are the polynomial).
+        // q0..q3 are still alive as DeviceBuffers — use them directly.
+        let quot_at_z: [QM31; 4] = {
+            let qs: [&DeviceBuffer<u32>; 4] = [&q0, &q1, &q2, &q3];
+            std::array::from_fn(|k| {
+                let mut d: DeviceBuffer<u32> = DeviceBuffer::from_host(&qs[k].to_host());
+                ntt::interpolate(&mut d, &cache.eval_inv_cache);
+                let coeffs = d.to_host();
+                eval_at_oods_from_coeffs(&coeffs[..n], z)
+            })
+        };
+        channel.mix_felts(&quot_at_z.to_vec());
+
+        // ── Phase 2b: draw OODS alpha; build line coefficients ────────────────
+        let oods_alpha = channel.draw_felt();
+
+        // Acc 0: sample point z  — N_COLS trace + 4 quotient = N_COLS+4 columns
+        // Acc 1: sample point z_next — N_COLS trace columns
+        let n_acc_z  = N_COLS + 4;
+        let mut b_coeffs_z:  Vec<u32> = Vec::with_capacity(n_acc_z * 4);
+        let mut c_coeffs_z:  Vec<u32> = Vec::with_capacity(n_acc_z * 4);
+        let mut linear_acc_z  = QM31::ZERO;
+        let mut b_coeffs_zn: Vec<u32> = Vec::with_capacity(N_COLS * 4);
+        let mut c_coeffs_zn: Vec<u32> = Vec::with_capacity(N_COLS * 4);
+        let mut linear_acc_zn = QM31::ZERO;
+        let mut alpha_pow = QM31::ONE;
+
+        for col_idx in 0..N_COLS {
+            let (a, b) = compute_line_coeffs(z, at_z[col_idx]);
+            b_coeffs_z.extend_from_slice(&a.to_u32_array());
+            c_coeffs_z.extend_from_slice(&alpha_pow.to_u32_array());
+            linear_acc_z = linear_acc_z + alpha_pow * b;
+            alpha_pow = alpha_pow * oods_alpha;
+        }
+        for k in 0..4 {
+            let (a, b) = compute_line_coeffs(z, quot_at_z[k]);
+            b_coeffs_z.extend_from_slice(&a.to_u32_array());
+            c_coeffs_z.extend_from_slice(&alpha_pow.to_u32_array());
+            linear_acc_z = linear_acc_z + alpha_pow * b;
+            alpha_pow = alpha_pow * oods_alpha;
+        }
+        for col_idx in 0..N_COLS {
+            let (a, b) = compute_line_coeffs(z_next, at_next[col_idx]);
+            b_coeffs_zn.extend_from_slice(&a.to_u32_array());
+            c_coeffs_zn.extend_from_slice(&alpha_pow.to_u32_array());
+            linear_acc_zn = linear_acc_zn + alpha_pow * b;
+            alpha_pow = alpha_pow * oods_alpha;
+        }
+
+        // ── Phase 2c: upload eval-domain columns; compute OODS numerators ────
+        // Upload trace eval cols + re-use q0..q3 GPU buffers by reference.
+        // cols 0..N_COLS = trace, cols N_COLS..N_COLS+4 = quotient q0..q3
+        let mut d_eval_cols: Vec<DeviceBuffer<u32>> = host_eval_cols.iter()
+            .map(|c| DeviceBuffer::from_host(c)).collect();
+        d_eval_cols.push(DeviceBuffer::from_host(&host_q0));
+        d_eval_cols.push(DeviceBuffer::from_host(&host_q1));
+        d_eval_cols.push(DeviceBuffer::from_host(&host_q2));
+        d_eval_cols.push(DeviceBuffer::from_host(&host_q3));
+
+        let all_col_ptrs: Vec<*const u32> = d_eval_cols.iter().map(|b| b.as_ptr()).collect();
+        let d_col_ptrs = DeviceBuffer::from_host(&all_col_ptrs);
+
+        let col_idx_z:  Vec<u32> = (0..(N_COLS + 4) as u32).collect();
+        let col_idx_zn: Vec<u32> = (0..N_COLS as u32).collect();
+        let d_cidx_z  = DeviceBuffer::from_host(&col_idx_z);
+        let d_cidx_zn = DeviceBuffer::from_host(&col_idx_zn);
+        let d_b_z  = DeviceBuffer::from_host(&b_coeffs_z);
+        let d_c_z  = DeviceBuffer::from_host(&c_coeffs_z);
+        let d_b_zn = DeviceBuffer::from_host(&b_coeffs_zn);
+        let d_c_zn = DeviceBuffer::from_host(&c_coeffs_zn);
+
+        let mut numer_z0  = DeviceBuffer::<u32>::alloc(eval_size);
+        let mut numer_z1  = DeviceBuffer::<u32>::alloc(eval_size);
+        let mut numer_z2  = DeviceBuffer::<u32>::alloc(eval_size);
+        let mut numer_z3  = DeviceBuffer::<u32>::alloc(eval_size);
+        let mut numer_zn0 = DeviceBuffer::<u32>::alloc(eval_size);
+        let mut numer_zn1 = DeviceBuffer::<u32>::alloc(eval_size);
+        let mut numer_zn2 = DeviceBuffer::<u32>::alloc(eval_size);
+        let mut numer_zn3 = DeviceBuffer::<u32>::alloc(eval_size);
+
+        unsafe {
+            ffi::cuda_accumulate_numerators(
+                d_col_ptrs.as_ptr() as *const *const u32, d_cidx_z.as_ptr(),
+                d_b_z.as_ptr(), d_c_z.as_ptr(), n_acc_z as u32, eval_size as u32,
+                numer_z0.as_mut_ptr(), numer_z1.as_mut_ptr(),
+                numer_z2.as_mut_ptr(), numer_z3.as_mut_ptr(),
+            );
+            ffi::cuda_accumulate_numerators(
+                d_col_ptrs.as_ptr() as *const *const u32, d_cidx_zn.as_ptr(),
+                d_b_zn.as_ptr(), d_c_zn.as_ptr(), N_COLS as u32, eval_size as u32,
+                numer_zn0.as_mut_ptr(), numer_zn1.as_mut_ptr(),
+                numer_zn2.as_mut_ptr(), numer_zn3.as_mut_ptr(),
+            );
+            ffi::cuda_device_sync();
+        }
+        drop(d_eval_cols); drop(d_col_ptrs);
+        drop(d_cidx_z); drop(d_b_z); drop(d_c_z);
+        drop(d_cidx_zn); drop(d_b_zn); drop(d_c_zn);
+
+        // ── Phase 2d: compute domain points; combine into OODS quotient ──────
+        let eval_coset = Coset::half_coset(log_eval_size);
+        let mut d_dom_xs = DeviceBuffer::<u32>::alloc(eval_size);
+        let mut d_dom_ys = DeviceBuffer::<u32>::alloc(eval_size);
+        unsafe {
+            ffi::cuda_compute_coset_points(
+                eval_coset.initial.x.0, eval_coset.initial.y.0,
+                eval_coset.step.x.0,    eval_coset.step.y.0,
+                d_dom_xs.as_mut_ptr(), d_dom_ys.as_mut_ptr(), eval_size as u32,
+            );
+        }
+
+        // Pack per-accumulator metadata
+        let sp_x: Vec<u32> = z.x.to_u32_array().iter().chain(z_next.x.to_u32_array().iter()).copied().collect();
+        let sp_y: Vec<u32> = z.y.to_u32_array().iter().chain(z_next.y.to_u32_array().iter()).copied().collect();
+        let fla:  Vec<u32> = linear_acc_z.to_u32_array().iter().chain(linear_acc_zn.to_u32_array().iter()).copied().collect();
+        let acc_log_szs: Vec<u32> = vec![log_eval_size, log_eval_size];
+        let d_sp_x   = DeviceBuffer::from_host(&sp_x);
+        let d_sp_y   = DeviceBuffer::from_host(&sp_y);
+        let d_fla    = DeviceBuffer::from_host(&fla);
+        let d_alszs  = DeviceBuffer::from_host(&acc_log_szs);
+
+        let np0: Vec<*const u32> = vec![numer_z0.as_ptr(), numer_zn0.as_ptr()];
+        let np1: Vec<*const u32> = vec![numer_z1.as_ptr(), numer_zn1.as_ptr()];
+        let np2: Vec<*const u32> = vec![numer_z2.as_ptr(), numer_zn2.as_ptr()];
+        let np3: Vec<*const u32> = vec![numer_z3.as_ptr(), numer_zn3.as_ptr()];
+        let d_np0 = DeviceBuffer::from_host(&np0);
+        let d_np1 = DeviceBuffer::from_host(&np1);
+        let d_np2 = DeviceBuffer::from_host(&np2);
+        let d_np3 = DeviceBuffer::from_host(&np3);
+
+        let mut oods_q0 = DeviceBuffer::<u32>::alloc(eval_size);
+        let mut oods_q1 = DeviceBuffer::<u32>::alloc(eval_size);
+        let mut oods_q2 = DeviceBuffer::<u32>::alloc(eval_size);
+        let mut oods_q3 = DeviceBuffer::<u32>::alloc(eval_size);
+
+        unsafe {
+            ffi::cuda_compute_quotients_combine(
+                d_sp_x.as_ptr(), d_sp_y.as_ptr(), d_fla.as_ptr(),
+                d_np0.as_ptr() as *const *const u32,
+                d_np1.as_ptr() as *const *const u32,
+                d_np2.as_ptr() as *const *const u32,
+                d_np3.as_ptr() as *const *const u32,
+                d_alszs.as_ptr(), 2,
+                d_dom_xs.as_ptr(), d_dom_ys.as_ptr(),
+                log_eval_size, eval_size as u32,
+                oods_q0.as_mut_ptr(), oods_q1.as_mut_ptr(),
+                oods_q2.as_mut_ptr(), oods_q3.as_mut_ptr(),
+            );
+            ffi::cuda_device_sync();
+        }
+        drop(numer_z0); drop(numer_z1); drop(numer_z2); drop(numer_z3);
+        drop(numer_zn0); drop(numer_zn1); drop(numer_zn2); drop(numer_zn3);
+        drop(d_sp_x); drop(d_sp_y); drop(d_fla); drop(d_alszs);
+        drop(d_np0); drop(d_np1); drop(d_np2); drop(d_np3);
+        drop(d_dom_xs); drop(d_dom_ys);
+
+        let z_arr    = z.to_u32_array();
         let at_z_arr: Vec<[u32; 4]>    = at_z.iter().map(|v| v.to_u32_array()).collect();
         let at_next_arr: Vec<[u32; 4]> = at_next.iter().map(|v| v.to_u32_array()).collect();
-        (z_arr, at_z_arr, at_next_arr)
+        let oods_q_arr: [[u32; 4]; 4]  = std::array::from_fn(|k| quot_at_z[k].to_u32_array());
+        let alpha_arr  = oods_alpha.to_u32_array();
+        let oods_col   = SecureColumn { cols: [oods_q0, oods_q1, oods_q2, oods_q3], len: eval_size };
+        (z_arr, at_z_arr, at_next_arr, oods_q_arr, alpha_arr, oods_col)
     };
 
-    // ---- Phase 4: FRI ----
-    let quotient_col = SecureColumn { cols: [q0, q1, q2, q3], len: eval_size };
+    // ---- Phase 4: FRI on OODS quotient (replaces direct AIR quotient FRI) ----
+    // The AIR quotient q0..q3 has been sampled at z (oods_quotient_at_z) and
+    // the OODS quotient polynomial is the FRI input.
+    drop(q0); drop(q1); drop(q2); drop(q3);
+    let quotient_col = oods_quotient_col;
+
+    // Commit OODS quotient polynomial for decommitment at query points.
+    // This commitment is mixed into the channel BEFORE fri_alpha so the verifier
+    // can replay the same Fiat-Shamir state.
+    let (oods_quotient_commitment, tile_roots_oods_q) =
+        MerkleTree::commit_root_soa4_with_subtrees(
+            &quotient_col.cols[0], &quotient_col.cols[1],
+            &quotient_col.cols[2], &quotient_col.cols[3],
+            log_eval_size,
+        );
+    channel.mix_digest(&oods_quotient_commitment);
+    // Download to host now — FRI will consume (drop) the DeviceBuffers.
+    let host_oods_q0 = quotient_col.cols[0].to_host_fast();
+    let host_oods_q1 = quotient_col.cols[1].to_host_fast();
+    let host_oods_q2 = quotient_col.cols[2].to_host_fast();
+    let host_oods_q3 = quotient_col.cols[3].to_host_fast();
 
     let fri_alpha = channel.draw_felt();
     let fold_domain = Coset::half_coset(log_eval_size);
@@ -1508,6 +1694,11 @@ fn cairo_prove_cached_with_columns(
         let decom = decommit_from_host_soa4(&cols, &tile_roots_quotient, &query_indices);
         decom
     };
+    // OODS quotient decommitment — FRI starts from these values (not AIR quotient).
+    let oods_quotient_decommitment = {
+        let cols = [host_oods_q0, host_oods_q1, host_oods_q2, host_oods_q3];
+        decommit_from_host_soa4(&cols, &tile_roots_oods_q, &query_indices)
+    };
 
     // LogUp interaction trace decommitment — binds interaction trace values at query
     // points to interaction_commitment (prerequisite for step transition verification).
@@ -1562,6 +1753,7 @@ fn cairo_prove_cached_with_columns(
         interaction_commitment,
         rc_interaction_commitment,
         quotient_commitment,
+        oods_quotient_commitment,
         fri_commitments,
         fri_last_layer,
         pow_nonce,
@@ -1577,6 +1769,7 @@ fn cairo_prove_cached_with_columns(
         logup_final_sum,
         rc_final_sum,
         quotient_decommitment,
+        oods_quotient_decommitment,
         fri_decommitments,
         interaction_decommitment,
         interaction_decommitment_next,
@@ -1605,6 +1798,8 @@ fn cairo_prove_cached_with_columns(
         oods_z,
         oods_trace_at_z,
         oods_trace_at_z_next,
+        oods_quotient_at_z,
+        oods_alpha,
     }
 }
 
@@ -1916,8 +2111,8 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
     channel.mix_digest(&proof.quotient_commitment);
 
     // ── OODS: replay sampled values in Fiat-Shamir (must match prover order) ──
-    // Verifier draws OODS point z (not used for constraint check in Phase 1).
-    // TODO Phase 2: verify that sampled_values are consistent with committed poly.
+    // Phase 1: draw z, mix trace evals at z and z_next.
+    // Phase 2: mix AIR quotient evals at z, draw oods_alpha.
     {
         use crate::oods::OodsPoint;
         let _z = OodsPoint::from_channel(&mut channel);
@@ -1927,7 +2122,15 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
             .map(|v| crate::field::QM31::from_u32_array(*v)).collect();
         channel.mix_felts(&oods_trace_at_z);
         channel.mix_felts(&oods_trace_at_z_next);
+        // Phase 2: replay AIR quotient evals at z, then draw OODS alpha.
+        let oods_quotient_at_z: Vec<crate::field::QM31> = proof.oods_quotient_at_z.iter()
+            .map(|v| crate::field::QM31::from_u32_array(*v)).collect();
+        channel.mix_felts(&oods_quotient_at_z);
+        let _oods_alpha = channel.draw_felt();
     }
+
+    // Mix the OODS quotient Merkle commitment (prover commits this before fri_alpha).
+    channel.mix_digest(&proof.oods_quotient_commitment);
 
     let mut fri_alphas = Vec::new();
     fri_alphas.push(channel.draw_felt()); // circle fold alpha
@@ -1985,13 +2188,13 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
         let mut current_idx = qi;
         let mut current_log = log_eval_size;
 
-        // Circle fold: quotient → FRI layer 0
+        // Circle fold: OODS quotient → FRI layer 0
         {
             let domain = Coset::half_coset(current_log);
             let folded_idx = current_idx / 2;
             let (f0, f1) = get_pair_from_decom_4(
-                &proof.quotient_decommitment.values[q],
-                &proof.quotient_decommitment.sibling_values[q],
+                &proof.oods_quotient_decommitment.values[q],
+                &proof.oods_quotient_decommitment.sibling_values[q],
                 current_idx,
             );
             let twiddle = fold_twiddle_at(&domain, folded_idx, true);
@@ -2445,12 +2648,19 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
         }
     }
 
-    // ---- Verify Merkle auth paths: quotient ----
+    // ---- Verify Merkle auth paths: AIR quotient ----
     verify_decommitment_auth_paths_soa4(
         &proof.quotient_commitment,
         &proof.quotient_decommitment,
         &proof.query_indices,
         "quotient",
+    )?;
+    // ---- Verify Merkle auth paths: OODS quotient (FRI input) ----
+    verify_decommitment_auth_paths_soa4(
+        &proof.oods_quotient_commitment,
+        &proof.oods_quotient_decommitment,
+        &proof.query_indices,
+        "oods_quotient",
     )?;
 
     // ---- Verify Merkle auth paths: FRI layers ----

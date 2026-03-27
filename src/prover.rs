@@ -76,8 +76,8 @@ pub const POW_BITS: u32 = 26;
 /// Decommitment data for a set of queries against a Merkle commitment.
 /// Includes both the queried value and its fold-sibling (index ^ 1) for
 /// verifying FRI fold equations.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-#[serde(bound = "T: Clone + serde::Serialize + serde::de::DeserializeOwned")]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(bound = "T: Clone + Default + serde::Serialize + serde::de::DeserializeOwned")]
 pub struct QueryDecommitment<T: Clone> {
     /// Leaf values at queried positions.
     pub values: Vec<T>,
