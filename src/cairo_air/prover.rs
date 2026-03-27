@@ -2358,6 +2358,24 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
     // they match the quotient values. This closes the critical soundness gap.
     let constraint_alphas = constraint_alphas_drawn;
     let verif_eval_domain = crate::circle::Coset::half_coset(log_eval_size);
+
+    // ---- Precompute OODS line coefficients (same for every query) ----
+    // Used in the OODS formula check below.
+    let (oods_line_z, oods_line_q, oods_line_zn, oods_z_point, oods_z_next_point, oods_alpha_val) = {
+        use crate::oods::{OodsPoint, compute_line_coeffs};
+        let z      = OodsPoint::from_u32_array(&proof.oods_z);
+        let step   = crate::circle::CirclePoint::GENERATOR.repeated_double(31 - log_n);
+        let z_next = z.next_step(step);
+        let alpha  = QM31::from_u32_array(proof.oods_alpha);
+        let line_z: Vec<(QM31, QM31)> = proof.oods_trace_at_z.iter()
+            .map(|v| compute_line_coeffs(z, QM31::from_u32_array(*v))).collect();
+        let line_q: Vec<(QM31, QM31)> = proof.oods_quotient_at_z.iter()
+            .map(|v| compute_line_coeffs(z, QM31::from_u32_array(*v))).collect();
+        let line_zn: Vec<(QM31, QM31)> = proof.oods_trace_at_z_next.iter()
+            .map(|v| compute_line_coeffs(z_next, QM31::from_u32_array(*v))).collect();
+        (line_z, line_q, line_zn, z, z_next, alpha)
+    };
+
     for (q, &qi) in proof.query_indices.iter().enumerate() {
         let row = &proof.trace_values_at_queries[q];
         let next = &proof.trace_values_at_queries_next[q];
@@ -2645,6 +2663,75 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
                  verifier computed C(x)={:?}, Q(x)*Z_H={:?}",
                 constraint_sum.to_u32_array(), q_times_zh.to_u32_array()
             ));
+        }
+
+        // ---- OODS formula check ----
+        // Verify that oods_quotient_decommitment.values[q] equals Q(p) computed from:
+        //   Q(qi) = full_numer_z(qi) * D(z, p_nat)^{-1} + full_numer_zn(qi) * D(z_next, p_nat)^{-1}
+        // where:
+        //   full_numer_z(qi)  = Σ_{j<N_COLS} alpha^j * (col_j(p_br) - a_j - b_j * p_nat.y)
+        //                     + Σ_{k<4}       alpha^{N_COLS+k} * (qk(p_br) - a_k' - b_k' * p_nat.y)
+        //   full_numer_zn(qi) = Σ_{j<N_COLS} alpha^{N_COLS+4+j} * (col_j(p_br) - a_j'' - b_j'' * p_nat.y)
+        //   L evaluated at p_nat (natural-order coset point) — because cuda_compute_coset_points
+        //   uses natural index qi (not bit-reversed), while column values col_j(p_br) are at
+        //   the bit-reversed domain point p_br = eval_coset.at(bit_reverse(qi)).
+        //   D(sp, p_nat) uses p_nat.x, p_nat.y from natural order.
+        {
+            use crate::oods::{oods_denom, qm31_from_m31};
+            // p_nat: natural-order domain point at index qi (matching GPU's cuda_compute_coset_points)
+            let p_nat = verif_eval_domain.at(qi);
+            let px = p_nat.x;
+            let py = p_nat.y;
+            let py_q = qm31_from_m31(py);
+
+            // GPU formula (accumulate_numerators kernel):
+            //   partial  = Σ_i (alpha^i * f_i - a_i)   — a_i NOT alpha-weighted
+            //   full_num = partial - linear_acc * p.y   — linear_acc = Σ_i alpha^i * b_i
+            let mut alpha_pow = QM31::ONE;
+
+            // z accumulator
+            let mut partial_z  = QM31::ZERO;
+            let mut lin_acc_z  = QM31::ZERO;
+            for j in 0..N_COLS {
+                let (a, b) = oods_line_z[j];
+                let f = qm31_from_m31(M31(row[j]));
+                partial_z = partial_z + alpha_pow * f - a;
+                lin_acc_z = lin_acc_z + alpha_pow * b;
+                alpha_pow = alpha_pow * oods_alpha_val;
+            }
+            for k in 0..4 {
+                let (a, b) = oods_line_q[k];
+                let f = qm31_from_m31(M31(proof.quotient_decommitment.values[q][k]));
+                partial_z = partial_z + alpha_pow * f - a;
+                lin_acc_z = lin_acc_z + alpha_pow * b;
+                alpha_pow = alpha_pow * oods_alpha_val;
+            }
+            let full_numer_z = partial_z - lin_acc_z * py_q;
+
+            // z_next accumulator
+            let mut partial_zn = QM31::ZERO;
+            let mut lin_acc_zn = QM31::ZERO;
+            for j in 0..N_COLS {
+                let (a, b) = oods_line_zn[j];
+                let f = qm31_from_m31(M31(row[j]));
+                partial_zn = partial_zn + alpha_pow * f - a;
+                lin_acc_zn = lin_acc_zn + alpha_pow * b;
+                alpha_pow = alpha_pow * oods_alpha_val;
+            }
+            let full_numer_zn = partial_zn - lin_acc_zn * py_q;
+
+            let d_z  = oods_denom(oods_z_point,      px, py);
+            let d_zn = oods_denom(oods_z_next_point, px, py);
+            let q_expected = full_numer_z  * d_z.inverse()
+                           + full_numer_zn * d_zn.inverse();
+            let q_committed = QM31::from_u32_array(proof.oods_quotient_decommitment.values[q]);
+            if q_expected != q_committed {
+                return Err(format!(
+                    "OODS quotient formula mismatch at query {q} (qi={qi}): \
+                     expected {:?}, committed {:?}",
+                    q_expected.to_u32_array(), q_committed.to_u32_array()
+                ));
+            }
         }
     }
 

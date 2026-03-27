@@ -233,3 +233,26 @@ fn test_soundness_random_field_element_mutations() {
     assert_eq!(rejections, attempts,
         "Expected all {attempts} random trace mutations to be detected; got {rejections}");
 }
+
+/// Tamper with the OODS quotient decommitment values and verify rejection.
+/// This exercises the new OODS quotient formula check: a malicious prover
+/// cannot substitute a fake polynomial as the FRI input.
+#[test]
+fn test_soundness_oods_quotient_tamper() {
+    init_gpu();
+    let prog = make_add_program(32);
+    let proof_base = cairo_prove(&prog, 32, 5);
+
+    // Baseline must pass
+    cairo_verify(&proof_base).expect("baseline proof must verify");
+
+    // Flip one limb of each OODS quotient decommitment value — must be rejected
+    for q in 0..proof_base.oods_quotient_decommitment.values.len() {
+        let mut proof = proof_base.clone();
+        proof.oods_quotient_decommitment.values[q][0] ^= 1;
+        assert!(
+            cairo_verify(&proof).is_err(),
+            "Tampered oods_quotient_decommitment.values[{q}][0] should be rejected"
+        );
+    }
+}

@@ -18,7 +18,7 @@
 //!   4. Mix all sampled_values into channel
 //!   5. Verifier independently computes same evaluations at query points and checks FRI
 
-use crate::field::{M31, QM31};
+use crate::field::{CM31, M31, QM31};
 use crate::channel::Channel;
 use crate::circle::CirclePoint;
 
@@ -342,6 +342,27 @@ pub fn compute_line_coeffs(z: OodsPoint, v: QM31) -> (QM31, QM31) {
     let b = (v - v_conj) * denom.inverse();
     let a = v - b * z.y;
     (a, b)
+}
+
+/// Compute the OODS vanishing denominator at a domain point p for sample point sp.
+///
+/// From the Circle STARK quotient formula:
+///   D(sp, p) = (Re(sp.x) - p.x) * Im(sp.y) - (Re(sp.y) - p.y) * Im(sp.x)
+///
+/// where Re(q) = q.a (CM31 real part) and Im(q) = q.b (CM31 u-coefficient) for QM31 q.
+/// p.x, p.y are M31 coordinates of the eval-domain point.
+///
+/// Returns a CM31 value. The full OODS quotient contribution at p for sample point sp is:
+///   full_numer(p) * oods_denom(sp, p.x, p.y)^{-1}
+#[inline]
+pub fn oods_denom(sp: OodsPoint, px: M31, py: M31) -> CM31 {
+    let prx = sp.x.a;  // Re(sp.x) — CM31
+    let pry = sp.y.a;  // Re(sp.y) — CM31
+    let pix = sp.x.b;  // Im(sp.x) — CM31
+    let piy = sp.y.b;  // Im(sp.y) — CM31
+    let term1 = (prx - CM31::new(px, M31::ZERO)) * piy;
+    let term2 = (pry - CM31::new(py, M31::ZERO)) * pix;
+    term1 - term2
 }
 
 #[cfg(test)]
