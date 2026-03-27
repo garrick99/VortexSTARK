@@ -382,13 +382,19 @@ unsafe extern "C" {
     );
 
     pub fn cuda_logup_memory_fused(
-        col_pc: *const u32, col_inst_lo: *const u32,
+        col_pc: *const u32, col_inst_lo: *const u32, col_inst_hi: *const u32,
         col_dst_addr: *const u32, col_dst: *const u32,
         col_op0_addr: *const u32, col_op0: *const u32,
         col_op1_addr: *const u32, col_op1: *const u32,
         out0: *mut u32, out1: *mut u32, out2: *mut u32, out3: *mut u32,
         z: *const u32, alpha: *const u32,
         n: u32,
+    );
+
+    pub fn cuda_logup_rc_fused(
+        col_off0: *const u32, col_off1: *const u32, col_off2: *const u32,
+        out0: *mut u32, out1: *mut u32, out2: *mut u32, out3: *mut u32,
+        z_rc: *const u32, n: u32,
     );
 
     pub fn cuda_logup_memory_denoms(

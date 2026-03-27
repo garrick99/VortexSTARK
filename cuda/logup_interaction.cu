@@ -172,9 +172,14 @@ __global__ void logup_memory_combine_kernel(
 // Fused kernel: computes per-row sum of 4 memory reciprocals with inline QM31 inverse.
 // Eliminates 2 global memory round-trips (denoms→inverse→combine → single pass).
 // Each thread: compute 4 denoms, product, inline inverse, numerator, multiply → output.
+// Fused kernel with inst_hi: includes alpha^2 * inst_hi in the instruction-fetch
+// denominator, binding both halves of the 63-bit instruction word.
+// Access 0: z - (pc + alpha*inst_lo + alpha^2*inst_hi)
+// Access 1-3: z - (addr + alpha*val)
 __global__ void logup_memory_fused_kernel(
     const uint32_t* __restrict__ col_pc,
     const uint32_t* __restrict__ col_inst_lo,
+    const uint32_t* __restrict__ col_inst_hi,
     const uint32_t* __restrict__ col_dst_addr,
     const uint32_t* __restrict__ col_dst,
     const uint32_t* __restrict__ col_op0_addr,
@@ -192,6 +197,7 @@ __global__ void logup_memory_fused_kernel(
 
     QM31 z = {{z0, z1, z2, z3}};
     QM31 alpha = {{a0, a1, a2, a3}};
+    QM31 alpha_sq = qm31_mul(alpha, alpha);
 
     uint32_t addrs[4] = { col_pc[i], col_dst_addr[i], col_op0_addr[i], col_op1_addr[i] };
     uint32_t vals[4]  = { col_inst_lo[i], col_dst[i], col_op0[i], col_op1[i] };
@@ -203,6 +209,9 @@ __global__ void logup_memory_fused_kernel(
         entry.v[0] = m31_add(entry.v[0], addrs[j]);
         d[j] = qm31_sub(z, entry);
     }
+    // Access 0 (instruction fetch): extend with alpha^2 * inst_hi
+    QM31 inst_hi_term = qm31_mul_m31(alpha_sq, col_inst_hi[i]);
+    d[0] = qm31_sub(d[0], inst_hi_term);
 
     // Product of all 4 denominators
     QM31 p01 = qm31_mul(d[0], d[1]);
@@ -225,6 +234,47 @@ __global__ void logup_memory_fused_kernel(
     out1[i] = result.v[1];
     out2[i] = result.v[2];
     out3[i] = result.v[3];
+}
+
+// ============================================================================
+// RC LogUp fused kernel: 3 range-check offsets per row → sum of 3 reciprocals.
+// Denominator for each offset: z_rc - offset  (no alpha term).
+// Uses product trick: 1/d0 + 1/d1 + 1/d2 = (d1*d2 + d0*d2 + d0*d1) / (d0*d1*d2).
+// ============================================================================
+__global__ void logup_rc_fused_kernel(
+    const uint32_t* __restrict__ col_off0,
+    const uint32_t* __restrict__ col_off1,
+    const uint32_t* __restrict__ col_off2,
+    uint32_t* __restrict__ out0, uint32_t* __restrict__ out1,
+    uint32_t* __restrict__ out2, uint32_t* __restrict__ out3,
+    uint32_t z0, uint32_t z1, uint32_t z2, uint32_t z3,
+    uint32_t n
+) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    // d_k = z_rc - offset_k  (only component 0 changes since offset is M31)
+    QM31 d0 = {{z0, z1, z2, z3}};
+    d0.v[0] = m31_sub(d0.v[0], col_off0[i]);
+    QM31 d1 = {{z0, z1, z2, z3}};
+    d1.v[0] = m31_sub(d1.v[0], col_off1[i]);
+    QM31 d2 = {{z0, z1, z2, z3}};
+    d2.v[0] = m31_sub(d2.v[0], col_off2[i]);
+
+    QM31 d01  = qm31_mul(d0, d1);
+    QM31 d012 = qm31_mul(d01, d2);  // full product
+
+    // Numerator = d1*d2 + d0*d2 + d0*d1
+    QM31 num = qm31_add(
+        qm31_add(qm31_mul(d1, d2), qm31_mul(d0, d2)),
+        d01
+    );
+
+    QM31 inv_prod = qm31_inv(d012);
+    QM31 result = qm31_mul(num, inv_prod);
+
+    out0[i] = result.v[0]; out1[i] = result.v[1];
+    out2[i] = result.v[2]; out3[i] = result.v[3];
 }
 
 // ============================================================================
@@ -443,7 +493,7 @@ void cuda_logup_accumulate_pair(
 }
 
 void cuda_logup_memory_fused(
-    const uint32_t* col_pc, const uint32_t* col_inst_lo,
+    const uint32_t* col_pc, const uint32_t* col_inst_lo, const uint32_t* col_inst_hi,
     const uint32_t* col_dst_addr, const uint32_t* col_dst,
     const uint32_t* col_op0_addr, const uint32_t* col_op0,
     const uint32_t* col_op1_addr, const uint32_t* col_op1,
@@ -454,10 +504,23 @@ void cuda_logup_memory_fused(
     uint32_t threads = 256;
     uint32_t blocks = (n + threads - 1) / threads;
     logup_memory_fused_kernel<<<blocks, threads>>>(
-        col_pc, col_inst_lo, col_dst_addr, col_dst,
+        col_pc, col_inst_lo, col_inst_hi, col_dst_addr, col_dst,
         col_op0_addr, col_op0, col_op1_addr, col_op1,
         out0, out1, out2, out3,
         z[0], z[1], z[2], z[3], alpha[0], alpha[1], alpha[2], alpha[3], n
+    );
+}
+
+void cuda_logup_rc_fused(
+    const uint32_t* col_off0, const uint32_t* col_off1, const uint32_t* col_off2,
+    uint32_t* out0, uint32_t* out1, uint32_t* out2, uint32_t* out3,
+    const uint32_t* z_rc, uint32_t n
+) {
+    uint32_t threads = 256;
+    uint32_t blocks = (n + threads - 1) / threads;
+    logup_rc_fused_kernel<<<blocks, threads>>>(
+        col_off0, col_off1, col_off2, out0, out1, out2, out3,
+        z_rc[0], z_rc[1], z_rc[2], z_rc[3], n
     );
 }
 

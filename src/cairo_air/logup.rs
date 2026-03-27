@@ -24,6 +24,7 @@
 
 use crate::field::{M31, QM31};
 use crate::field::cm31::CM31;
+use rayon::prelude::*;
 
 /// Number of memory accesses per execution step.
 /// Instruction fetch + dst + op0 + op1 = 4 accesses.
@@ -131,29 +132,29 @@ pub fn compute_memory_table_sum(
     alpha: QM31,
 ) -> QM31 {
     let alpha_sq = alpha * alpha;
-    let mut sum = QM31::ZERO;
 
-    // Regular data accesses (dst, op0, op1)
-    for &(addr, value, mult) in memory_entries {
-        let entry = qm31_from_m31(addr) + alpha * qm31_from_m31(value);
-        let denom = z - entry;
-        debug_assert!(denom != QM31::ZERO, "LogUp table denominator is zero — Fiat-Shamir collision");
-        let mult_qm31 = qm31_from_m31(M31(mult));
-        sum = sum - mult_qm31 * denom.inverse();
-    }
+    // Parallel reduction — each term is independent (pure function of its entry).
+    let data_sum: QM31 = memory_entries.par_iter()
+        .map(|&(addr, value, mult)| {
+            let entry = qm31_from_m31(addr) + alpha * qm31_from_m31(value);
+            let denom = z - entry;
+            debug_assert!(denom != QM31::ZERO, "LogUp table denominator is zero — Fiat-Shamir collision");
+            -(qm31_from_m31(M31(mult)) * denom.inverse())
+        })
+        .reduce(|| QM31::ZERO, |a, b| a + b);
 
-    // Instruction fetch accesses (extended denominator with inst_hi)
-    for &(pc, inst_lo, inst_hi, mult) in instr_entries {
-        let entry = qm31_from_m31(pc)
-            + alpha * qm31_from_m31(inst_lo)
-            + alpha_sq * qm31_from_m31(inst_hi);
-        let denom = z - entry;
-        debug_assert!(denom != QM31::ZERO, "LogUp instr denominator is zero — Fiat-Shamir collision");
-        let mult_qm31 = qm31_from_m31(M31(mult));
-        sum = sum - mult_qm31 * denom.inverse();
-    }
+    let instr_sum: QM31 = instr_entries.par_iter()
+        .map(|&(pc, inst_lo, inst_hi, mult)| {
+            let entry = qm31_from_m31(pc)
+                + alpha * qm31_from_m31(inst_lo)
+                + alpha_sq * qm31_from_m31(inst_hi);
+            let denom = z - entry;
+            debug_assert!(denom != QM31::ZERO, "LogUp instr denominator is zero — Fiat-Shamir collision");
+            -(qm31_from_m31(M31(mult)) * denom.inverse())
+        })
+        .reduce(|| QM31::ZERO, |a, b| a + b);
 
-    sum
+    data_sum + instr_sum
 }
 
 /// Extract memory table from an execution trace.
@@ -185,7 +186,7 @@ pub fn extract_memory_table(
         data_pairs.push((trace_cols[COL_OP1_ADDR][i], trace_cols[COL_OP1][i]));
     }
 
-    data_pairs.sort_unstable();
+    data_pairs.par_sort_unstable();
     let data: Vec<(M31, M31, u32)> = {
         let mut out = Vec::new();
         let mut i = 0;
@@ -198,7 +199,7 @@ pub fn extract_memory_table(
         out
     };
 
-    instr_triples.sort_unstable();
+    instr_triples.par_sort_unstable();
     let instrs: Vec<(M31, M31, M31, u32)> = {
         let mut out = Vec::new();
         let mut i = 0;

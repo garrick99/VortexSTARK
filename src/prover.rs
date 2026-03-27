@@ -67,6 +67,12 @@ pub const BLOWUP_BITS: u32 = 2; // blowup factor = 4
 /// Reduced from 100 to 80 to partially offset the 2x eval-domain cost.
 pub const N_QUERIES: usize = 80;
 
+/// Proof-of-work bits required before query indices are sampled.
+/// Prevents grinding attacks: an adversary cannot adaptively choose commitments
+/// and predict query indices without spending 2^POW_BITS hash evaluations.
+/// 26 bits costs ~5ms on RTX 5090 GPU and closes the PoW gap.
+pub const POW_BITS: u32 = 26;
+
 /// Decommitment data for a set of queries against a Merkle commitment.
 /// Includes both the queried value and its fold-sibling (index ^ 1) for
 /// verifying FRI fold equations.

@@ -52,6 +52,82 @@ const SEGMENT_BASE_DEFAULT: u64 = 1 << 24;
 /// The VM executes deterministically from the bytecode alone; hints inject
 /// non-deterministic witness values.  Some hints (AllocSegment, dicts) need
 /// state that persists across steps — that lives here.
+// ---------------------------------------------------------------------------
+// Starknet syscall selector constants
+// ---------------------------------------------------------------------------
+//
+// Syscall selectors are felt252 values whose big-endian bytes equal the ASCII
+// name of the syscall.  VortexSTARK's memory stores the low 64 bits of each
+// felt252, which equals the last 8 bytes of the ASCII name (padded with leading
+// zeros for names shorter than 8 bytes).
+
+mod sel {
+    pub const STORAGE_READ:       u64 = 0x7261_6765_5265_6164; // "rageRead"  ← "StorageRead"
+    pub const STORAGE_WRITE:      u64 = 0x6167_6557_7269_7465; // "ageWrite"  ← "StorageWrite"
+    pub const EMIT_EVENT:         u64 = 0x6d69_7445_7665_6e74; // "mitEvent"  ← "EmitEvent"
+    pub const GET_EXECUTION_INFO: u64 = 0x7469_6f6e_496e_666f; // "tionInfo"  ← "GetExecutionInfo"
+    pub const CALL_CONTRACT:      u64 = 0x436f_6e74_7261_6374; // "Contract"  ← "CallContract"
+    pub const DEPLOY:             u64 = 0x0000_4465_706c_6f79; // "Deploy"    ← "Deploy" (6 bytes)
+    pub const GET_BLOCK_HASH:     u64 = 0x6c6f_636b_4861_7368; // "lockHash"  ← "GetBlockHash"
+    pub const LIBRARY_CALL:       u64 = 0x7261_7279_4361_6c6c; // "raryCall"  ← "LibraryCall"
+    pub const SEND_MSG_TO_L1:     u64 = 0x6167_6554_6f4c_3100; // "ageToL1"   ← "SendMessageToL1"
+}
+
+// ---------------------------------------------------------------------------
+// Starknet syscall state
+// ---------------------------------------------------------------------------
+
+/// Emitted event from an emit_event syscall.
+pub struct SyscallEvent {
+    pub keys: Vec<u64>,
+    pub data: Vec<u64>,
+}
+
+/// Starknet execution context and mutable state for syscall emulation.
+///
+/// Passed into `cairo_prove_program_with_syscalls` to give the program a
+/// realistic environment.  All syscalls that modify state (storage_write,
+/// emit_event) write into these fields so the caller can inspect them after
+/// proving.
+pub struct SyscallState {
+    /// Contract storage: storage_key (felt252 low-64) → value (felt252 low-64).
+    pub storage: HashMap<u64, u64>,
+    /// Events emitted by emit_event syscalls.
+    pub events: Vec<SyscallEvent>,
+    /// Caller address passed to get_execution_info.
+    pub caller_address: u64,
+    /// Current contract address.
+    pub contract_address: u64,
+    /// Entry-point selector.
+    pub entry_point_selector: u64,
+    /// Block number (used by get_execution_info / get_block_hash).
+    pub block_number: u64,
+    /// Block timestamp.
+    pub block_timestamp: u64,
+    /// Base address of the lazily-allocated execution-info region in memory.
+    /// Set on first get_execution_info call and reused for subsequent calls.
+    exec_info_base: Option<u64>,
+}
+
+impl Default for SyscallState {
+    fn default() -> Self {
+        Self {
+            storage: HashMap::new(),
+            events: Vec::new(),
+            caller_address: 0,
+            contract_address: 1,
+            entry_point_selector: 0,
+            block_number: 1000,
+            block_timestamp: 0,
+            exec_info_base: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HintContext
+// ---------------------------------------------------------------------------
+
 pub struct HintContext {
     /// Next flat address to hand out for AllocSegment / AllocFelt252Dict.
     pub next_segment_base: u64,
@@ -90,6 +166,9 @@ pub struct HintContext {
     /// occurred. `cairo_prove_program` returns `ProveError::ExecutionRangeViolation`
     /// if the count is non-zero, refusing to produce a misleading proof.
     pub execution_overflows: usize,
+
+    /// Starknet syscall state (storage, events, execution context).
+    pub syscall: SyscallState,
 }
 
 /// Iteration state for dict squash hints.
@@ -119,7 +198,13 @@ impl HintContext {
             squash: SquashState::default(),
             dict_accesses: Vec::new(),
             execution_overflows: 0,
+            syscall: SyscallState::default(),
         }
+    }
+
+    pub fn with_syscall_state(mut self, state: SyscallState) -> Self {
+        self.syscall = state;
+        self
     }
 
     /// Allocate a fresh segment: return its base, advance the counter.
@@ -204,7 +289,7 @@ fn run_one(hint: &CasmHint, step: usize, state: &CairoState, memory: &mut Memory
         // Writes a dummy success response (retdata_start == retdata_end, error_code = 0).
         // The response struct is at [fp - 3]: selector=request, response=(0, ptr, ptr).
         // Without a full Starknet OS emulator, storage values return 0 and events are dropped.
-        "SystemCall" => hint_system_call_stub(params, state, memory),
+        "SystemCall" => hint_system_call(params, state, memory, ctx),
 
         // Cheatcode: testing framework hook (Foundry/snforge). No-op outside test runner.
         "Cheatcode" => {}
@@ -251,56 +336,171 @@ fn run_one(hint: &CasmHint, step: usize, state: &CairoState, memory: &mut Memory
 }
 
 // ---------------------------------------------------------------------------
-// Starknet syscall stub
+// Starknet syscall handler
 // ---------------------------------------------------------------------------
+//
+// Buffer layout for each syscall (offsets from syscall_ptr):
+//
+//   StorageRead:      [sel, gas, domain, key | remaining_gas, err, value]
+//   StorageWrite:     [sel, gas, domain, key, value | remaining_gas, err]
+//   EmitEvent:        [sel, gas, keys_len, k0..kN, data_len, d0..dN | remaining_gas, err]
+//   GetExecutionInfo: [sel, gas | remaining_gas, err, exec_info_ptr]
+//   CallContract:     [sel, gas, addr, entry_pt, calldata_len, cd0..cdN | remaining_gas, err, ret_len, r0..rN]
+//   Others:           write [0, 0] after request fields as minimal success response.
+//
+// Gas is always left at 0 (not tracked by VortexSTARK).
 
-/// Stub handler for `SystemCall` hints in Starknet CASM.
-///
-/// Starknet syscalls write a request struct to memory at the syscall_ptr and then
-/// call through a syscall handler that fills in a response. Without a full Starknet
-/// OS emulator, we write a minimal "success" response:
-///   - `remaining_gas` = 0 (not tracked)
-///   - Any output/retdata pointers = 0 (empty)
-///   - `error_code` = 0 (success)
-///
-/// The `system` parameter points to the syscall_ptr in memory.
-/// The selector at system[0] identifies the syscall type.
-fn hint_system_call_stub(
+fn hint_system_call(
     params: &serde_json::Value,
     state: &CairoState,
     memory: &mut Memory,
+    ctx: &mut HintContext,
 ) {
-    // The syscall pointer is passed as the "system" register-relative operand.
     let syscall_ptr = if let Some(sys) = params.get("system") {
         cell_ref_addr(sys, state)
     } else {
-        return; // no system param — nothing to do
+        return;
     };
 
-    // Read the selector (first word) to identify the syscall type.
+    // [0]: selector (felt252 low-64), [1]: gas_counter
     let selector = memory.get(syscall_ptr);
 
-    // Write a minimal "success" response after the request.
-    // Most syscalls have layout: [selector, ...request_fields, gas_remaining, error_code, ...response]
-    // We write zeros at the response location (gas_remaining=0, error_code=0, retdata=empty).
-    // For storage_read: response at syscall_ptr+3 = [gas, error, value_low, value_high]
-    // For emit_event/send_message: response at end of request = [gas, error]
-    // For get_execution_info: response at end = [gas, error, exec_info_ptr]
-    //
-    // Selectors (from Starknet spec, big-endian felt252):
-    //   storage_read   = 0x0100... → write 0,0 at response (value = 0)
-    //   storage_write  = 0x0200... → write 0,0 at response (gas=0, error=0)
-    //   emit_event     = 0x0400...
-    //   get_exec_info  = 0x1000...
-    //
-    // For simplicity, write 8 zeros starting at syscall_ptr+1 to cover any response fields.
-    // This may not be correct for all syscalls, but prevents memory-uninitialized reads.
-    let _ = selector; // selector printed in debug mode only
-    for offset in 1..=8u64 {
-        if memory.get(syscall_ptr + offset) == 0 {
-            memory.set(syscall_ptr + offset, 0);
+    match selector {
+        sel::STORAGE_READ => {
+            // Request:  [sel, gas, domain, key]
+            // Response: [remaining_gas=0, err=0, value]
+            let key = memory.get(syscall_ptr + 3);
+            let value = ctx.syscall.storage.get(&key).copied().unwrap_or(0);
+            memory.set(syscall_ptr + 4, 0);     // remaining_gas
+            memory.set(syscall_ptr + 5, 0);     // error_code
+            memory.set(syscall_ptr + 6, value); // value
+        }
+
+        sel::STORAGE_WRITE => {
+            // Request:  [sel, gas, domain, key, value]
+            // Response: [remaining_gas=0, err=0]
+            let key   = memory.get(syscall_ptr + 3);
+            let value = memory.get(syscall_ptr + 4);
+            ctx.syscall.storage.insert(key, value);
+            memory.set(syscall_ptr + 5, 0); // remaining_gas
+            memory.set(syscall_ptr + 6, 0); // error_code
+        }
+
+        sel::EMIT_EVENT => {
+            // Request:  [sel, gas, keys_len, k0..kN, data_len, d0..dN]
+            // Response: [remaining_gas=0, err=0]
+            let keys_len = memory.get(syscall_ptr + 2) as usize;
+            let mut keys = Vec::with_capacity(keys_len);
+            for i in 0..keys_len as u64 {
+                keys.push(memory.get(syscall_ptr + 3 + i));
+            }
+            let data_offset = 3 + keys_len as u64;
+            let data_len = memory.get(syscall_ptr + data_offset) as usize;
+            let mut data = Vec::with_capacity(data_len);
+            for i in 0..data_len as u64 {
+                data.push(memory.get(syscall_ptr + data_offset + 1 + i));
+            }
+            ctx.syscall.events.push(SyscallEvent { keys, data });
+            let resp = data_offset + 1 + data_len as u64;
+            memory.set(syscall_ptr + resp, 0);     // remaining_gas
+            memory.set(syscall_ptr + resp + 1, 0); // error_code
+        }
+
+        sel::GET_EXECUTION_INFO => {
+            // Request:  [sel, gas]
+            // Response: [remaining_gas=0, err=0, exec_info_ptr]
+            let exec_info_ptr = syscall_exec_info_ptr(memory, ctx);
+            memory.set(syscall_ptr + 2, 0);              // remaining_gas
+            memory.set(syscall_ptr + 3, 0);              // error_code
+            memory.set(syscall_ptr + 4, exec_info_ptr);  // exec_info_ptr
+        }
+
+        sel::GET_BLOCK_HASH => {
+            // Request:  [sel, gas, block_number]
+            // Response: [remaining_gas=0, err=0, hash_low, hash_high]
+            // Return a deterministic mock hash = block_number (low64)
+            let _block = memory.get(syscall_ptr + 2);
+            memory.set(syscall_ptr + 3, 0); // remaining_gas
+            memory.set(syscall_ptr + 4, 0); // error_code
+            memory.set(syscall_ptr + 5, ctx.syscall.block_number); // hash (mock)
+            memory.set(syscall_ptr + 6, 0); // hash high word
+        }
+
+        _ => {
+            // Unknown or unimplemented syscall (CallContract, Deploy, LibraryCall, etc.).
+            // Write a minimal [remaining_gas=0, err=0] success response at offset+2
+            // (covers the gas+err fields after selector+gas_consumed).
+            // This prevents memory-uninitialized panics for programs that call these
+            // but do not act on their return values.
+            if cfg!(debug_assertions) {
+                eprintln!("syscall: unhandled selector {selector:#018x} at ptr={syscall_ptr}");
+            }
+            for offset in 2..=9u64 {
+                if memory.get(syscall_ptr + offset) == 0 {
+                    memory.set(syscall_ptr + offset, 0);
+                }
+            }
         }
     }
+}
+
+/// Lazily allocate and populate the execution-info memory region.
+/// Returns the exec_info_ptr to include in GetExecutionInfo responses.
+///
+/// Memory layout (all relative to `base = ctx.alloc_segment()`):
+///   base +  0..18 : tx_info fields (19 words)
+///   base + 19..21 : block_info fields (3 words: block_number, timestamp, sequencer)
+///   base + 22     : empty-array sentinel (shared by empty sig / resource_bounds / etc.)
+///   base + 23..27 : exec_info fields (5 words: block_ptr, tx_ptr, caller, contract, selector)
+fn syscall_exec_info_ptr(memory: &mut Memory, ctx: &mut HintContext) -> u64 {
+    if let Some(ptr) = ctx.syscall.exec_info_base {
+        return ptr;
+    }
+
+    let base = ctx.alloc_segment();
+    let tx_info   = base;
+    let block_info = base + 19;
+    let sentinel  = base + 22; // empty-array start == end for all empty arrays
+    let exec_info = base + 23;
+
+    // --- tx_info (19 words) ---
+    memory.set(tx_info,      1);                                // version = 1
+    memory.set(tx_info + 1,  ctx.syscall.caller_address);      // account_contract_address
+    memory.set(tx_info + 2,  0);                                // max_fee
+    memory.set(tx_info + 3,  sentinel);                         // signature_start (empty)
+    memory.set(tx_info + 4,  sentinel);                         // signature_end   (empty)
+    memory.set(tx_info + 5,  0);                                // transaction_hash
+    memory.set(tx_info + 6,  0);                                // chain_id
+    memory.set(tx_info + 7,  0);                                // nonce
+    memory.set(tx_info + 8,  sentinel);                         // resource_bounds_start
+    memory.set(tx_info + 9,  sentinel);                         // resource_bounds_end
+    memory.set(tx_info + 10, 0);                                // tip
+    memory.set(tx_info + 11, sentinel);                         // paymaster_data_start
+    memory.set(tx_info + 12, sentinel);                         // paymaster_data_end
+    memory.set(tx_info + 13, 0);                                // nonce_data_availability_mode
+    memory.set(tx_info + 14, 0);                                // fee_data_availability_mode
+    memory.set(tx_info + 15, sentinel);                         // account_deployment_data_start
+    memory.set(tx_info + 16, sentinel);                         // account_deployment_data_end
+    memory.set(tx_info + 17, sentinel);                         // proof_facts_start
+    memory.set(tx_info + 18, sentinel);                         // proof_facts_end
+
+    // --- block_info (3 words) ---
+    memory.set(block_info,     ctx.syscall.block_number);       // block_number
+    memory.set(block_info + 1, ctx.syscall.block_timestamp);    // block_timestamp
+    memory.set(block_info + 2, 0);                              // sequencer_address
+
+    // sentinel cell — just needs to exist (programs with empty arrays won't read past it)
+    memory.set(sentinel, 0);
+
+    // --- exec_info (5 words) ---
+    memory.set(exec_info,     block_info);                      // block_info_ptr
+    memory.set(exec_info + 1, tx_info);                         // tx_info_ptr
+    memory.set(exec_info + 2, ctx.syscall.caller_address);      // caller_address
+    memory.set(exec_info + 3, ctx.syscall.contract_address);    // contract_address
+    memory.set(exec_info + 4, ctx.syscall.entry_point_selector);// entry_point_selector
+
+    ctx.syscall.exec_info_base = Some(exec_info);
+    exec_info
 }
 
 // ---------------------------------------------------------------------------

@@ -7,7 +7,7 @@
 use vortexstark::cairo_air::{
     decode::Instruction,
     vm::Memory,
-    trace::{N_VM_COLS, N_CONSTRAINTS, COL_PC, COL_INST_LO, COL_DST_ADDR, COL_DST,
+    trace::{N_VM_COLS, N_CONSTRAINTS, COL_PC, COL_INST_LO, COL_INST_HI, COL_DST_ADDR, COL_DST,
             COL_OP0_ADDR, COL_OP0, COL_OP1_ADDR, COL_OP1},
     pedersen::{PedersenBuiltin, gpu_init, N_LIMBS},
     builtins::gpu_pedersen_builtin_trace,
@@ -163,7 +163,7 @@ fn main() {
 
         // Columns needed for LogUp
         let logup_cols: std::collections::HashSet<usize> = [
-            COL_PC, COL_INST_LO, COL_DST_ADDR, COL_DST,
+            COL_PC, COL_INST_LO, COL_INST_HI, COL_DST_ADDR, COL_DST,
             COL_OP0_ADDR, COL_OP0, COL_OP1_ADDR, COL_OP1,
         ].iter().copied().collect();
 
@@ -171,7 +171,7 @@ fn main() {
         // Only one eval column in VRAM at a time (+ LogUp columns retained).
         // VRAM per column: trace(n×4) + eval(2n×4) + twiddles(~2GB) ≈ 3n×4 + 2GB.
         // At log_n=28: 3×1GB + 2GB = 5GB per column. Fits easily.
-        let mut d_eval_cols: Vec<DeviceBuffer<u32>> = Vec::with_capacity(8);
+        let mut d_eval_cols: Vec<DeviceBuffer<u32>> = Vec::with_capacity(9);
         let mut col_roots: Vec<[u32; 8]> = Vec::with_capacity(N_VM_COLS);
 
         // At large log_n, only process LogUp columns to save CPU+GPU memory.
@@ -274,11 +274,15 @@ fn main() {
         if log_n < 28 {
             // Standard fused path: all 8 LogUp columns in VRAM simultaneously
             unsafe {
+                // d_eval_cols order (sorted by col index):
+                // [0]=COL_PC, [1]=COL_INST_LO, [2]=COL_INST_HI,
+                // [3]=COL_DST_ADDR, [4]=COL_DST, [5]=COL_OP0_ADDR,
+                // [6]=COL_OP0, [7]=COL_OP1_ADDR, [8]=COL_OP1
                 ffi::cuda_logup_memory_fused(
-                    d_eval_cols[0].as_ptr(), d_eval_cols[1].as_ptr(),
-                    d_eval_cols[2].as_ptr(), d_eval_cols[3].as_ptr(),
-                    d_eval_cols[4].as_ptr(), d_eval_cols[5].as_ptr(),
-                    d_eval_cols[6].as_ptr(), d_eval_cols[7].as_ptr(),
+                    d_eval_cols[0].as_ptr(), d_eval_cols[1].as_ptr(), d_eval_cols[2].as_ptr(),
+                    d_eval_cols[3].as_ptr(), d_eval_cols[4].as_ptr(),
+                    d_eval_cols[5].as_ptr(), d_eval_cols[6].as_ptr(),
+                    d_eval_cols[7].as_ptr(), d_eval_cols[8].as_ptr(),
                     d_logup0.as_mut_ptr(), d_logup1.as_mut_ptr(),
                     d_logup2.as_mut_ptr(), d_logup3.as_mut_ptr(),
                     z_arr.as_ptr(), alpha_arr.as_ptr(),

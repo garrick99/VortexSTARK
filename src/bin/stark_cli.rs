@@ -77,6 +77,21 @@ enum Commands {
         /// Maximum execution steps
         #[arg(long, default_value = "1000000")]
         steps: usize,
+        /// Initial contract storage as JSON: '{"0xkey": "0xvalue", ...}'
+        #[arg(long)]
+        storage: Option<String>,
+        /// Caller address (felt252 hex, e.g. 0x1234)
+        #[arg(long, default_value = "0x0")]
+        caller: String,
+        /// Contract address (felt252 hex)
+        #[arg(long, default_value = "0x1")]
+        contract_address: String,
+        /// Entry point selector (felt252 hex)
+        #[arg(long, default_value = "0x0")]
+        entry_point_selector: String,
+        /// Block number for get_block_hash / get_execution_info
+        #[arg(long, default_value = "1000")]
+        block_number: u64,
     },
 
     /// Inspect/disassemble a CASM file
@@ -122,8 +137,15 @@ fn main() {
         Commands::ProveFile { program, output, steps, log_n, entry_point } => {
             cmd_prove_file(&program, &output, steps, log_n, entry_point);
         }
-        Commands::ProveStarknet { class_hash, rpc, output, steps } => {
-            cmd_prove_starknet(&class_hash, &rpc, &output, steps);
+        Commands::ProveStarknet {
+            class_hash, rpc, output, steps,
+            storage, caller, contract_address, entry_point_selector, block_number,
+        } => {
+            cmd_prove_starknet(
+                &class_hash, &rpc, &output, steps,
+                storage.as_deref(), &caller, &contract_address,
+                &entry_point_selector, block_number,
+            );
         }
         Commands::Inspect { program, max } => cmd_inspect(&program, max),
         Commands::FetchBlock { block, rpc, fetch_classes } => {
@@ -245,7 +267,25 @@ fn cmd_prove_file(path: &PathBuf, output: &str, max_steps: Option<usize>, log_n_
     eprintln!("  written to: {output}");
 }
 
-fn cmd_prove_starknet(class_hash: &str, rpc_url: &str, output: &str, max_steps: usize) {
+fn parse_hex_u64(s: &str) -> u64 {
+    let s = s.trim().trim_start_matches("0x").trim_start_matches("0X");
+    u64::from_str_radix(s, 16).unwrap_or(0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_prove_starknet(
+    class_hash: &str,
+    rpc_url: &str,
+    output: &str,
+    max_steps: usize,
+    storage_json: Option<&str>,
+    caller: &str,
+    contract_address: &str,
+    entry_point_selector: &str,
+    block_number: u64,
+) {
+    use vortexstark::cairo_air::hints::SyscallState;
+
     eprintln!("Fetching CASM from Starknet RPC...");
     eprintln!("  RPC:        {rpc_url}");
     eprintln!("  Class hash: {class_hash}");
@@ -257,6 +297,31 @@ fn cmd_prove_starknet(class_hash: &str, rpc_url: &str, output: &str, max_steps: 
     }).unwrap_or_else(|e| { eprintln!("ERROR: {e}"); std::process::exit(1); });
 
     casm_loader::print_summary(&program);
+
+    // Build SyscallState from CLI args
+    let mut sc = SyscallState::default();
+    sc.caller_address       = parse_hex_u64(caller);
+    sc.contract_address     = parse_hex_u64(contract_address);
+    sc.entry_point_selector = parse_hex_u64(entry_point_selector);
+    sc.block_number         = block_number;
+
+    if let Some(json) = storage_json {
+        match serde_json::from_str::<serde_json::Value>(json) {
+            Ok(serde_json::Value::Object(map)) => {
+                for (k, v) in &map {
+                    let key = parse_hex_u64(k.as_str());
+                    let val = v.as_str().map(parse_hex_u64)
+                        .or_else(|| v.as_u64())
+                        .unwrap_or(0);
+                    sc.storage.insert(key, val);
+                }
+                eprintln!("  storage:    {} entries", sc.storage.len());
+            }
+            _ => {
+                eprintln!("WARN: --storage JSON parse failed, using empty storage");
+            }
+        }
+    }
 
     // Detect steps
     eprintln!("Auto-detecting execution steps (max {max_steps})...");
@@ -284,13 +349,22 @@ fn cmd_prove_starknet(class_hash: &str, rpc_url: &str, output: &str, max_steps: 
     ffi::init_memory_pool();
 
     let t0 = Instant::now();
-    let proof = vortexstark::cairo_air::prover::cairo_prove_program(&program, n_steps, log_n)
-        .unwrap_or_else(|e| { eprintln!("ERROR: {e}"); std::process::exit(1); });
+    let (proof, sc_out) =
+        vortexstark::cairo_air::prover::cairo_prove_program_with_syscalls(
+            &program, n_steps, log_n, sc,
+        ).unwrap_or_else(|e| { eprintln!("ERROR: {e}"); std::process::exit(1); });
     let prove_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     eprintln!("  prove: {prove_ms:.1}ms");
     if !program.hints.is_empty() {
         eprintln!("  hints executed: {} hint sites", program.hints.len());
+    }
+    if !sc_out.events.is_empty() {
+        eprintln!("  events emitted: {}", sc_out.events.len());
+    }
+    if sc_out.storage.values().any(|&v| v != 0) {
+        let writes: Vec<_> = sc_out.storage.iter().filter(|(_, v)| **v != 0).collect();
+        eprintln!("  storage writes: {}", writes.len());
     }
 
     let bytes = serialize_cairo_proof(&proof);

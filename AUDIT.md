@@ -1,7 +1,7 @@
 # VortexSTARK Internal Audit Document
 
 **Status:** Internal pre-audit. No external audit has been conducted.
-**Last updated:** 2026-03-25
+**Last updated:** 2026-03-26
 **Auditor:** Self (automated + manual)
 
 ---
@@ -81,7 +81,7 @@ The Cairo VM AIR has **35 constraints (0-34)**: 31 VM execution constraints, 2 L
 
 ## 4. ZK (Zero-Knowledge) Status
 
-VortexSTARK provides **partial ZK** as of 2026-03-25.
+VortexSTARK provides **partial ZK** as of 2026-03-26.
 
 ### Blinded columns (22/34)
 `ap`, `fp`, all 15 instruction flags, `res`, `off0`, `off1`, `off2`, `dst_inv`.
@@ -94,12 +94,18 @@ points (evaluations are randomly masked). FRI proves the blinded polynomial low-
 **LogUp-involved (9):** `pc`, `inst_lo`, `inst_hi`, `dst_addr`, `dst`, `op0_addr`, `op0`, `op1_addr`, `op1`.
 **Dict linkage (3):** `dict_key` (col 31), `dict_new` (col 32), `dict_active` (col 33).
 
-The 9 LogUp columns appear in QM31-inverse denominators of C31/C32. The 3 dict columns appear in
-the C34 QM31-inverse denominator. Adding `r · Z_H` to any of these would make the blinded quotient
-a rational function, breaking FRI. Full ZK for these columns requires protocol redesign. See GAP-4.
+The current code places all 34 columns in `ZK_BLIND_COLS` (including these 12), but the
+soundness of blinding the LogUp denominator columns has not been formally verified.
+These columns appear in QM31-inverse denominators in constraints C31, C32, C34.
+The concern: blinding them introduces `r · Z_H(x)` terms into the denominator expressions,
+and it is not yet proven that the resulting quotient polynomial Q = C/Z_H remains a
+well-defined low-degree polynomial acceptable to FRI.
 
-**Privacy implication:** The 12 unblinded columns expose memory access patterns and dict operation
-sites at query positions (addresses, values, which steps had dict accesses).
+**Status (needs auditor attention):** The 12 columns appear in `ZK_BLIND_COLS` and tests pass,
+but the formal argument has not been established. See GAP-4.
+
+**Privacy implication (worst case):** The 12 columns expose memory access patterns and dict
+operation sites at query positions (addresses, values, which steps had dict accesses).
 
 ---
 
@@ -160,17 +166,41 @@ not a soundness bug.
 **Status:** Documented; any unrecognized syscall hint is silently skipped with a stderr warning.
 **What's needed:** Syscall emulation table.
 
-### GAP-4: Partial ZK — PARTIALLY CLOSED
-**Severity:** Privacy gap (not a soundness gap)
-**Status (2026-03-26):** 22/34 trace columns blinded via `r · Z_H(x)`. See §4 above.
-**Remaining gap:** 9 columns are unblinded due to LogUp rational constraint compatibility.
-Full ZK requires protocol redesign for those 9 columns.
+### GAP-4: Partial ZK — OPEN
+**Severity:** Privacy gap (not a soundness gap); potential soundness risk if blinding breaks FRI
+**Status (2026-03-26):** All 34 columns are placed in `ZK_BLIND_COLS` in the code, but the
+formal soundness of blinding the 12 LogUp/dict denominator columns has not been established.
+**What's needed:**
+1. Prove (or disprove) that blinding columns in QM31-inverse denominator expressions still
+   yields a well-defined polynomial quotient Q = C/Z_H acceptable to FRI.
+2. If correct: document the formal argument. If incorrect: revert blinding for those 12 columns
+   and document the privacy limitation.
+**Auditor priority:** HIGH — needs formal analysis before claiming full ZK.
 
 ### GAP-5: FRI security parameters not formally analyzed
 **Severity:** Medium
 **Status:** Conjectured ~160-bit security (80 queries × 2 bits/query). No formal analysis
 over the Circle group.
 **What's needed:** Security proof for Circle-FRI proximity gap over M31.
+
+### GAP-6: Missing proof-of-work nonce — CLOSED
+**Severity:** Medium → CLOSED
+**Status (2026-03-26):** `CairoProof` now includes `pow_nonce: u64`. The prover grinds a
+valid nonce on GPU (RTX 5090, ~5ms for 26 bits) after all FRI commitments are mixed into the
+Fiat-Shamir transcript. The verifier checks the nonce before sampling query indices.
+
+**What the gap was:** Without PoW, an adversary could observe all Merkle commitments, predict
+the deterministic query indices, and adaptively craft commitments that pass the queried
+positions. The prover needed to commit to a nonce that requires 2^POW_BITS work to find
+*after* seeing the commitments — preventing this adaptive strategy.
+
+**Protocol (matches stwo's Blake2s convention):**
+- `prefix_digest = Blake2s(0x12345678_LE || [0u8;12] || channel_state || POW_BITS_LE)`
+- Valid nonce: `Blake2s(prefix_digest || nonce_LE)` has ≥ `POW_BITS` trailing zeros in bytes 0–15 (u128 LE)
+- After verification: `channel.mix_u64(nonce)` then query indices sampled as normal
+- `POW_BITS = 26` (64M expected hashes; ~5ms GPU, ~several seconds CPU)
+
+**Files:** `src/prover.rs` (POW_BITS const), `src/channel.rs` (`mix_u64`, `verify_pow_nonce`, `state_words`), `src/cairo_air/prover.rs` (`pow_nonce` field, GPU grind, verifier check), `cuda/grind.cu` (existing kernel, now wired up).
 
 ---
 
@@ -187,12 +217,12 @@ over the Circle group.
 | LogUp memory | 4 | Cancellation for 2-step and 10-step programs |
 | Range check | 3 | Offset validation |
 | Cairo hints | 13 | AllocSegment, dict lifecycle, squash, U256InvModN |
-| Dict consistency + LogUp | 16 | Chain verify, LogUp cancellation, Fiat-Shamir binding, tamper tests, dict sub-AIR (11 unit tests), permutation argument |
-| ZK blinding | 1 | Different commitments per run, both verify |
+| Dict consistency + LogUp | 18 | Chain verify, LogUp cancellation, Fiat-Shamir binding, tamper tests, dict sub-AIR (11 unit tests), permutation argument, padding row tamper, dict_active binary |
+| ZK blinding | 1 | Different commitments per run, both verify (34/34 columns) |
 | Execution range gate | 2 | Overflow detected, valid program passes |
 | Proof serialization | 1 | Prove → JSON → deserialize → verify roundtrip |
 | Property / cross-validation | ~18 | Random programs, reference VM comparison |
-| **Total** | **~216** (lib) **+ 28** (integration) | |
+| **Total** | **233** (lib) **+ 28** (integration) | |
 
 ---
 
@@ -225,8 +255,8 @@ on a valid proof is a soundness/completeness bug.
    kernel matches the CPU verifier path
 4. **Instruction decomposition constraint** (constraint 30): verify the algebraic identity over M31
    and the 2^31≡1 reduction
-5. **Partial ZK** (GAP-4): confirm 22 blinded columns satisfy the ZK property; confirm the 9
-   unblinded columns' privacy implications are correctly documented
+5. **ZK blinding** (GAP-4 open): formally analyze whether blinding the 12 LogUp/dict denominator
+   columns (in `ZK_BLIND_COLS`) preserves a well-defined low-degree quotient polynomial for FRI
 6. **Merkle domain separation**: verify the `h[6]^=1` personalization prevents leaf/node confusion
 7. **Fiat-Shamir ordering**: verify prover and verifier mix commitments and draw challenges in the
    same order — the dict commitment block must precede `z_mem`/`alpha_mem`/`z_rc` in both prover
@@ -250,7 +280,7 @@ on a valid proof is a soundness/completeness bug.
 - [x] Dict tamper tests: exec_sum tamper, sort-order tamper, hash mismatch — all detected
 - [x] `cairo_prove_program` returns error for truncated felt252 bytecode (>u64)
 - [x] `cairo_prove_program` returns error for execution-time values exceeding M31
-- [x] 22/34 trace columns ZK-blinded; blinding verified across proof runs
+- [~] 34/34 trace columns in ZK_BLIND_COLS; soundness of blinding 12 LogUp/dict columns unverified (GAP-4)
 - [x] Proof serialize → deserialize → verify roundtrip passes
 - [x] Dict sub-AIR: 2 Merkle polynomial commitments (exec data, sorted data)
 - [x] Full exec and sorted trace data in proof; verifier recomputes Merkle roots for authentication
@@ -262,6 +292,7 @@ on a valid proof is a soundness/completeness bug.
 - [x] dict_trace_commitment (Group C) verified with auth paths at every query
 - [x] dict_main_interaction_commitment (S_dict) bound to Fiat-Shamir via dict_link_final
 - [x] Verifier independently recomputes exec_key_new_sum and checks dict_link_final == exec_key_new_sum
-- [ ] Full ZK for 12 unblinded columns (9 LogUp + 3 dict) — requires protocol redesign (see GAP-4)
+- [ ] Full ZK for 12 LogUp/dict denominator columns — formal soundness argument needed (GAP-4 open)
 - [ ] Formal FRI security analysis for Circle group — see GAP-5; current argument documented in SOUNDNESS.md
+- [x] Proof-of-work nonce (GAP-6 CLOSED): `pow_nonce` in `CairoProof`, GPU grind + verifier check
 - [ ] External third-party audit

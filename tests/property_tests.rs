@@ -52,7 +52,7 @@ fn make_add_program(n_steps: usize) -> Vec<u64> {
 #[test]
 fn test_completeness_multiple_sizes() {
     init_gpu();
-    for (n_steps, log_n) in [(4, 4), (8, 4), (16, 4), (32, 5), (64, 6)] {
+    for (n_steps, log_n) in [(16, 4), (32, 5), (64, 6), (128, 7)] {
         let prog = make_add_program(n_steps);
         let proof = cairo_prove(&prog, n_steps, log_n);
         let result = cairo_verify(&proof);
@@ -169,6 +169,29 @@ fn test_soundness_fri_last_layer_tamper() {
         assert!(result.is_err(),
             "Tampered fri_last_layer[{i}] should be detected");
     }
+}
+
+/// Tamper with the PoW nonce and verify rejection.
+#[test]
+fn test_soundness_pow_nonce_tamper() {
+    init_gpu();
+    let prog = make_add_program(32);
+    let proof_base = cairo_prove(&prog, 32, 5);
+
+    // Baseline must pass
+    cairo_verify(&proof_base).expect("baseline proof must verify");
+
+    // Nonce+1 should fail PoW check
+    let mut proof = proof_base.clone();
+    proof.pow_nonce = proof_base.pow_nonce.wrapping_add(1);
+    assert!(cairo_verify(&proof).is_err(),
+        "pow_nonce+1 should be rejected");
+
+    // Nonce-1 should also fail
+    let mut proof2 = proof_base.clone();
+    proof2.pow_nonce = proof_base.pow_nonce.wrapping_sub(1);
+    assert!(cairo_verify(&proof2).is_err(),
+        "pow_nonce-1 should be rejected");
 }
 
 // ---------------------------------------------------------------------------

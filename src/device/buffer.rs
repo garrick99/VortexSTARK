@@ -3,6 +3,13 @@
 use crate::cuda::ffi;
 use std::ffi::c_void;
 use std::marker::PhantomData;
+use std::sync::Mutex;
+
+// cudaMallocAsync and cudaFreeAsync are NOT thread-safe: concurrent calls from
+// multiple host threads corrupt the pool's internal metadata (NVIDIA docs).
+// Synchronous cudaMalloc/cudaFree are thread-safe (serialized by the driver),
+// so only the async path needs a lock.
+static POOL_LOCK: Mutex<()> = Mutex::new(());
 
 /// Owning handle to a contiguous GPU allocation.
 /// Automatically freed on drop (unless `owns` is false for slice views).
@@ -62,6 +69,7 @@ impl<T> DeviceBuffer<T> {
         let err = if use_sync() {
             unsafe { ffi::cudaMalloc(&mut ptr, bytes) }
         } else {
+            let _g = POOL_LOCK.lock().unwrap();
             unsafe { ffi::cudaMallocAsync(&mut ptr, bytes, std::ptr::null_mut()) }
         };
         if err != 0 {
@@ -529,6 +537,7 @@ impl<T> Drop for DeviceBuffer<T> {
             if use_sync() {
                 unsafe { ffi::cudaFree(self.ptr as *mut c_void) };
             } else {
+                let _g = POOL_LOCK.lock().unwrap();
                 unsafe { ffi::cudaFreeAsync(self.ptr as *mut c_void, std::ptr::null_mut()) };
             }
         }

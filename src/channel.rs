@@ -71,6 +71,58 @@ impl Channel {
         (raw % bound as u64) as usize
     }
 
+    /// Mix a u64 (PoW nonce) into the channel state.
+    /// Follows stwo's Blake2s channel convention: mix_u32s(&[lo, hi]).
+    pub fn mix_u64(&mut self, value: u64) {
+        let lo = value as u32;
+        let hi = (value >> 32) as u32;
+        let mut input = [0u8; 40];
+        input[..32].copy_from_slice(&self.state);
+        input[32..36].copy_from_slice(&lo.to_le_bytes());
+        input[36..40].copy_from_slice(&hi.to_le_bytes());
+        self.state = blake2s_hash(&input);
+        self.counter = 0;
+    }
+
+    /// Return the current channel state as 8 u32 words (for GPU PoW prefix computation).
+    pub fn state_words(&self) -> [u32; 8] {
+        let mut out = [0u32; 8];
+        for (i, chunk) in self.state.chunks_exact(4).enumerate() {
+            out[i] = u32::from_le_bytes(chunk.try_into().unwrap());
+        }
+        out
+    }
+
+    /// Verify that Blake2s(prefix_digest || nonce_le) has >= pow_bits trailing zeros
+    /// in its first 16 bytes (u128 LE), matching stwo's Blake2s PoW convention.
+    ///
+    /// prefix_digest = Blake2s(0x12345678_LE || [0u8;12] || self.state || pow_bits_LE)
+    pub fn verify_pow_nonce(&self, pow_bits: u32, nonce: u64) -> bool {
+        // Compute prefix_digest (52-byte input)
+        let mut prefix_input = [0u8; 52];
+        prefix_input[0..4].copy_from_slice(&0x12345678u32.to_le_bytes());
+        // bytes 4..16 are zero padding
+        prefix_input[16..48].copy_from_slice(&self.state);
+        prefix_input[48..52].copy_from_slice(&pow_bits.to_le_bytes());
+        let prefix_digest = blake2s_hash(&prefix_input);
+
+        // Compute Blake2s(prefix_digest || nonce_le) — 40-byte input
+        let mut input = [0u8; 40];
+        input[..32].copy_from_slice(&prefix_digest);
+        input[32..40].copy_from_slice(&nonce.to_le_bytes());
+        let result = blake2s_hash(&input);
+
+        // Check trailing zeros of first 16 bytes (u128 LE)
+        let lo = u64::from_le_bytes(result[0..8].try_into().unwrap());
+        let hi = u64::from_le_bytes(result[8..16].try_into().unwrap());
+        let tz = if lo != 0 {
+            lo.trailing_zeros()
+        } else {
+            64 + hi.trailing_zeros()
+        };
+        tz >= pow_bits
+    }
+
     fn squeeze(&mut self) -> [u8; 32] {
         let mut input = [0u8; 40];
         input[..32].copy_from_slice(&self.state);
