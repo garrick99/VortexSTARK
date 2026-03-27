@@ -34,7 +34,7 @@ pub const LOG_LAST_LAYER: u32 = 4; // last layer size = 16
 // ─────────────────────────────────────────────
 
 /// Decommitment for one query at one fold layer.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FriLayerDecommit {
     /// f_l[low] where low = query_idx mod (M_l / 2).
     pub f_lo: [u32; 8],
@@ -47,7 +47,7 @@ pub struct FriLayerDecommit {
 }
 
 /// All layer decommitments for one query index.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FriQueryDecommit {
     /// layers[0] is the decommitment into the caller's f0 tree.
     /// layers[1..] are decommitments into inner FRI trees.
@@ -55,7 +55,7 @@ pub struct FriQueryDecommit {
 }
 
 /// The serializable FRI proof.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FriProof {
     /// Merkle roots for FRI layers 1..n_folds.
     /// Layer 0 root is the caller's commitment (not repeated here).

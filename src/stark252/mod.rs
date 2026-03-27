@@ -25,6 +25,7 @@ pub mod fri;
 pub mod stark;
 pub mod cairo_air;
 pub mod multi_stark;
+pub mod logup;
 
 pub use field::{Fp, ntt_root_of_unity, batch_inverse, Channel252,
                 fp_to_u32x8, fp_from_u32x8};
@@ -33,3 +34,4 @@ pub use verifier::verify;
 pub use fri::{FriProof, fri_commit, fri_build_proof, fri_verify};
 pub use stark::{StarkAir, StarkProof, prove as prove_general, verify_with_air};
 pub use multi_stark::{MultiColumnAir, MultiProof, prove_multi, verify_multi};
+pub use logup::{MemoryAccess, MemoryLogupProof, prove_memory_logup, verify_memory_logup};
