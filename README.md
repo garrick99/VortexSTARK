@@ -6,7 +6,7 @@ GPU-native Circle STARK prover with end-to-end proof generation and verification
 
 ### End-to-end proven and verified on hardware
 
-- **Fibonacci STARK**: Full prove → verify pipeline, 100-bit conjectured security, 12 tamper-detection tests
+- **Fibonacci STARK**: Full prove → verify pipeline, 100-bit conjectured security, 18+ tamper-detection tests
 - **Cairo VM STARK**: 34-column trace, 35 transition constraints, verifier independently evaluates all constraints at query points
 - **LogUp memory consistency**: Full cancellation check — memory table committed as explicit proof data (all unique entries), verifier independently checks exec_sum + table_sum == 0
 - **Pedersen hash**: GPU windowed EC scalar multiplication, 37.7M hashes/sec, verified against CPU reference
@@ -19,13 +19,16 @@ GPU-native Circle STARK prover with end-to-end proof generation and verification
 | Workload | Scale | Prove | Verify |
 |----------|-------|-------|--------|
 | Fibonacci log_n=24 | 16.8M elements | 214ms | 6.2ms |
-| Fibonacci log_n=28 | 268M elements | 1.56s | 8.2ms |
-| Fibonacci log_n=30 | 1.07B elements | 9.79s | 10.7ms |
-| Cairo VM log_n=20 | 1.0M steps | 1.73s | 0.30s |
-| Cairo VM log_n=24 | 16.8M steps | 29.5s | 6.5s |
+| Fibonacci log_n=28 | 268M elements | 1.55s | 8.2ms |
+| Fibonacci log_n=30 | 1.07B elements | 10.6s | 9.3ms |
+| Cairo VM log_n=20 | 1.0M steps | 994ms | 112ms |
+| Cairo VM log_n=24 | 16.8M steps | 16.8s | 1.66s |
+| Cairo VM log_n=26 | 67M steps | 169s | 7.9s |
 | Poseidon2 trace+NTT log_n=28 | 8.9M hashes | 1.92s | — |
 | RPO-M31 trace+NTT log_n=28 | 19.2M hashes | 5.51s | — |
 | Pedersen GPU batch | 1M hashes | 26.6ms | — |
+
+All Cairo VM numbers include 34 columns, 35 constraints, full LogUp+RC memory table, S_dict LogUp, OODS quotient, and 26-bit proof-of-work. Fibonacci numbers are the standalone single-column prover.
 
 ### Adversarial soundness (constraint coverage)
 
@@ -98,14 +101,14 @@ Requires: Rust 1.85+ (stable), CUDA 13.0+, RTX 5090 (SM 12.0) or RTX 4090 (SM 8.
 
 ```bash
 cargo build --release
-cargo test -- --test-threads=1    # 228 tests
+cargo test                          # 269 tests (239 lib + 30 integration)
 cargo run --release --bin full_benchmark
 cargo run --release --bin gpu_bench     # pre-flight checks + per-section GPU telemetry
 ```
 
 ## Tests
 
-228 tests covering: M31/CM31/QM31 field arithmetic, Circle NTT, Merkle tree (commit, auth paths, tiled, SoA4), FRI (fold, circle fold, deterministic), STARK prover + verifier (multiple sizes, tamper detection), Cairo VM (decoder, executor, Fibonacci, constraints, LogUp, range checks, instruction decomposition), Poseidon, Pedersen (Stark252 field, EC ops, GPU vs CPU), Bitwise (memory segment, trace generation, constraint verification, prove/verify round-trip, tamper detection), LogUp/RC soundness (memory table commitment, cancellation check, RC counts commitment), GPU constraint eval (bytecode VM, warp-cooperative), GPU leaf hashing (Blake2s, domain separation), CASM loader, Cairo hints (AllocSegment, AllocFelt252Dict, dict entry lifecycle, squash, U256InvModN, multi-dict programs, isqrt edge cases).
+269 tests (239 lib + 30 integration) covering: M31/CM31/QM31 field arithmetic, Circle NTT, Merkle tree (commit, auth paths, tiled, SoA4), FRI (fold, circle fold, deterministic), STARK prover + verifier (multiple sizes, tamper detection), Cairo VM (decoder, executor, Fibonacci, constraints, LogUp, range checks, instruction decomposition), Poseidon, Pedersen (Stark252 field, EC ops, GPU vs CPU), Bitwise (memory segment, trace generation, constraint verification, prove/verify round-trip, tamper detection), LogUp/RC soundness (memory table commitment, cancellation check, RC counts commitment), OODS quotient formula correctness, GPU constraint eval (bytecode VM, warp-cooperative), GPU leaf hashing (Blake2s, domain separation), CASM loader, Cairo hints (AllocSegment, AllocFelt252Dict, dict entry lifecycle, squash, U256InvModN, multi-dict programs, isqrt edge cases), property tests (completeness, soundness, random mutations), cross-validation (reference VM comparison for 9 program types).
 
 ## Break This System
 
@@ -129,7 +132,8 @@ These should **not** break. If they do, that's a real soundness bug:
 - Tampering any committed value (trace, quotient, FRI, commitment) is detected
 - LogUp final-value enforcement: corrupting the memory consistency sum breaks FRI verification
 - FRI fold equations: algebraic consistency checked at every query across all layers
-- Merkle auth paths: data integrity verified for trace, quotient, and all FRI layers
+- Merkle auth paths: data integrity verified for trace, quotient, OODS quotient, and all FRI layers
+- OODS quotient formula: verifier independently recomputes Q(p) from decommitted trace and AIR quotient values and rejects any mismatch
 - Fiat-Shamir transcript: any mutation to public inputs, commitments, or challenges cascades into rejection
 
 ### Tamper tests (all passing)
@@ -153,6 +157,7 @@ These should **not** break. If they do, that's a real soundness bug:
 | `test_cairo_prove_verify_tampered_quotient` | Corrupt quotient value | REJECTED |
 | `test_cairo_prove_verify_tampered_fri` | Corrupt FRI value | REJECTED |
 | `test_tamper_ec_trace` | Corrupt EC trace commitment | REJECTED |
+| `test_soundness_oods_quotient_tamper` | Corrupt OODS quotient decommitment value | REJECTED |
 
 ## License
 

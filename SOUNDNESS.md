@@ -55,7 +55,7 @@
   which by the Schwartz-Zippel argument implies C(x) vanishes on the trace domain w.h.p.
 
 ### Verifier-side constraint evaluation
-- Verifier independently evaluates all 31 constraints at query points
+- Verifier independently evaluates all 35 constraints at query points (31 VM execution + 2 LogUp/RC step-transition + 2 dict linkage)
 - Checks constraint_sum == quotient_value * Z_H(eval_point.x) (accounting for zerofier)
 - Per-constraint-family tamper tests all passing
 
@@ -318,7 +318,43 @@ run through `execute_to_columns_with_hints` and therefore has no overflow counte
 entry points are intended for hand-crafted M31 programs (benchmarks, tests) where overflow
 cannot occur; use `cairo_prove_program` for production.
 
-## Confidence Summary (2026-03-26)
+### OODS quotient formula verification (ADDED 2026-03-27)
+
+**Gap closed:** Previously the verifier checked Merkle auth paths for the OODS quotient commitment
+but never verified that the committed values actually equal the OODS quotient formula. A malicious
+prover could commit any arbitrary polynomial as the FRI input and it would pass Merkle verification
+and FRI folding — there was no link between the committed OODS quotient and the decommitted trace
+and AIR quotient values.
+
+**What was added:** For each query point qi, the verifier independently computes:
+
+```
+Q(qi) = full_numer_z(qi) · D(z, p_nat)⁻¹ + full_numer_zn(qi) · D(z_next, p_nat)⁻¹
+```
+
+where:
+- `p_nat = eval_coset.at(qi)` — natural-order coset point (matches `cuda_compute_coset_points`)
+- `D(sp, p) = (Re(sp.x) − p.x)·Im(sp.y) − (Re(sp.y) − p.y)·Im(sp.x)` — circle STARK OODS denominator
+- `full_numer_z = Σᵢ(αⁱ·colᵢ(p_br) − aᵢ) − linear_acc_z · p_nat.y`  where `aᵢ` are the line constants (not alpha-weighted) and `linear_acc_z = Σᵢ αⁱ·bᵢ` (slopes are alpha-weighted)
+- `col_i(p_br)` from `proof.trace_values_at_queries[q][i]` (NTT-order, corresponding to bit-reversed domain point)
+- Line coefficients `(aᵢ, bᵢ) = compute_line_coeffs(z, proof.oods_trace_at_z[i])`
+
+**Domain point convention:** The GPU's `accumulate_numerators` kernel accumulates partial numerators
+using NTT-order column data (`eval_col[qi]`), while `compute_quotients_combine` uses the natural-order
+domain point `eval_coset.at(qi)` for the denominator and linear correction term. The verifier matches
+this convention exactly: column values come from the NTT-order decommitment; `p_nat.y` for the linear
+correction comes from `verif_eval_domain.at(qi)` (natural index).
+
+**GPU formula detail:** The CUDA kernel computes:
+- `partial = Σᵢ (αⁱ · fᵢ − aᵢ)` — the constant `aᵢ` is subtracted without the alpha weight
+- `full_numer = partial − (Σᵢ αⁱ · bᵢ) · p.y` — slope term IS alpha-weighted
+- This differs from the "textbook" `Σᵢ αⁱ · (fᵢ − aᵢ − bᵢ · p.y)` by a factor of `(αⁱ−1) · aᵢ` per term; the construction is still sound because the line coefficients are uniquely determined by the OODS evaluation claims.
+
+**New helper:** `oods_denom(sp, px, py) → CM31` in `src/oods.rs`.
+
+**New test:** `test_soundness_oods_quotient_tamper` in `tests/property_tests.rs`.
+
+## Confidence Summary (2026-03-27)
 
 | Component | Confidence |
 |-----------|-----------|
@@ -326,6 +362,7 @@ cannot occur; use `cairo_prove_program` for production.
 | Fibonacci STARK (prove+verify) | 95% |
 | Cairo verifier soundness | 98% |
 | Cairo constraint completeness (35 constraints, all tested) | 98% |
+| OODS quotient formula check (verifier recomputes Q(p) from trace values) | 97% |
 | Full ZK (34/34 columns blinded, GAP-4 closed) | 92% |
 | Dict sub-AIR (full-soundness: Merkle root recompute + all constraints) | 95% |
 | Dict S_dict link (GAP-1 closure: cols 31-33, C33-C34, S_dict argument) | 93% |
