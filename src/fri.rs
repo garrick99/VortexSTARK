@@ -259,10 +259,9 @@ pub fn fold_line(
 // When data is small (≤1024 elements), GPU kernel launch + D2H sync overhead
 // exceeds the actual compute time. CPU avoids ~60μs/iteration overhead.
 
-/// Log2 of the last-layer degree bound.
-/// With BLOWUP_BITS=2 and last-layer log-size=3: the last-layer fold polynomial
-/// lives in the first half of the IFFT basis (4 coefficients = 2^2).
-pub const LOG_LAST_LAYER_DEGREE_BOUND: u32 = 2;
+/// Log2 of the FRI last-layer size (number of raw evaluations stored in the proof).
+/// After all FRI folds the last layer has 2^3 = 8 QM31 evaluations in BRT order.
+pub const LOG_LAST_LAYER_DEGREE_BOUND: u32 = 3;
 
 /// Bit-reverse a slice of QM31 values in place.
 fn bit_reverse_qm31(v: &mut [QM31], log_n: u32) {
@@ -289,8 +288,9 @@ fn bit_reverse_qm31(v: &mut [QM31], log_n: u32) {
 /// Applies: bit-reverse → line IFFT using half_coset domain → normalize →
 /// bit-reverse → truncate to `1 << LOG_LAST_LAYER_DEGREE_BOUND` coefficients.
 ///
-/// Returns `[c0, c1]` such that the degree-1 polynomial `p(x) = c0 + c1*x`
-/// satisfies `p(domain.at(bit_reverse(j, log_n)).x) == eval_input[j]`.
+/// NOTE: This function is only valid when the input evaluations lie on a `half_coset`
+/// domain AND the polynomial truly has degree < `1 << LOG_LAST_LAYER_DEGREE_BOUND`.
+/// VortexSTARK uses raw evaluations instead of this; this is kept for future stwo compat work.
 pub fn last_layer_poly_coeffs(mut eval: Vec<QM31>) -> Vec<QM31> {
     let n = eval.len();
     assert!(n.is_power_of_two() && n >= 2);
@@ -335,14 +335,14 @@ pub fn last_layer_poly_coeffs(mut eval: Vec<QM31>) -> Vec<QM31> {
     eval
 }
 
+
 /// Evaluate the last-layer line polynomial at a queried index.
 ///
-/// Coefficients [c0,c1,c2,c3] are in NATURAL-ORDER from the IFFT.
-/// In this basis the evaluation at x-coordinate x is:
-///   p(x) = c0 + c1*x + c2*(2x²-1) + c3*x*(2x²-1)
+/// `coeffs` are in NATURAL-ORDER from the line IFFT, using the LinePoly basis:
+///   phi_0(x) = 1,  phi_1(x) = x,  phi_2(x) = 2x²-1,  phi_3(x) = x*(2x²-1), ...
+/// Only the first `coeffs.len()` terms are evaluated; higher terms are assumed zero.
 ///
-/// This corresponds to stwo's LinePoly natural-order basis for n=4 coefficients.
-/// `last_idx` is the bit-reversed index into the last-layer domain (log_last_layer_size bits).
+/// `last_idx` is the BRT (bit-reversed) index into the last-layer domain.
 pub fn eval_last_layer_poly(coeffs: &[QM31], last_idx: usize, log_last_layer_size: u32) -> QM31 {
     let domain = Coset::half_coset(log_last_layer_size);
     let natural_idx = {
@@ -355,10 +355,19 @@ pub fn eval_last_layer_poly(coeffs: &[QM31], last_idx: usize, log_last_layer_siz
         result
     };
     let x: M31 = domain.at(natural_idx).x;
-    // dx = 2x²-1 (x-doubling on the circle)
-    let dx = M31(2) * x * x - M31::ONE;
-    // p(x) = c0 + c1*x + c2*(2x²-1) + c3*x*(2x²-1)
-    coeffs[0] + coeffs[1] * x + coeffs[2] * dx + coeffs[3] * x * dx
+
+    let mut acc = coeffs[0];
+    if coeffs.len() > 1 {
+        acc = acc + coeffs[1] * x;
+    }
+    if coeffs.len() > 2 {
+        let dx = M31(2) * x * x - M31::ONE;
+        acc = acc + coeffs[2] * dx;
+        if coeffs.len() > 3 {
+            acc = acc + coeffs[3] * x * dx;
+        }
+    }
+    acc
 }
 
 /// FRI fold_line on CPU (small data path).
@@ -476,6 +485,39 @@ mod tests {
         }
 
         // Also verify eval_last_layer_poly recovers the evaluations.
+        for j in 0..n {
+            let recovered = eval_last_layer_poly(&coeffs, j, log_n);
+            assert_eq!(recovered, brt_eval[j], "eval mismatch at j={j}");
+        }
+    }
+
+    /// Verify round-trip for a full degree-3 polynomial (all 4 LinePoly basis terms non-zero).
+    #[test]
+    fn test_last_layer_poly_round_trip_degree3() {
+        let c0 = QM31::from_m31_array([M31(42), M31(0), M31(0), M31(0)]);
+        let c1 = QM31::from_m31_array([M31(17), M31(0), M31(0), M31(0)]);
+        let c2 = QM31::from_m31_array([M31(99), M31(0), M31(0), M31(0)]);
+        let c3 = QM31::from_m31_array([M31(7), M31(0), M31(0), M31(0)]);
+        let n = 8usize;
+        let log_n = 3u32;
+        let domain = Coset::half_coset(log_n);
+
+        // Build BRT-ordered evaluations: p(x) = c0 + c1*x + c2*(2x²-1) + c3*x*(2x²-1)
+        let brt_eval: Vec<QM31> = (0..n)
+            .map(|j| {
+                let x: M31 = domain.at(br(j, log_n)).x;
+                let dx = M31(2) * x * x - M31::ONE;
+                c0 + c1 * x + c2 * dx + c3 * x * dx
+            })
+            .collect();
+
+        let coeffs = last_layer_poly_coeffs(brt_eval.clone());
+        assert_eq!(coeffs.len(), 1 << LOG_LAST_LAYER_DEGREE_BOUND, "wrong coefficient count");
+        assert_eq!(coeffs[0], c0, "c0 mismatch");
+        assert_eq!(coeffs[1], c1, "c1 mismatch");
+        if coeffs.len() > 2 { assert_eq!(coeffs[2], c2, "c2 mismatch"); }
+        if coeffs.len() > 3 { assert_eq!(coeffs[3], c3, "c3 mismatch"); }
+
         for j in 0..n {
             let recovered = eval_last_layer_poly(&coeffs, j, log_n);
             assert_eq!(recovered, brt_eval[j], "eval mismatch at j={j}");

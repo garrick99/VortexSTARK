@@ -567,7 +567,7 @@ pub fn cairo_proof_to_stwo(proof: &CairoProof) -> TwoStarkProof {
         })
         .collect();
 
-    // Last layer polynomial.
+    // Last layer: 8 raw BRT-ordered QM31 evaluations (one per fold position).
     let last_layer_poly: Vec<TwoSecureField> = proof.fri_last_layer.iter()
         .map(|q| q.to_u32_array())
         .collect();
@@ -579,7 +579,7 @@ pub fn cairo_proof_to_stwo(proof: &CairoProof) -> TwoStarkProof {
         log_blowup_factor: BLOWUP_BITS,
         n_queries: N_QUERIES as u32,
         pow_bits: POW_BITS,
-        log_last_layer_degree_bound: 3, // last layer has 2^3 = 8 values
+        log_last_layer_degree_bound: crate::fri::LOG_LAST_LAYER_DEGREE_BOUND,
     };
 
     TwoStarkProof {
@@ -595,70 +595,35 @@ pub fn cairo_proof_to_stwo(proof: &CairoProof) -> TwoStarkProof {
     }
 }
 
-/// Build combined hash_witness for a trace tree that is queried at both
-/// current-row positions (`query_indices`) and next-row positions (`query_indices + 1`).
+/// Build combined hash_witness for a trace tree queried at both current-row
+/// (`query_indices`) and next-row (`query_indices[i] + 1`) positions.
 ///
-/// Both sets of positions are sorted and merged; the deduplication pass removes
-/// redundant siblings when a queried position and its sibling are both opened.
+/// Merges both position sets, deduplicates, then delegates to
+/// `auth_paths_to_hash_witness` for stwo-compatible sibling deduplication.
 fn build_trace_witness(
     query_indices: &[usize],
     auth_paths_cur: &[Vec<[u32; 8]>],
     auth_paths_next: &[Vec<[u32; 8]>],
     tree_height: usize,
 ) -> Vec<TwoHash> {
-    // Compute next-row positions (query + 1, wrapping within eval domain).
-    // auth_paths_next[i] covers position (query_indices[i] + 1).
-    let n = query_indices.len();
-
-    // Merge all positions and their auth paths.
-    // Map: position → auth path index and which set (cur=false, next=true).
-    let mut pos_to_path: BTreeMap<usize, (usize, bool)> = BTreeMap::new();
+    // Collect merged positions in sorted order; for each position keep one auth path.
+    // Current positions take priority over next positions on collision.
+    let mut pos_to_auth: BTreeMap<usize, &Vec<[u32; 8]>> = BTreeMap::new();
     for (i, &pos) in query_indices.iter().enumerate() {
-        pos_to_path.entry(pos).or_insert((i, false));
+        pos_to_auth.entry(pos).or_insert(&auth_paths_cur[i]);
     }
-    // next-row positions: if auth_paths_next is non-empty
     if !auth_paths_next.is_empty() {
         for (i, &pos) in query_indices.iter().enumerate() {
-            let next_pos = pos + 1; // no modular wrap needed (within eval domain)
-            pos_to_path.entry(next_pos).or_insert((i, true));
+            let next_pos = pos + 1;
+            pos_to_auth.entry(next_pos).or_insert(&auth_paths_next[i]);
         }
     }
 
-    let mut current_positions: Vec<usize> = pos_to_path.keys().copied().collect();
-    let mut level_pos_to_path: BTreeMap<usize, (usize, bool)> = pos_to_path;
+    let merged_positions: Vec<usize> = pos_to_auth.keys().copied().collect();
+    let merged_auth_paths: Vec<Vec<[u32; 8]>> =
+        merged_positions.iter().map(|&p| pos_to_auth[&p].clone()).collect();
 
-    let mut witness = Vec::new();
-
-    for level in 0..tree_height {
-        let mut i = 0;
-        while i < current_positions.len() {
-            let pos = current_positions[i];
-            let sibling = pos ^ 1;
-
-            if i + 1 < current_positions.len() && current_positions[i + 1] == sibling {
-                i += 2;
-            } else {
-                let &(path_idx, is_next) = &level_pos_to_path[&pos];
-                let paths = if is_next { auth_paths_next } else { auth_paths_cur };
-                if path_idx < paths.len() && level < paths[path_idx].len() {
-                    witness.push(TwoHash::from(paths[path_idx][level]));
-                }
-                i += 1;
-            }
-        }
-
-        let mut parent_map: BTreeMap<usize, (usize, bool)> = BTreeMap::new();
-        for &pos in &current_positions {
-            let parent = pos >> 1;
-            let path_ref = level_pos_to_path[&pos];
-            parent_map.entry(parent).or_insert(path_ref);
-        }
-
-        current_positions = parent_map.keys().copied().collect();
-        level_pos_to_path = parent_map;
-    }
-
-    witness
+    auth_paths_to_hash_witness(&merged_positions, &merged_auth_paths, tree_height)
 }
 
 /// Serialize a `CairoProof` to Stwo-compatible JSON.

@@ -2340,9 +2340,6 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
             );
             let twiddle = fold_twiddle_at(&domain, folded_idx, false);
             let expected = fold_pair(f0, f1, fri_alphas[n_fri_layers], twiddle);
-            if folded_idx >= proof.fri_last_layer.len() {
-                return Err(format!("FRI last layer index {folded_idx} out of range"));
-            }
             if expected != proof.fri_last_layer[folded_idx] {
                 return Err(format!("FRI last layer mismatch at query {q}"));
             }
