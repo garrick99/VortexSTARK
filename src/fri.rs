@@ -259,6 +259,108 @@ pub fn fold_line(
 // When data is small (≤1024 elements), GPU kernel launch + D2H sync overhead
 // exceeds the actual compute time. CPU avoids ~60μs/iteration overhead.
 
+/// Log2 of the last-layer degree bound.
+/// With BLOWUP_BITS=2 and last-layer log-size=3: the last-layer fold polynomial
+/// lives in the first half of the IFFT basis (4 coefficients = 2^2).
+pub const LOG_LAST_LAYER_DEGREE_BOUND: u32 = 2;
+
+/// Bit-reverse a slice of QM31 values in place.
+fn bit_reverse_qm31(v: &mut [QM31], log_n: u32) {
+    let n = v.len();
+    for i in 0..n {
+        let j = {
+            let mut result = 0usize;
+            let mut val = i;
+            for _ in 0..log_n {
+                result = (result << 1) | (val & 1);
+                val >>= 1;
+            }
+            result
+        };
+        if i < j {
+            v.swap(i, j);
+        }
+    }
+}
+
+/// Convert the last-layer evaluations (bit-reversed order, from the fold chain) to
+/// polynomial coefficients in the line-poly basis `{1, x}`.
+///
+/// Applies: bit-reverse → line IFFT using half_coset domain → normalize →
+/// bit-reverse → truncate to `1 << LOG_LAST_LAYER_DEGREE_BOUND` coefficients.
+///
+/// Returns `[c0, c1]` such that the degree-1 polynomial `p(x) = c0 + c1*x`
+/// satisfies `p(domain.at(bit_reverse(j, log_n)).x) == eval_input[j]`.
+pub fn last_layer_poly_coeffs(mut eval: Vec<QM31>) -> Vec<QM31> {
+    let n = eval.len();
+    assert!(n.is_power_of_two() && n >= 2);
+    let log_n = n.ilog2();
+
+    // Step 1: Bit-reverse to natural order.
+    bit_reverse_qm31(&mut eval, log_n);
+
+    // Step 2: Line IFFT on natural-order evaluations using half_coset domains.
+    // At each level we apply ibutterfly(l[i], r[i], domain.at(i).x^{-1}).
+    let mut chunk_size = n;
+    let mut dom_log = log_n;
+    while chunk_size > 1 {
+        let domain = Coset::half_coset(dom_log);
+        let half = chunk_size / 2;
+        for chunk in eval.chunks_exact_mut(chunk_size) {
+            let (l, r) = chunk.split_at_mut(half);
+            for i in 0..half {
+                let x_inv = domain.at(i).x.inverse();
+                // ibutterfly: v0 = v0+v1, v1 = (v0-v1)*itwid
+                let tmp = l[i];
+                l[i] = tmp + r[i];
+                r[i] = (tmp - r[i]) * x_inv;
+            }
+        }
+        dom_log -= 1;
+        chunk_size = half;
+    }
+
+    // Step 3: Normalize by 1/n.
+    let n_inv = M31(n as u32).inverse();
+    for v in eval.iter_mut() {
+        *v = *v * n_inv;
+    }
+    // eval now contains bit-reversed polynomial coefficients.
+
+    // Step 4: Bit-reverse to natural-order coefficients [c0, c1, c2, ..., c_{n-1}].
+    bit_reverse_qm31(&mut eval, log_n);
+
+    // Step 5: Truncate to degree bound.
+    eval.truncate(1 << LOG_LAST_LAYER_DEGREE_BOUND);
+    eval
+}
+
+/// Evaluate the last-layer line polynomial at a queried index.
+///
+/// Coefficients [c0,c1,c2,c3] are in NATURAL-ORDER from the IFFT.
+/// In this basis the evaluation at x-coordinate x is:
+///   p(x) = c0 + c1*x + c2*(2x²-1) + c3*x*(2x²-1)
+///
+/// This corresponds to stwo's LinePoly natural-order basis for n=4 coefficients.
+/// `last_idx` is the bit-reversed index into the last-layer domain (log_last_layer_size bits).
+pub fn eval_last_layer_poly(coeffs: &[QM31], last_idx: usize, log_last_layer_size: u32) -> QM31 {
+    let domain = Coset::half_coset(log_last_layer_size);
+    let natural_idx = {
+        let mut result = 0usize;
+        let mut val = last_idx;
+        for _ in 0..log_last_layer_size {
+            result = (result << 1) | (val & 1);
+            val >>= 1;
+        }
+        result
+    };
+    let x: M31 = domain.at(natural_idx).x;
+    // dx = 2x²-1 (x-doubling on the circle)
+    let dx = M31(2) * x * x - M31::ONE;
+    // p(x) = c0 + c1*x + c2*(2x²-1) + c3*x*(2x²-1)
+    coeffs[0] + coeffs[1] * x + coeffs[2] * dx + coeffs[3] * x * dx
+}
+
 /// FRI fold_line on CPU (small data path).
 /// result[i] = (f0 + f1) + alpha * twiddle[i] * (f0 - f1)
 pub fn fold_line_cpu(
@@ -333,6 +435,52 @@ pub fn merkle_root_cpu(values: &[QM31]) -> [u32; 8] {
 mod tests {
     use super::*;
     use crate::field::M31;
+
+    /// Helper: bit-reverse an index.
+    fn br(x: usize, bits: u32) -> usize {
+        let mut result = 0usize;
+        let mut val = x;
+        for _ in 0..bits {
+            result = (result << 1) | (val & 1);
+            val >>= 1;
+        }
+        result
+    }
+
+    /// Verify that `last_layer_poly_coeffs` correctly recovers a degree-1 polynomial
+    /// from 8 BRT-ordered evaluations on `half_coset(3)`.
+    #[test]
+    fn test_last_layer_poly_round_trip() {
+        let c0 = QM31::from_m31_array([M31(42), M31(0), M31(0), M31(0)]);
+        let c1 = QM31::from_m31_array([M31(17), M31(0), M31(0), M31(0)]);
+        let n = 8usize;
+        let log_n = 3u32;
+        let domain = Coset::half_coset(log_n);
+
+        // Build BRT-ordered evaluations: brt_eval[j] = p(domain.at(br(j, log_n)).x)
+        let brt_eval: Vec<QM31> = (0..n)
+            .map(|j| {
+                let x: M31 = domain.at(br(j, log_n)).x;
+                c0 + c1 * x
+            })
+            .collect();
+
+        let coeffs = last_layer_poly_coeffs(brt_eval.clone());
+        assert_eq!(coeffs.len(), 1 << LOG_LAST_LAYER_DEGREE_BOUND, "wrong coefficient count");
+        assert_eq!(coeffs[0], c0, "constant term mismatch");
+        assert_eq!(coeffs[1], c1, "linear term mismatch");
+        // Higher-order terms should be zero for a degree-1 polynomial.
+        let zero = QM31::from_m31_array([M31(0), M31(0), M31(0), M31(0)]);
+        for k in 2..coeffs.len() {
+            assert_eq!(coeffs[k], zero, "coefficient c{k} should be zero");
+        }
+
+        // Also verify eval_last_layer_poly recovers the evaluations.
+        for j in 0..n {
+            let recovered = eval_last_layer_poly(&coeffs, j, log_n);
+            assert_eq!(recovered, brt_eval[j], "eval mismatch at j={j}");
+        }
+    }
 
     #[test]
     fn test_fold_line_halves_size() {

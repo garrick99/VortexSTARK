@@ -1643,4 +1643,162 @@ mod tests {
             );
         }
     }
+
+    /// Replay the Fiat-Shamir transcript using stwo's Blake2sChannel and verify that
+    /// stwo's `draw_queries` produces the exact same query positions as VortexSTARK.
+    ///
+    /// This test proves that VortexSTARK's Fiat-Shamir channel is byte-for-byte
+    /// compatible with stwo's Blake2sChannel at every mixing and drawing step.
+    ///
+    /// Requires a simple Fibonacci program (no dicts, no EC, no bitwise).
+    #[test]
+    fn test_stwo_fri_channel_transcript_compatibility() {
+        use crate::cairo_air::prover::cairo_prove;
+        use crate::cairo_air::trace::N_CONSTRAINTS;
+        use crate::cuda::ffi;
+        use crate::prover::{BLOWUP_BITS, N_QUERIES};
+
+        use stwo::core::channel::Channel as SChannel;
+        use stwo::core::channel::Blake2sChannel as SBlake2sChannel;
+        use stwo::core::fields::qm31::SecureField as SSecureField;
+        use stwo::core::fields::m31::BaseField as SBaseField;
+        use stwo::core::queries::draw_queries;
+
+        ffi::init_memory_pool();
+
+        // Simple Fibonacci — no dicts, no EC, no bitwise builtins.
+        let program: Vec<u64> = vec![
+            0x480680017fff8000, // [ap] = 1; ap++
+            0x480680017fff8000, // [ap] = 1; ap++
+            0x48307ffb7fff8000, // [ap] = [fp-1] + [fp-2]; ap++
+            0x48307ffb7fff8000,
+            0x40780017fff7fff,  // jmp rel -2
+        ];
+        let proof = cairo_prove(&program, 64, 6);
+        let log_n = 6u32;
+        let log_eval_size = log_n + BLOWUP_BITS;
+
+        // Verify no dict/bitwise data (assumptions for this test).
+        assert!(proof.dict_exec_data.is_empty(), "test requires no dict accesses");
+        assert!(proof.dict_exec_commitment.is_none(), "test requires no dict commitment");
+        assert!(proof.bitwise_rows.is_empty(), "test requires no bitwise rows");
+        assert!(proof.ec_trace_commitment.is_none(), "test requires no EC trace");
+
+        // Convenience: convert VortexSTARK [u32;4] to stwo SecureField.
+        let sf = |v: [u32; 4]| -> SSecureField {
+            use stwo::core::fields::m31::M31;
+            use stwo::core::fields::cm31::CM31;
+            SSecureField::from_m31_array([M31(v[0]), M31(v[1]), M31(v[2]), M31(v[3])])
+        };
+
+        let mut ch = SBlake2sChannel::default();
+
+        // ── Replay transcript ──────────────────────────────────────────────────
+        // Matches cairo_verify channel sequence exactly.
+
+        // Phase 1: Public commitments.
+        ch.mix_u32s(&proof.public_inputs.program_hash);
+        ch.mix_u32s(&proof.trace_commitment);
+        ch.mix_u32s(&proof.trace_commitment_hi);
+        ch.mix_u32s(&proof.dict_trace_commitment);
+
+        // Draw S_dict link challenges (z_dict_link, alpha_dict_link).
+        ch.draw_secure_felt();
+        ch.draw_secure_felt();
+
+        // Mix dict_main_interaction + dict_link_final (always mixed).
+        ch.mix_u32s(&proof.dict_main_interaction_commitment);
+        ch.mix_u32s(&[
+            proof.dict_link_final[0], proof.dict_link_final[1],
+            proof.dict_link_final[2], proof.dict_link_final[3],
+            0, 0, 0, 0,
+        ]);
+
+        // (No EC trace commits — assert above.)
+        // (No dict exec/sorted commitment rounds — assert above.)
+
+        // Draw z_mem, alpha_mem, z_rc (for LogUp / RC challenges).
+        ch.draw_secure_felt();
+        ch.draw_secure_felt();
+        ch.draw_secure_felt();
+
+        // Mix interaction commitments and LogUp+RC final sums.
+        ch.mix_u32s(&proof.interaction_commitment);
+        ch.mix_u32s(&proof.rc_interaction_commitment);
+        ch.mix_u32s(&[
+            proof.logup_final_sum[0], proof.logup_final_sum[1],
+            proof.logup_final_sum[2], proof.logup_final_sum[3],
+            proof.rc_final_sum[0],    proof.rc_final_sum[1],
+            proof.rc_final_sum[2],    proof.rc_final_sum[3],
+        ]);
+
+        // (No bitwise commitment — assert above.)
+
+        // Mix memory table and RC counts commitments.
+        ch.mix_u32s(&proof.memory_table_commitment);
+        ch.mix_u32s(&proof.rc_counts_commitment);
+
+        // Draw constraint alphas (N_CONSTRAINTS = 35).
+        for _ in 0..N_CONSTRAINTS {
+            ch.draw_secure_felt();
+        }
+
+        // Mix quotient commitment.
+        ch.mix_u32s(&proof.quotient_commitment);
+
+        // Draw OODS point z.
+        ch.draw_secure_felt();
+
+        // Mix all OODS sampled values in flatten_cols order.
+        let n_trace = proof.oods_trace_at_z.len().min(proof.oods_trace_at_z_next.len());
+        let mut oods_felts: Vec<SSecureField> = Vec::with_capacity(n_trace * 2 + 12 * 2 + 4);
+        for i in 0..n_trace {
+            oods_felts.push(sf(proof.oods_trace_at_z[i]));
+            oods_felts.push(sf(proof.oods_trace_at_z_next[i]));
+        }
+        for pi in 0..3 {
+            for k in 0..4 {
+                oods_felts.push(sf(proof.oods_interaction_at_z[pi][k]));
+                oods_felts.push(sf(proof.oods_interaction_at_z_next[pi][k]));
+            }
+        }
+        for k in 0..4 {
+            oods_felts.push(sf(proof.oods_quotient_at_z[k]));
+        }
+        ch.mix_felts(&oods_felts);
+
+        // Draw oods_alpha.
+        ch.draw_secure_felt();
+
+        // ── FRI commitment phase ───────────────────────────────────────────────
+        ch.mix_u32s(&proof.oods_quotient_commitment);
+        ch.draw_secure_felt(); // fri_alpha (circle fold)
+
+        for fri_commit in &proof.fri_commitments {
+            ch.mix_u32s(fri_commit);
+            ch.draw_secure_felt(); // fold alpha
+        }
+
+        // Mix last layer polynomial values.
+        let last_layer_felts: Vec<SSecureField> = proof.fri_last_layer.iter()
+            .map(|qm| sf(qm.to_u32_array()))
+            .collect();
+        ch.mix_felts(&last_layer_felts);
+
+        // Mix PoW nonce (after verify_pow, which doesn't change channel state).
+        ch.mix_u64(proof.pow_nonce);
+
+        // ── Query derivation ─────────────────────────────────────────────────
+        // draw_queries uses stwo's 8-per-squeeze scheme; must match draw_query_indices.
+        let stwo_queries = draw_queries(&mut ch, log_eval_size, N_QUERIES);
+
+        assert_eq!(
+            stwo_queries, proof.query_indices,
+            "stwo draw_queries produced different positions than VortexSTARK draw_query_indices.\n\
+             stwo:       {:?}\n\
+             VortexSTARK: {:?}",
+            &stwo_queries[..stwo_queries.len().min(8)],
+            &proof.query_indices[..proof.query_indices.len().min(8)],
+        );
+    }
 }

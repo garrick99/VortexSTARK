@@ -94,6 +94,27 @@ impl Channel {
         (raw % bound as u64) as usize
     }
 
+    /// Draw `n` query indices in `[0, 2^log_domain_size)`.
+    ///
+    /// Matches stwo's `draw_queries`: extracts 8 positions per squeeze (one per u32 word),
+    /// applying `word & ((1 << log_domain_size) - 1)` to each. This is the stwo-compatible
+    /// query derivation scheme required for FriVerifier interoperability.
+    pub fn draw_query_indices(&mut self, log_domain_size: u32, n: usize) -> Vec<usize> {
+        let mask = (1u32 << log_domain_size).wrapping_sub(1);
+        let mut result = Vec::with_capacity(n);
+        while result.len() < n {
+            let bytes = self.squeeze();
+            for i in 0..8 {
+                let word = u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+                result.push((word & mask) as usize);
+                if result.len() == n {
+                    break;
+                }
+            }
+        }
+        result
+    }
+
     /// Mix a u64 (PoW nonce) into the channel state.
     /// Matches stwo: mix_u32s(&[lo, hi]) = Blake2s(state || lo_le || hi_le).
     pub fn mix_u64(&mut self, value: u64) {

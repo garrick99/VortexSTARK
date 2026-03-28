@@ -1608,7 +1608,8 @@ fn cairo_prove_cached_with_columns(
         current_log -= 1;
     }
 
-    let fri_last_layer = current.to_qm31();
+    let current_qm31 = current.to_qm31();
+    let fri_last_layer = current_qm31;
 
     // ---- Phase 5: Proof-of-Work grinding + Query + decommitment ----
     channel.mix_felts(&fri_last_layer);
@@ -1671,9 +1672,7 @@ fn cairo_prove_cached_with_columns(
     };
     channel.mix_u64(pow_nonce);
 
-    let query_indices: Vec<usize> = (0..N_QUERIES)
-        .map(|_| channel.draw_number(eval_size))
-        .collect();
+    let query_indices = channel.draw_query_indices(log_eval_size, N_QUERIES);
 
     // Sparse trace extraction from host (eval cols already downloaded after commitment)
     let trace_values_at_queries: Vec<Vec<u32>> = {
@@ -2257,7 +2256,8 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
     }
 
     if proof.fri_last_layer.len() != 1usize << 3 {
-        return Err(format!("Expected 8 FRI last layer values, got {}",
+        return Err(format!("Expected {} FRI last layer evaluations, got {}",
+            1usize << 3,
             proof.fri_last_layer.len()));
     }
 
@@ -2270,9 +2270,7 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
         ));
     }
     channel.mix_u64(proof.pow_nonce);
-    let expected_indices: Vec<usize> = (0..N_QUERIES)
-        .map(|_| channel.draw_number(eval_size))
-        .collect();
+    let expected_indices = channel.draw_query_indices(log_eval_size, N_QUERIES);
     if proof.query_indices != expected_indices {
         return Err("Query indices don't match Fiat-Shamir derivation".into());
     }
@@ -2332,7 +2330,7 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
             current_log -= 1;
         }
 
-        // Verify: fold last FRI decommitment into fri_last_layer
+        // Verify: fold last FRI decommitment matches last-layer polynomial
         if n_fri_layers > 0 {
             let last_decom = &proof.fri_decommitments[n_fri_layers - 1];
             let domain = Coset::half_coset(current_log);
@@ -2342,10 +2340,11 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
             );
             let twiddle = fold_twiddle_at(&domain, folded_idx, false);
             let expected = fold_pair(f0, f1, fri_alphas[n_fri_layers], twiddle);
-            if folded_idx < proof.fri_last_layer.len() {
-                if expected != proof.fri_last_layer[folded_idx] {
-                    return Err(format!("FRI last layer mismatch at query {q}"));
-                }
+            if folded_idx >= proof.fri_last_layer.len() {
+                return Err(format!("FRI last layer index {folded_idx} out of range"));
+            }
+            if expected != proof.fri_last_layer[folded_idx] {
+                return Err(format!("FRI last layer mismatch at query {q}"));
             }
         }
     }
