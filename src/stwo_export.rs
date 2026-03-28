@@ -153,6 +153,55 @@ pub struct TwoStarkProof {
     pub fri_proof: TwoFriProof,
 }
 
+// ── Core algorithm: FRI witness deduplication ─────────────────────────────────
+
+/// Build a stwo-compatible `fri_witness` for one FRI layer.
+///
+/// stwo's `FriLayerProof.fri_witness` contains evaluations at positions that are
+/// in the "fold group" but NOT in the queried set.  With `fold_step = 1`, each
+/// fold group is a pair `{q & !1, (q & !1) | 1}`.  If both siblings of a pair are
+/// queried, neither appears in `fri_witness`.  If only one is queried, the other
+/// (its sibling's value) must be in `fri_witness`.
+///
+/// VortexSTARK's `QueryDecommitment.sibling_values[i]` is always `layer[pos ^ 1]`
+/// for every query `i` — N_QUERIES entries regardless.  This function deduplicates
+/// them to match stwo's format.
+///
+/// `layer_positions[i]` is the queried position for query `i` at this layer.
+/// `sibling_values[i]`  is the evaluated value at `layer_positions[i] ^ 1`.
+///
+/// Returns witness values in sorted-pair order (matching stwo's consumption order).
+fn dedup_fri_witness(
+    layer_positions: &[usize],
+    sibling_values: &[[u32; 4]],
+) -> Vec<TwoSecureField> {
+    use std::collections::BTreeMap;
+
+    // Build map: position → sibling_value (first occurrence wins for duplicates).
+    let mut pos_to_sibling: BTreeMap<usize, [u32; 4]> = BTreeMap::new();
+    for (i, &pos) in layer_positions.iter().enumerate() {
+        if i < sibling_values.len() {
+            pos_to_sibling.entry(pos).or_insert(sibling_values[i]);
+        }
+    }
+
+    // Unique queried positions (sorted by BTreeMap).
+    let unique_positions: std::collections::BTreeSet<usize> =
+        pos_to_sibling.keys().copied().collect();
+
+    // For each unique position p: if sibling (p ^ 1) is NOT also queried,
+    // we must include the sibling value in fri_witness.
+    // Sorted iteration = pair-order (stwo processes pairs in ascending order).
+    let mut witness = Vec::new();
+    for &pos in &unique_positions {
+        let sibling = pos ^ 1;
+        if !unique_positions.contains(&sibling) {
+            witness.push(pos_to_sibling[&pos]);
+        }
+    }
+    witness
+}
+
 // ── Core algorithm: auth paths → hash_witness ─────────────────────────────────
 
 /// Convert a set of Merkle auth paths to a deduplicated `hash_witness`.
@@ -480,9 +529,11 @@ pub fn cairo_proof_to_stwo(proof: &CairoProof) -> TwoStarkProof {
     // ── FRI proof ─────────────────────────────────────────────────────────────
 
     // FRI first layer = OODS quotient.
-    // fri_witness = sibling values needed for fold verification at this layer.
-    let oods_q_witness: Vec<TwoSecureField> = proof.oods_quotient_decommitment.sibling_values
-        .iter().map(|&v| v).collect();
+    // fri_witness = stwo-deduplicated sibling values (omit when both siblings queried).
+    let oods_q_witness = dedup_fri_witness(
+        &proof.query_indices,
+        &proof.oods_quotient_decommitment.sibling_values,
+    );
     let oods_q_decommitment = TwoMerkleDecommitment {
         hash_witness: decommitment_hash_witness(
             &proof.query_indices, &proof.oods_quotient_decommitment, tree_height)
@@ -498,14 +549,14 @@ pub fn cairo_proof_to_stwo(proof: &CairoProof) -> TwoStarkProof {
         .enumerate()
         .map(|(i, &commitment)| {
             let decomm = &proof.fri_decommitments[i];
-            // fri_witness = sibling values for fold verification at layer i.
-            let fri_witness: Vec<TwoSecureField> = decomm.sibling_values.iter().map(|&v| v).collect();
             // FRI tree at layer i has log_eval - (i+1) levels (one fold per layer).
             let layer_height = (tree_height).saturating_sub(i + 1);
             // Query positions at this layer are folded by (i+1) halvings.
             let layer_positions: Vec<usize> = proof.query_indices.iter()
                 .map(|&q| q >> (i + 1))
                 .collect();
+            // fri_witness = stwo-deduplicated sibling values at this layer.
+            let fri_witness = dedup_fri_witness(&layer_positions, &decomm.sibling_values);
             let layer_decommitment = auth_paths_to_hash_witness(
                 &layer_positions, &decomm.auth_paths, layer_height);
             TwoFriFoldProof {
@@ -1399,5 +1450,197 @@ mod tests {
 
         assert_eq!(state_after_vortex, expected_words,
             "mix_felts(combined) state mismatch vs direct Blake2s computation");
+    }
+
+    // ── FRI Merkle decommitment tests ─────────────────────────────────────────
+
+    /// Verify all FRI layer Merkle witnesses using stwo's `MerkleVerifierLifted`.
+    ///
+    /// Each FRI layer commits to a QM31 polynomial (4 M31 components per leaf).
+    /// This test verifies that the hash_witness exported by VortexSTARK is accepted
+    /// by stwo's verifier for all layers:
+    ///   - first_layer (OODS quotient, circle domain log_size=log_eval)
+    ///   - inner_layers[i] (line domain log_size=log_eval-1-i)
+    #[test]
+    fn test_stwo_fri_merkle_witnesses() {
+        use crate::cairo_air::prover::cairo_prove;
+        use crate::cuda::ffi;
+        use crate::prover::BLOWUP_BITS;
+
+        use stwo::core::fields::m31::BaseField as SBaseField;
+        use stwo::core::vcs::blake2_hash::Blake2sHash as SBlake2sHash;
+        use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasher as SBlake2sMerkleHasher;
+        use stwo::core::vcs_lifted::verifier::{MerkleDecommitmentLifted, MerkleVerifierLifted};
+
+        ffi::init_memory_pool();
+
+        let program: Vec<u64> = vec![
+            0x480680017fff8000,
+            0x480680017fff8000,
+            0x48307ffb7fff8000,
+            0x48307ffb7fff8000,
+            0x40780017fff7fff,
+        ];
+        let proof = cairo_prove(&program, 64, 6);
+        let two = cairo_proof_to_stwo(&proof);
+
+        let log_eval = (6u32 + BLOWUP_BITS);
+        let n_q = proof.query_indices.len();
+
+        /// Helper: call MerkleVerifierLifted on 4-component QM31 leaf data.
+        ///
+        /// `positions` must be sorted ascending.
+        /// `values[q]` = [u32; 4] QM31 at position `positions[q]`.
+        fn verify_fri_layer_merkle(
+            log_size: u32,
+            positions: &[usize],
+            values: &[[u32; 4]],
+            hash_witness: &[TwoHash],
+            commitment: &TwoHash,
+        ) {
+            // Sort positions and reorder values.
+            let n = positions.len();
+            let mut order: Vec<usize> = (0..n).collect();
+            order.sort_unstable_by_key(|&i| positions[i]);
+            let sorted_pos: Vec<usize> = order.iter().map(|&i| positions[i]).collect();
+
+            // Build 4-column layout.
+            let qv: Vec<Vec<SBaseField>> = (0..4)
+                .map(|comp| order.iter().map(|&i| SBaseField::from(values[i][comp])).collect())
+                .collect();
+
+            let hw: Vec<SBlake2sHash> = hash_witness.iter().map(|h| SBlake2sHash(h.0)).collect();
+            let decommitment = MerkleDecommitmentLifted::<SBlake2sMerkleHasher> { hash_witness: hw };
+            let root = SBlake2sHash(commitment.0);
+            let col_log_sizes = vec![log_size; 4];
+
+            MerkleVerifierLifted::<SBlake2sMerkleHasher>::new(root, col_log_sizes, None)
+                .verify(&sorted_pos, qv, decommitment)
+                .unwrap_or_else(|e| panic!("FRI Merkle verify failed at log_size={log_size}: {e}"));
+        }
+
+        // ── First layer: OODS quotient (circle domain, log_size = log_eval) ──
+        verify_fri_layer_merkle(
+            log_eval,
+            &proof.query_indices,
+            &proof.oods_quotient_decommitment.values,
+            &two.fri_proof.first_layer.decommitment.hash_witness,
+            &two.fri_proof.first_layer.commitment,
+        );
+
+        // ── Inner layers: line domains ─────────────────────────────────────────
+        // Layer i has log_size = log_eval - 1 - i.
+        // Query positions at layer i are folded from the original: query >> (i+1).
+        for (i, layer) in two.fri_proof.inner_layers.iter().enumerate() {
+            let layer_log = log_eval - 1 - i as u32;
+            let layer_positions: Vec<usize> = proof.query_indices.iter()
+                .map(|&q| q >> (i + 1))
+                .collect();
+            verify_fri_layer_merkle(
+                layer_log,
+                &layer_positions,
+                &proof.fri_decommitments[i].values,
+                &layer.decommitment.hash_witness,
+                &layer.commitment,
+            );
+        }
+    }
+
+    // ── Unit test: dedup_fri_witness logic ────────────────────────────────────
+
+    #[test]
+    fn test_dedup_fri_witness_no_shared_siblings() {
+        // Queries at positions 0, 4, 8 — no two are siblings (differ by ^1).
+        // All three need their sibling in fri_witness.
+        let positions = vec![0usize, 4, 8];
+        let vals: Vec<[u32; 4]> = positions.iter().map(|&p| [(p ^ 1) as u32, 0, 0, 0]).collect();
+        let witness = dedup_fri_witness(&positions, &vals);
+        // 0^1=1, 4^1=5, 8^1=9 — none queried → all 3 included.
+        assert_eq!(witness.len(), 3);
+        assert_eq!(witness[0], [1, 0, 0, 0]); // sibling of 0
+        assert_eq!(witness[1], [5, 0, 0, 0]); // sibling of 4
+        assert_eq!(witness[2], [9, 0, 0, 0]); // sibling of 8
+    }
+
+    #[test]
+    fn test_dedup_fri_witness_all_siblings_paired() {
+        // Queries at positions 0, 1, 4, 5 — (0,1) and (4,5) are both full pairs.
+        // Both pairs are fully queried → fri_witness is empty.
+        let positions = vec![0usize, 1, 4, 5];
+        let vals: Vec<[u32; 4]> = vec![[1,0,0,0],[0,0,0,0],[5,0,0,0],[4,0,0,0]];
+        let witness = dedup_fri_witness(&positions, &vals);
+        assert!(witness.is_empty(), "full sibling pairs: witness must be empty");
+    }
+
+    #[test]
+    fn test_dedup_fri_witness_mixed() {
+        // Queries at {0, 1, 4} — pair (0,1) is full; position 4's sibling (5) is not queried.
+        let positions = vec![0usize, 1, 4];
+        // sibling_values[i] = val at positions[i]^1
+        let vals: Vec<[u32; 4]> = vec![[1,0,0,0],[0,0,0,0],[5,0,0,0]];
+        let witness = dedup_fri_witness(&positions, &vals);
+        // (0,1) full pair → 0 entries; 4 needs sibling 5 → 1 entry.
+        assert_eq!(witness.len(), 1);
+        assert_eq!(witness[0], [5, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_dedup_fri_witness_duplicate_positions() {
+        // Same position queried twice (possible with N_QUERIES draws).
+        // Logical set = {3} — sibling 2 not queried → 1 witness entry.
+        let positions = vec![3usize, 3];
+        let vals: Vec<[u32; 4]> = vec![[2,0,0,0],[2,0,0,0]];
+        let witness = dedup_fri_witness(&positions, &vals);
+        assert_eq!(witness.len(), 1);
+        assert_eq!(witness[0], [2, 0, 0, 0]);
+    }
+
+    // ── Integration test: fri_witness dedup in real proof ─────────────────────
+
+    /// Verify that the exported FRI witness counts are consistent with the
+    /// deduplicated format: for each layer, the witness count equals the number of
+    /// queries whose siblings are NOT also queried (i.e. unpaired positions).
+    #[test]
+    fn test_fri_witness_dedup_counts() {
+        use crate::cairo_air::prover::cairo_prove;
+        use crate::cuda::ffi;
+        use std::collections::BTreeSet;
+
+        ffi::init_memory_pool();
+
+        let program: Vec<u64> = vec![
+            0x480680017fff8000,
+            0x480680017fff8000,
+            0x48307ffb7fff8000,
+            0x48307ffb7fff8000,
+            0x40780017fff7fff,
+        ];
+        let proof = cairo_prove(&program, 64, 6);
+        let two = cairo_proof_to_stwo(&proof);
+
+        // Count unpaired queries at each FRI layer.
+        fn unpaired_count(positions: &[usize]) -> usize {
+            let unique: BTreeSet<usize> = positions.iter().copied().collect();
+            unique.iter().filter(|&&p| !unique.contains(&(p ^ 1))).count()
+        }
+
+        // First layer: query positions = proof.query_indices.
+        let expected_first = unpaired_count(&proof.query_indices);
+        assert_eq!(
+            two.fri_proof.first_layer.fri_witness.len(), expected_first,
+            "first_layer fri_witness count mismatch"
+        );
+
+        // Inner layers: folded positions.
+        for (i, layer) in two.fri_proof.inner_layers.iter().enumerate() {
+            let layer_positions: Vec<usize> = proof.query_indices.iter()
+                .map(|&q| q >> (i + 1))
+                .collect();
+            let expected = unpaired_count(&layer_positions);
+            assert_eq!(
+                layer.fri_witness.len(), expected,
+                "inner_layer[{i}] fri_witness count mismatch"
+            );
+        }
     }
 }
