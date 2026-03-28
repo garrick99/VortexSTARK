@@ -7,16 +7,22 @@
 use crate::field::QM31;
 
 /// Simple Blake2s-based Fiat-Shamir channel.
+///
+/// Squeeze convention matches stwo's Blake2sChannel:
+///   draw input = state[32] || n_draws_le_u32[4] || 0x00[1]  (37 bytes)
+/// This ensures proofs are verifiable by an stwo-compatible verifier.
+#[derive(Clone)]
 pub struct Channel {
     state: [u8; 32],
-    counter: u64,
+    /// Draw counter — u32, matching stwo's n_draws field.
+    n_draws: u32,
 }
 
 impl Channel {
     pub fn new() -> Self {
         Self {
             state: [0u8; 32],
-            counter: 0,
+            n_draws: 0,
         }
     }
 
@@ -28,35 +34,52 @@ impl Channel {
             input[32 + i * 4..32 + i * 4 + 4].copy_from_slice(&w.to_le_bytes());
         }
         self.state = blake2s_hash(&input);
-        self.counter = 0;
+        self.n_draws = 0;
     }
 
-    /// Mix a QM31 field element into the channel.
+    /// Mix QM31 field elements into the channel.
+    ///
+    /// Matches stwo's Channel::mix_felts: all felts are appended to the current digest
+    /// bytes in a single Blake2s call (not one hash per felt).
+    /// Input = state[32] || f0_u0..f0_u3 || f1_u0..f1_u3 || ...  (each u32 LE, 4 bytes)
+    /// Uses the `blake2` crate for correct multi-block hashing (input > 64 bytes).
     pub fn mix_felts(&mut self, felts: &[QM31]) {
+        if felts.is_empty() { return; }
+        use blake2::{Blake2s256, Digest as _};
+        let mut hasher = Blake2s256::new();
+        hasher.update(&self.state);
         for f in felts {
-            let arr = f.to_u32_array();
-            let mut input = [0u8; 48];
-            input[..32].copy_from_slice(&self.state);
-            for (i, &w) in arr.iter().enumerate() {
-                input[32 + i * 4..32 + i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+            for &w in &f.to_u32_array() {
+                hasher.update(&w.to_le_bytes());
             }
-            self.state = blake2s_hash(&input);
-            self.counter = 0;
         }
+        let result: [u8; 32] = hasher.finalize().into();
+        self.state = result;
+        self.n_draws = 0;
     }
 
     /// Draw a random QM31 element from the channel.
+    ///
+    /// Matches stwo's draw_secure_felt: rejection-samples the 8 u32s from one
+    /// squeeze until all are in [0, 2P), then reduces. Uses first 4 of the 8.
+    /// Rejection probability per round ≈ 2^{-28}; practically never retries.
     pub fn draw_felt(&mut self) -> QM31 {
-        let bytes = self.squeeze();
-        let v: [u32; 4] = std::array::from_fn(|i| {
-            u32::from_le_bytes([
-                bytes[i * 4],
-                bytes[i * 4 + 1],
-                bytes[i * 4 + 2],
-                bytes[i * 4 + 3],
-            ]) % crate::field::m31::P // reduce to [0, P)
-        });
-        QM31::from_u32_array(v)
+        const P: u32 = crate::field::m31::P;
+        loop {
+            let bytes = self.squeeze();
+            let u32s: [u32; 8] = std::array::from_fn(|i| {
+                u32::from_le_bytes(bytes[i * 4..(i + 1) * 4].try_into().unwrap())
+            });
+            if u32s.iter().all(|&x| x < 2 * P) {
+                let v = [
+                    u32s[0] % P,
+                    u32s[1] % P,
+                    u32s[2] % P,
+                    u32s[3] % P,
+                ];
+                return QM31::from_u32_array(v);
+            }
+        }
     }
 
     /// Draw multiple random QM31 elements.
@@ -72,7 +95,7 @@ impl Channel {
     }
 
     /// Mix a u64 (PoW nonce) into the channel state.
-    /// Follows stwo's Blake2s channel convention: mix_u32s(&[lo, hi]).
+    /// Matches stwo: mix_u32s(&[lo, hi]) = Blake2s(state || lo_le || hi_le).
     pub fn mix_u64(&mut self, value: u64) {
         let lo = value as u32;
         let hi = (value >> 32) as u32;
@@ -81,7 +104,7 @@ impl Channel {
         input[32..36].copy_from_slice(&lo.to_le_bytes());
         input[36..40].copy_from_slice(&hi.to_le_bytes());
         self.state = blake2s_hash(&input);
-        self.counter = 0;
+        self.n_draws = 0;
     }
 
     /// Return the current channel state as 8 u32 words (for GPU PoW prefix computation).
@@ -126,11 +149,16 @@ impl Channel {
     /// Expose raw 32-byte squeeze for Stark252 field element generation.
     pub fn squeeze_raw(&mut self) -> [u8; 32] { self.squeeze() }
 
+    /// Squeeze 32 bytes from the channel.
+    ///
+    /// Input = state[32] || n_draws_le_u32[4] || 0x00[1]  (37 bytes total)
+    /// Matches stwo's Blake2sChannel::draw_u32s with domain byte 0x00.
     fn squeeze(&mut self) -> [u8; 32] {
-        let mut input = [0u8; 40];
+        let mut input = [0u8; 37];
         input[..32].copy_from_slice(&self.state);
-        input[32..40].copy_from_slice(&self.counter.to_le_bytes());
-        self.counter += 1;
+        input[32..36].copy_from_slice(&self.n_draws.to_le_bytes());
+        input[36] = 0x00; // domain separator (matches stwo)
+        self.n_draws += 1;
         blake2s_hash(&input)
     }
 }
@@ -156,10 +184,10 @@ pub fn hash_words(words: &[u32]) -> [u32; 8] {
     out
 }
 
-/// Blake2s hash with domain separation for internal Merkle nodes.
-/// Identical to `blake2s_hash` except h[6] is XORed with 0x01 (personalization).
+/// Blake2s hash for internal Merkle nodes.
+/// Uses standard Blake2s (no domain byte), matching stwo's MerkleHasherLifted::hash_children.
 pub fn blake2s_hash_node(input: &[u8]) -> [u8; 32] {
-    blake2s_hash_domain(input, 0x01)
+    blake2s_hash(input)
 }
 
 /// Minimal Blake2s hash (single block, up to 64 bytes input).
@@ -290,5 +318,44 @@ mod tests {
         unique.sort_by_key(|f| f.to_u32_array());
         unique.dedup();
         assert!(unique.len() >= 7, "Too many duplicate felts: {} unique out of 10", unique.len());
+    }
+
+    /// Verify mix_felts batches all felts into one Blake2s call, matching stwo's protocol.
+    #[test]
+    fn test_mix_felts_matches_stwo_batched() {
+        use blake2::{Blake2s256, Digest as _};
+        use crate::field::QM31;
+
+        let felts: Vec<QM31> = (1u32..=36)
+            .collect::<Vec<_>>()
+            .chunks(4)
+            .map(|c| QM31::from_u32_array([c[0], c[1], c[2], c[3]]))
+            .collect();
+        // 9 QM31 values = 36 M31 words = 144 bytes after state → multi-block territory (>64B).
+
+        // Compute expected value the same way stwo would:
+        // new_state = Blake2s(state || f0_bytes || f1_bytes || ...)
+        let initial_state = [0u8; 32];
+        let mut hasher = Blake2s256::new();
+        hasher.update(initial_state);
+        for f in &felts {
+            for &w in &f.to_u32_array() {
+                hasher.update(w.to_le_bytes());
+            }
+        }
+        let expected: [u8; 32] = hasher.finalize().into();
+
+        let mut ch = Channel::new(); // state = [0; 32]
+        ch.mix_felts(&felts);
+        // Access state via state_words (state_words returns u32 words from self.state).
+        let got: [u8; 32] = {
+            let mut out = [0u8; 32];
+            for (i, w) in ch.state_words().iter().enumerate() {
+                out[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+            }
+            out
+        };
+
+        assert_eq!(got, expected, "mix_felts does not match stwo's batched Blake2s hashing");
     }
 }

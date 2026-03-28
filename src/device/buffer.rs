@@ -104,6 +104,27 @@ impl<T> DeviceBuffer<T> {
         buf
     }
 
+    /// Clone this GPU buffer into a new allocation (device-to-device copy).
+    pub fn clone_on_device(&self) -> Self
+    where
+        T: Default,
+    {
+        let buf = Self::alloc(self.len);
+        if self.len > 0 {
+            let bytes = self.len * std::mem::size_of::<T>();
+            let err = unsafe {
+                ffi::cudaMemcpy(
+                    buf.ptr as *mut c_void,
+                    self.ptr as *const c_void,
+                    bytes,
+                    ffi::MEMCPY_D2D,
+                )
+            };
+            assert!(err == 0, "cudaMemcpy D2D failed: error {err}");
+        }
+        buf
+    }
+
     /// Upload host slice to a new GPU buffer.
     pub fn from_host(data: &[T]) -> Self {
         let buf = Self::alloc(data.len());

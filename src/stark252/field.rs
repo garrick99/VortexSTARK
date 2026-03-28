@@ -99,6 +99,7 @@ pub fn batch_inverse(a: &[Fp]) -> Vec<Fp> {
 
 /// Fiat-Shamir channel that draws Stark252 field elements.
 /// Wraps the existing Blake2s `Channel`.
+#[derive(Clone)]
 pub struct Channel252(pub Channel);
 
 impl Channel252 {

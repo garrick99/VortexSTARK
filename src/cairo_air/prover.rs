@@ -366,6 +366,17 @@ pub struct CairoProof {
     /// Used to combine all (column, sample_point) pairs into the OODS quotient polynomial for FRI.
     #[serde(default)]
     pub oods_alpha: [u32; 4],
+    /// OODS evaluations of the 3 interaction polynomials at z.
+    /// Indexed as [poly][component]: poly ∈ {0=LogUp, 1=RC, 2=S_dict}, component ∈ 0..4.
+    /// Each entry is a QM31 value (M31 component polynomial evaluated at QM31 point z).
+    /// Mixed into Fiat-Shamir between trace evals and AIR quotient evals (stwo tree order).
+    #[serde(default)]
+    pub oods_interaction_at_z: [[[u32; 4]; 4]; 3],
+    /// OODS evaluations of the 3 interaction polynomials at z_next.
+    /// Same layout as oods_interaction_at_z.
+    /// Mixed immediately after oods_interaction_at_z (step-transition binding).
+    #[serde(default)]
+    pub oods_interaction_at_z_next: [[[u32; 4]; 4]; 3],
 }
 
 
@@ -1262,7 +1273,7 @@ fn cairo_prove_cached_with_columns(
     // ---- OODS: Out-Of-Domain Sampling (stwo wire format) ----
     // Phase 1: evaluate trace at z and z_next; mix into channel.
     // Phase 2: evaluate AIR quotient at z; draw OODS alpha; compute OODS quotient for FRI.
-    let (oods_z, oods_trace_at_z, oods_trace_at_z_next, oods_quotient_at_z, oods_alpha, oods_quotient_col) = {
+    let (oods_z, oods_trace_at_z, oods_trace_at_z_next, oods_quotient_at_z, oods_alpha, oods_quotient_col, oods_interaction_at_z, oods_interaction_at_z_next) = {
         use crate::oods::{OodsPoint, eval_at_oods_from_coeffs, qm31_from_m31, oods_vanishing, compute_line_coeffs};
         use std::collections::HashMap;
 
@@ -1289,8 +1300,33 @@ fn cairo_prove_cached_with_columns(
             at_z.push(val_z);
             at_next.push(val_next);
         }
-        channel.mix_felts(&at_z);
-        channel.mix_felts(&at_next);
+        // ── Phase 1.5: evaluate 12 interaction polynomial components at z and z_next ──
+        // 3 interaction polys (LogUp, RC, S_dict) × 4 M31 components = 12 evals each.
+        // Batch strategy: upload each component once (H→D), keep eval-domain GPU buffer
+        // for Phase 2c reuse, clone to scratch for INTT, evaluate at both z and z_next.
+        // Eliminates the 12 redundant H→D re-uploads in Phase 2c.
+        let srcs: [&[Vec<u32>]; 3] = [&host_logup, &host_rc_logup, &host_sdict];
+        // d_interaction_eval[pi][k] = eval-domain GPU buffer (kept alive for Phase 2c)
+        let d_interaction_eval: Vec<Vec<DeviceBuffer<u32>>> = srcs.iter()
+            .map(|src| (0..4).map(|k| DeviceBuffer::from_host(&src[k])).collect())
+            .collect();
+        let (interaction_evals_raw, interaction_evals_next_raw): ([[[u32; 4]; 4]; 3], [[[u32; 4]; 4]; 3]) = {
+            let mut raw_z    = [[[0u32; 4]; 4]; 3];
+            let mut raw_zn   = [[[0u32; 4]; 4]; 3];
+            for pi in 0..3 {
+                for k in 0..4 {
+                    // D→D clone so eval-domain buffer survives INTT
+                    let mut scratch = d_interaction_eval[pi][k].clone_on_device();
+                    ntt::interpolate(&mut scratch, &cache.eval_inv_cache);
+                    let coeffs = scratch.to_host();
+                    let val_z  = eval_at_oods_from_coeffs(&coeffs[..n], z);
+                    let val_zn = eval_at_oods_from_coeffs(&coeffs[..n], z_next);
+                    raw_z[pi][k]  = val_z.to_u32_array();
+                    raw_zn[pi][k] = val_zn.to_u32_array();
+                }
+            }
+            (raw_z, raw_zn)
+        };
 
         // ── Phase 2a: evaluate AIR quotient columns at z ─────────────────────
         // INTT each qk from eval domain → coefficients (first n are the polynomial).
@@ -1304,19 +1340,43 @@ fn cairo_prove_cached_with_columns(
                 eval_at_oods_from_coeffs(&coeffs[..n], z)
             })
         };
-        channel.mix_felts(&quot_at_z.to_vec());
 
-        // ── Phase 2b: draw OODS alpha; build line coefficients ────────────────
+        // ── Phase 2b: mix all sampled values (stwo flatten_cols order) ────────
+        // stwo's channel.mix_felts(sampled_values.flatten_cols()) iterates:
+        //   for each tree, for each column, for each sample point.
+        // Trees 0-2 (trace): N_COLS cols × 2 samples [z, z_next] interleaved per column.
+        // Trees 3-5 (interaction): 4 cols × 2 samples interleaved per column.
+        // Tree 6 (quotient): 4 cols × 1 sample [z].
+        {
+            let mut combined: Vec<QM31> = Vec::with_capacity(N_COLS * 2 + 12 * 2 + 4);
+            for i in 0..N_COLS {
+                combined.push(at_z[i]);
+                combined.push(at_next[i]);
+            }
+            for pi in 0..3 {
+                for k in 0..4 {
+                    combined.push(QM31::from_u32_array(interaction_evals_raw[pi][k]));
+                    combined.push(QM31::from_u32_array(interaction_evals_next_raw[pi][k]));
+                }
+            }
+            for k in 0..4 {
+                combined.push(quot_at_z[k]);
+            }
+            channel.mix_felts(&combined);
+        }
+
+        // Draw OODS alpha (matches stwo's random_coeff draw in verify_values).
         let oods_alpha = channel.draw_felt();
 
-        // Acc 0: sample point z  — N_COLS trace + 4 quotient = N_COLS+4 columns
-        // Acc 1: sample point z_next — N_COLS trace columns
-        let n_acc_z  = N_COLS + 4;
+        // Acc 0: sample point z    — N_COLS trace + 4 quotient + 12 interaction = N_COLS+16
+        // Acc 1: sample point z_next — N_COLS trace + 12 interaction = N_COLS+12
+        let n_acc_z  = N_COLS + 4 + 12;
+        let n_acc_zn = N_COLS + 12;
         let mut b_coeffs_z:  Vec<u32> = Vec::with_capacity(n_acc_z * 4);
         let mut c_coeffs_z:  Vec<u32> = Vec::with_capacity(n_acc_z * 4);
         let mut linear_acc_z  = QM31::ZERO;
-        let mut b_coeffs_zn: Vec<u32> = Vec::with_capacity(N_COLS * 4);
-        let mut c_coeffs_zn: Vec<u32> = Vec::with_capacity(N_COLS * 4);
+        let mut b_coeffs_zn: Vec<u32> = Vec::with_capacity(n_acc_zn * 4);
+        let mut c_coeffs_zn: Vec<u32> = Vec::with_capacity(n_acc_zn * 4);
         let mut linear_acc_zn = QM31::ZERO;
         let mut alpha_pow = QM31::ONE;
 
@@ -1334,12 +1394,34 @@ fn cairo_prove_cached_with_columns(
             linear_acc_z = linear_acc_z + alpha_pow * b;
             alpha_pow = alpha_pow * oods_alpha;
         }
+        // 12 interaction component columns (LogUp, RC, S_dict × 4 comps each)
+        for pi in 0..3usize {
+            for k in 0..4 {
+                let val = QM31::from_u32_array(interaction_evals_raw[pi][k]);
+                let (a, b) = compute_line_coeffs(z, val);
+                b_coeffs_z.extend_from_slice(&a.to_u32_array());
+                c_coeffs_z.extend_from_slice(&alpha_pow.to_u32_array());
+                linear_acc_z = linear_acc_z + alpha_pow * b;
+                alpha_pow = alpha_pow * oods_alpha;
+            }
+        }
         for col_idx in 0..N_COLS {
             let (a, b) = compute_line_coeffs(z_next, at_next[col_idx]);
             b_coeffs_zn.extend_from_slice(&a.to_u32_array());
             c_coeffs_zn.extend_from_slice(&alpha_pow.to_u32_array());
             linear_acc_zn = linear_acc_zn + alpha_pow * b;
             alpha_pow = alpha_pow * oods_alpha;
+        }
+        // 12 interaction component columns at z_next (step-transition binding)
+        for pi in 0..3usize {
+            for k in 0..4 {
+                let val = QM31::from_u32_array(interaction_evals_next_raw[pi][k]);
+                let (a, b) = compute_line_coeffs(z_next, val);
+                b_coeffs_zn.extend_from_slice(&a.to_u32_array());
+                c_coeffs_zn.extend_from_slice(&alpha_pow.to_u32_array());
+                linear_acc_zn = linear_acc_zn + alpha_pow * b;
+                alpha_pow = alpha_pow * oods_alpha;
+            }
         }
 
         // ── Phase 2c: upload eval-domain columns; compute OODS numerators ────
@@ -1351,12 +1433,21 @@ fn cairo_prove_cached_with_columns(
         d_eval_cols.push(DeviceBuffer::from_host(&host_q1));
         d_eval_cols.push(DeviceBuffer::from_host(&host_q2));
         d_eval_cols.push(DeviceBuffer::from_host(&host_q3));
+        // Interaction columns: reuse the already-uploaded eval-domain GPU buffers from Phase 1.5
+        // (avoids 12 redundant H→D uploads — d_interaction_eval[pi][k] still contains eval data).
+        for pi in 0..3 {
+            for k in 0..4 {
+                d_eval_cols.push(d_interaction_eval[pi][k].clone_on_device());
+            }
+        }
 
         let all_col_ptrs: Vec<*const u32> = d_eval_cols.iter().map(|b| b.as_ptr()).collect();
         let d_col_ptrs = DeviceBuffer::from_host(&all_col_ptrs);
 
-        let col_idx_z:  Vec<u32> = (0..(N_COLS + 4) as u32).collect();
-        let col_idx_zn: Vec<u32> = (0..N_COLS as u32).collect();
+        let col_idx_z: Vec<u32> = (0..(N_COLS + 4 + 12) as u32).collect();
+        // z_next: trace (0..N_COLS) then interaction (N_COLS+4..N_COLS+16), skipping quotient slots.
+        let mut col_idx_zn: Vec<u32> = (0..N_COLS as u32).collect();
+        col_idx_zn.extend(((N_COLS + 4) as u32)..((N_COLS + 4 + 12) as u32));
         let d_cidx_z  = DeviceBuffer::from_host(&col_idx_z);
         let d_cidx_zn = DeviceBuffer::from_host(&col_idx_zn);
         let d_b_z  = DeviceBuffer::from_host(&b_coeffs_z);
@@ -1382,7 +1473,7 @@ fn cairo_prove_cached_with_columns(
             );
             ffi::cuda_accumulate_numerators(
                 d_col_ptrs.as_ptr() as *const *const u32, d_cidx_zn.as_ptr(),
-                d_b_zn.as_ptr(), d_c_zn.as_ptr(), N_COLS as u32, eval_size as u32,
+                d_b_zn.as_ptr(), d_c_zn.as_ptr(), n_acc_zn as u32, eval_size as u32,
                 numer_zn0.as_mut_ptr(), numer_zn1.as_mut_ptr(),
                 numer_zn2.as_mut_ptr(), numer_zn3.as_mut_ptr(),
             );
@@ -1391,6 +1482,7 @@ fn cairo_prove_cached_with_columns(
         drop(d_eval_cols); drop(d_col_ptrs);
         drop(d_cidx_z); drop(d_b_z); drop(d_c_z);
         drop(d_cidx_zn); drop(d_b_zn); drop(d_c_zn);
+        drop(d_interaction_eval); // eval-domain interaction GPU buffers no longer needed
 
         // ── Phase 2d: compute domain points; combine into OODS quotient ──────
         let eval_coset = Coset::half_coset(log_eval_size);
@@ -1455,7 +1547,7 @@ fn cairo_prove_cached_with_columns(
         let oods_q_arr: [[u32; 4]; 4]  = std::array::from_fn(|k| quot_at_z[k].to_u32_array());
         let alpha_arr  = oods_alpha.to_u32_array();
         let oods_col   = SecureColumn { cols: [oods_q0, oods_q1, oods_q2, oods_q3], len: eval_size };
-        (z_arr, at_z_arr, at_next_arr, oods_q_arr, alpha_arr, oods_col)
+        (z_arr, at_z_arr, at_next_arr, oods_q_arr, alpha_arr, oods_col, interaction_evals_raw, interaction_evals_next_raw)
     };
 
     // ---- Phase 4: FRI on OODS quotient (replaces direct AIR quotient FRI) ----
@@ -1800,6 +1892,8 @@ fn cairo_prove_cached_with_columns(
         oods_trace_at_z_next,
         oods_quotient_at_z,
         oods_alpha,
+        oods_interaction_at_z,
+        oods_interaction_at_z_next,
     }
 }
 
@@ -2110,22 +2204,32 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
 
     channel.mix_digest(&proof.quotient_commitment);
 
-    // ── OODS: replay sampled values in Fiat-Shamir (must match prover order) ──
-    // Phase 1: draw z, mix trace evals at z and z_next.
-    // Phase 2: mix AIR quotient evals at z, draw oods_alpha.
+    // ── OODS: replay sampled values in Fiat-Shamir (stwo flatten_cols order) ──
+    // Single mix_felts call matching stwo's channel.mix_felts(sampled_values.flatten_cols()).
+    // Order: for each tree, for each column, for each sample point.
+    //   Trees 0-2 (trace, N_COLS cols × 2 samples): col_i_at_z, col_i_at_z_next interleaved.
+    //   Trees 3-5 (interaction, 4 cols × 2 samples): col_k_at_z, col_k_at_z_next interleaved.
+    //   Tree 6 (quotient, 4 cols × 1 sample): col_k_at_z.
     {
         use crate::oods::OodsPoint;
         let _z = OodsPoint::from_channel(&mut channel);
-        let oods_trace_at_z: Vec<crate::field::QM31> = proof.oods_trace_at_z.iter()
-            .map(|v| crate::field::QM31::from_u32_array(*v)).collect();
-        let oods_trace_at_z_next: Vec<crate::field::QM31> = proof.oods_trace_at_z_next.iter()
-            .map(|v| crate::field::QM31::from_u32_array(*v)).collect();
-        channel.mix_felts(&oods_trace_at_z);
-        channel.mix_felts(&oods_trace_at_z_next);
-        // Phase 2: replay AIR quotient evals at z, then draw OODS alpha.
-        let oods_quotient_at_z: Vec<crate::field::QM31> = proof.oods_quotient_at_z.iter()
-            .map(|v| crate::field::QM31::from_u32_array(*v)).collect();
-        channel.mix_felts(&oods_quotient_at_z);
+        let n_trace = proof.oods_trace_at_z.len().min(proof.oods_trace_at_z_next.len());
+        let mut combined: Vec<crate::field::QM31> =
+            Vec::with_capacity(n_trace * 2 + 12 * 2 + 4);
+        for i in 0..n_trace {
+            combined.push(crate::field::QM31::from_u32_array(proof.oods_trace_at_z[i]));
+            combined.push(crate::field::QM31::from_u32_array(proof.oods_trace_at_z_next[i]));
+        }
+        for pi in 0..3 {
+            for k in 0..4 {
+                combined.push(crate::field::QM31::from_u32_array(proof.oods_interaction_at_z[pi][k]));
+                combined.push(crate::field::QM31::from_u32_array(proof.oods_interaction_at_z_next[pi][k]));
+            }
+        }
+        for k in 0..4 {
+            combined.push(crate::field::QM31::from_u32_array(proof.oods_quotient_at_z[k]));
+        }
+        channel.mix_felts(&combined);
         let _oods_alpha = channel.draw_felt();
     }
 
@@ -2361,7 +2465,7 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
 
     // ---- Precompute OODS line coefficients (same for every query) ----
     // Used in the OODS formula check below.
-    let (oods_line_z, oods_line_q, oods_line_zn, oods_z_point, oods_z_next_point, oods_alpha_val) = {
+    let (oods_line_z, oods_line_q, oods_line_interaction, oods_line_interaction_next, oods_line_zn, oods_z_point, oods_z_next_point, oods_alpha_val) = {
         use crate::oods::{OodsPoint, compute_line_coeffs};
         let z      = OodsPoint::from_u32_array(&proof.oods_z);
         let step   = crate::circle::CirclePoint::GENERATOR.repeated_double(31 - log_n);
@@ -2371,9 +2475,21 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
             .map(|v| compute_line_coeffs(z, QM31::from_u32_array(*v))).collect();
         let line_q: Vec<(QM31, QM31)> = proof.oods_quotient_at_z.iter()
             .map(|v| compute_line_coeffs(z, QM31::from_u32_array(*v))).collect();
+        // line_interaction[pi][k]: line coeffs for component k of interaction poly pi at z.
+        let line_interaction: Vec<Vec<(QM31, QM31)>> = proof.oods_interaction_at_z.iter()
+            .map(|poly| poly.iter()
+                .map(|v| compute_line_coeffs(z, QM31::from_u32_array(*v)))
+                .collect())
+            .collect();
+        // line_interaction_next[pi][k]: line coeffs at z_next (step-transition binding).
+        let line_interaction_next: Vec<Vec<(QM31, QM31)>> = proof.oods_interaction_at_z_next.iter()
+            .map(|poly| poly.iter()
+                .map(|v| compute_line_coeffs(z_next, QM31::from_u32_array(*v)))
+                .collect())
+            .collect();
         let line_zn: Vec<(QM31, QM31)> = proof.oods_trace_at_z_next.iter()
             .map(|v| compute_line_coeffs(z_next, QM31::from_u32_array(*v))).collect();
-        (line_z, line_q, line_zn, z, z_next, alpha)
+        (line_z, line_q, line_interaction, line_interaction_next, line_zn, z, z_next, alpha)
     };
 
     for (q, &qi) in proof.query_indices.iter().enumerate() {
@@ -2706,6 +2822,21 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
                 lin_acc_z = lin_acc_z + alpha_pow * b;
                 alpha_pow = alpha_pow * oods_alpha_val;
             }
+            // 12 interaction component columns (LogUp, RC, S_dict × 4 components each)
+            let interaction_col_values = [
+                &proof.interaction_decommitment.values[q],
+                &proof.rc_interaction_decommitment.values[q],
+                &proof.dict_main_interaction_decommitment.values[q],
+            ];
+            for (pi, col_vals) in interaction_col_values.iter().enumerate() {
+                for k in 0..4 {
+                    let (a, b) = oods_line_interaction[pi][k];
+                    let f = qm31_from_m31(M31(col_vals[k]));
+                    partial_z = partial_z + alpha_pow * f - a;
+                    lin_acc_z = lin_acc_z + alpha_pow * b;
+                    alpha_pow = alpha_pow * oods_alpha_val;
+                }
+            }
             let full_numer_z = partial_z - lin_acc_z * py_q;
 
             // z_next accumulator
@@ -2717,6 +2848,21 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
                 partial_zn = partial_zn + alpha_pow * f - a;
                 lin_acc_zn = lin_acc_zn + alpha_pow * b;
                 alpha_pow = alpha_pow * oods_alpha_val;
+            }
+            // 12 interaction component columns at z_next (step-transition)
+            let interaction_col_values_next = [
+                &proof.interaction_decommitment.values[q],
+                &proof.rc_interaction_decommitment.values[q],
+                &proof.dict_main_interaction_decommitment.values[q],
+            ];
+            for (pi, col_vals) in interaction_col_values_next.iter().enumerate() {
+                for k in 0..4 {
+                    let (a, b) = oods_line_interaction_next[pi][k];
+                    let f = qm31_from_m31(M31(col_vals[k]));
+                    partial_zn = partial_zn + alpha_pow * f - a;
+                    lin_acc_zn = lin_acc_zn + alpha_pow * b;
+                    alpha_pow = alpha_pow * oods_alpha_val;
+                }
             }
             let full_numer_zn = partial_zn - lin_acc_zn * py_q;
 

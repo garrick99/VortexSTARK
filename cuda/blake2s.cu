@@ -1,13 +1,13 @@
 // Blake2s hashing for Merkle tree commitments.
 // Uses shared blake2s_compress from include/blake2s.cuh.
 //
-// Domain separation: leaf hashes use h6=IV6, internal nodes use h6=IV6^1.
-// This prevents second-preimage attacks where a leaf is confused with a node.
+// Leaf and node hashing both use standard Blake2s (h6=IV6, no domain byte),
+// matching stwo's Blake2sMerkleHasher which uses Blake2s without personalization.
 
 #include "include/blake2s.cuh"
 
-// Domain-separated IV6 for internal node hashing (personalization byte 0x01).
-#define IV6_NODE (IV6 ^ 1u)
+// No domain separation — matches stwo's MerkleHasherLifted::hash_children.
+#define IV6_NODE IV6
 
 // Hash leaf: n_cols M31 values → 32-byte Blake2s hash
 __global__ void merkle_hash_leaves_kernel(

@@ -435,7 +435,12 @@ pub fn verify_memory_logup(
 
     channel.mix_digest(&proof.q_root);
 
-    // ── Replay FRI channel to reach query index draw ──
+    // Clone channel here — this is the state the prover was in when fri_commit was called.
+    // We use this clone for fri_verify; the main channel is advanced through the FRI ops
+    // so subsequent sub-proofs (range-check) get the correct starting state.
+    let mut fri_channel = channel.clone();
+
+    // ── Advance main channel through FRI ops (for query-index replay) ──
     let _alpha_fri0 = channel.draw_fp();
     for root in &proof.fri_proof.inner_roots {
         channel.mix_digest(root);
@@ -519,14 +524,6 @@ pub fn verify_memory_logup(
     }
 
     // ── FRI verify ────────────────────────────
-    // Rebuild channel from scratch, replicating the prover's exact operations:
-    // draw z, draw alpha, mix s_root, mix q_root.
-    let mut fri_channel = Channel252::new();
-    let _ = fri_channel.draw_fp();  // z (advance past draw, same state as prover)
-    let _ = fri_channel.draw_fp();  // alpha
-    fri_channel.mix_digest(&proof.s_root);
-    fri_channel.mix_digest(&proof.q_root);
-
     fri_verify(
         &proof.fri_proof,
         &proof.q_root,
