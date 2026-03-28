@@ -392,7 +392,7 @@ fn prove_lean_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
 
     // Prefetch first line fold twiddle
     if current_log_size > FRI_CPU_TAIL_LOG.max(3) {
-        let next_domain = Coset::half_coset(current_log_size);
+        let next_domain = Coset::half_odds(current_log_size);
         prefetched_twid = Some(fri::compute_fold_twiddles_async(&next_domain, false, &twid_stream));
     }
 
@@ -407,7 +407,7 @@ fn prove_lean_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
         // Start prefetching NEXT layer's twiddle (overlaps with this fold+commit)
         let next_log = current_log_size - 1;
         if next_log > FRI_CPU_TAIL_LOG.max(3) {
-            let next_domain = Coset::half_coset(next_log);
+            let next_domain = Coset::half_odds(next_log);
             prefetched_twid = Some(fri::compute_fold_twiddles_async(&next_domain, false, &twid_stream));
         }
 
@@ -475,7 +475,7 @@ fn prove_lean_inner(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     while current_log_size > 3 {
         let ti = Instant::now();
         let fold_alpha = channel.draw_felt();
-        let line_domain = Coset::half_coset(current_log_size);
+        let line_domain = Coset::half_odds(current_log_size);
         let d_twid = fri::compute_fold_twiddles_on_demand(&line_domain, false);
         let twid_host = d_twid.to_host();
         drop(d_twid);
@@ -844,7 +844,7 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
 
     // Prefetch first line fold twiddle
     if current_log_size > FRI_CPU_TAIL_LOG.max(3) {
-        let first_domain = Coset::half_coset(current_log_size);
+        let first_domain = Coset::half_odds(current_log_size);
         prefetched_twid = Some(fri::compute_fold_twiddles_async(&first_domain, false, &twid_stream));
     }
 
@@ -871,7 +871,7 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
         // Start prefetching NEXT layer's twiddle (overlaps with this fold+commit)
         let next_log = current_log_size - 1;
         if next_log > FRI_CPU_TAIL_LOG.max(3) {
-            let next_domain = Coset::half_coset(next_log);
+            let next_domain = Coset::half_odds(next_log);
             prefetched_twid = Some(fri::compute_fold_twiddles_async(&next_domain, false, &twid_stream));
         }
 
@@ -981,7 +981,7 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
     let mut cpu_fri_trees: Vec<(Vec<QM31>, [u32; 8])> = Vec::new();
     while current_log_size > 3 {
         let fold_alpha = channel.draw_felt();
-        let line_domain = Coset::half_coset(current_log_size);
+        let line_domain = Coset::half_odds(current_log_size);
         let d_twid = fri::compute_fold_twiddles_on_demand(&line_domain, false);
         let twid_host = d_twid.to_host();
         drop(d_twid);

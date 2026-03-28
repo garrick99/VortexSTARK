@@ -567,10 +567,13 @@ pub fn cairo_proof_to_stwo(proof: &CairoProof) -> TwoStarkProof {
         })
         .collect();
 
-    // Last layer: 8 raw BRT-ordered QM31 evaluations (one per fold position).
-    let last_layer_poly: Vec<TwoSecureField> = proof.fri_last_layer.iter()
-        .map(|q| q.to_u32_array())
-        .collect();
+    // Last layer: convert BRT-ordered half_odds evaluations to LinePoly coefficients.
+    // This matches stwo's FriVerifier expectation: last_layer_poly holds coefficients
+    // in the LinePoly basis {1, x, 2x²-1, x(2x²-1), ...} so eval_at_point(x) works.
+    let last_layer_poly: Vec<TwoSecureField> = {
+        let coeffs = crate::fri::last_layer_poly_coeffs(proof.fri_last_layer.clone());
+        coeffs.iter().map(|q| q.to_u32_array()).collect()
+    };
 
     let fri_proof = TwoFriProof { first_layer, inner_layers, last_layer_poly };
 

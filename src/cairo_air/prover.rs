@@ -1598,7 +1598,7 @@ fn cairo_prove_cached_with_columns(
         fri_commitments.push(layer_commitment);
 
         let fold_alpha = channel.draw_felt();
-        let line_domain = Coset::half_coset(current_log);
+        let line_domain = Coset::half_odds(current_log);
         let d_twid = fri::compute_fold_twiddles_on_demand(&line_domain, false);
         let folded = fri::fold_line_with_twiddles(&current, fold_alpha, &d_twid);
         drop(d_twid);
@@ -2314,7 +2314,7 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
 
         // Line folds
         for layer in 0..n_fri_layers.saturating_sub(1) {
-            let domain = Coset::half_coset(current_log);
+            let domain = Coset::half_odds(current_log);
             let folded_idx = current_idx / 2;
             let decom = &proof.fri_decommitments[layer];
             let (f0, f1) = get_pair_from_decom_4(
@@ -2333,7 +2333,7 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
         // Verify: fold last FRI decommitment matches last-layer polynomial
         if n_fri_layers > 0 {
             let last_decom = &proof.fri_decommitments[n_fri_layers - 1];
-            let domain = Coset::half_coset(current_log);
+            let domain = Coset::half_odds(current_log);
             let folded_idx = current_idx / 2;
             let (f0, f1) = get_pair_from_decom_4(
                 &last_decom.values[q], &last_decom.sibling_values[q], current_idx,

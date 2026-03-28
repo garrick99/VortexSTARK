@@ -185,7 +185,7 @@ pub fn verify(proof: &StarkProof) -> Result<(), String> {
         // The last FRI decommitment IS fri_last_layer, so we fold layers 0..N-2
         // and the result of the last fold should match fri_last_layer.
         for layer in 0..n_fri_layers.saturating_sub(1) {
-            let domain = Coset::half_coset(current_log);
+            let domain = Coset::half_odds(current_log);
             let folded_idx = current_idx / 2;
             let decom = &proof.fri_decommitments[layer];
             let (f0, f1) = get_pair_from_decom_4(

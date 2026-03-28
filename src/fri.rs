@@ -148,9 +148,10 @@ pub fn precompute_fri_twiddles(start_log_size: u32, stop_log_size: u32) -> Vec<D
     result.push(compute_fold_twiddles_gpu(&domain, true));
 
     // Line fold twiddles (subsequent layers) — inverse x-coordinates
+    // Use half_odds to match stwo's FriVerifier fold domain convention.
     let mut log_size = start_log_size - 1;
     while log_size > stop_log_size {
-        let domain = Coset::half_coset(log_size);
+        let domain = Coset::half_odds(log_size);
         result.push(compute_fold_twiddles_gpu(&domain, false));
         log_size -= 1;
     }
@@ -283,14 +284,13 @@ fn bit_reverse_qm31(v: &mut [QM31], log_n: u32) {
 }
 
 /// Convert the last-layer evaluations (bit-reversed order, from the fold chain) to
-/// polynomial coefficients in the line-poly basis `{1, x}`.
+/// polynomial coefficients in the line-poly basis `{1, x, 2x²-1, x(2x²-1), ...}`.
 ///
-/// Applies: bit-reverse → line IFFT using half_coset domain → normalize →
+/// Applies: bit-reverse → line IFFT using half_odds domain → normalize →
 /// bit-reverse → truncate to `1 << LOG_LAST_LAYER_DEGREE_BOUND` coefficients.
 ///
-/// NOTE: This function is only valid when the input evaluations lie on a `half_coset`
-/// domain AND the polynomial truly has degree < `1 << LOG_LAST_LAYER_DEGREE_BOUND`.
-/// VortexSTARK uses raw evaluations instead of this; this is kept for future stwo compat work.
+/// Input evaluations must lie on a `half_odds` domain (the VortexSTARK line-fold
+/// domain, matching stwo's FriVerifier convention).
 pub fn last_layer_poly_coeffs(mut eval: Vec<QM31>) -> Vec<QM31> {
     let n = eval.len();
     assert!(n.is_power_of_two() && n >= 2);
@@ -299,12 +299,12 @@ pub fn last_layer_poly_coeffs(mut eval: Vec<QM31>) -> Vec<QM31> {
     // Step 1: Bit-reverse to natural order.
     bit_reverse_qm31(&mut eval, log_n);
 
-    // Step 2: Line IFFT on natural-order evaluations using half_coset domains.
+    // Step 2: Line IFFT on natural-order evaluations using half_odds domains.
     // At each level we apply ibutterfly(l[i], r[i], domain.at(i).x^{-1}).
     let mut chunk_size = n;
     let mut dom_log = log_n;
     while chunk_size > 1 {
-        let domain = Coset::half_coset(dom_log);
+        let domain = Coset::half_odds(dom_log);
         let half = chunk_size / 2;
         for chunk in eval.chunks_exact_mut(chunk_size) {
             let (l, r) = chunk.split_at_mut(half);
@@ -342,9 +342,9 @@ pub fn last_layer_poly_coeffs(mut eval: Vec<QM31>) -> Vec<QM31> {
 ///   phi_0(x) = 1,  phi_1(x) = x,  phi_2(x) = 2x²-1,  phi_3(x) = x*(2x²-1), ...
 /// Only the first `coeffs.len()` terms are evaluated; higher terms are assumed zero.
 ///
-/// `last_idx` is the BRT (bit-reversed) index into the last-layer domain.
+/// `last_idx` is the BRT (bit-reversed) index into the last-layer `half_odds` domain.
 pub fn eval_last_layer_poly(coeffs: &[QM31], last_idx: usize, log_last_layer_size: u32) -> QM31 {
-    let domain = Coset::half_coset(log_last_layer_size);
+    let domain = Coset::half_odds(log_last_layer_size);
     let natural_idx = {
         let mut result = 0usize;
         let mut val = last_idx;
@@ -457,14 +457,14 @@ mod tests {
     }
 
     /// Verify that `last_layer_poly_coeffs` correctly recovers a degree-1 polynomial
-    /// from 8 BRT-ordered evaluations on `half_coset(3)`.
+    /// from 8 BRT-ordered evaluations on `half_odds(3)`.
     #[test]
     fn test_last_layer_poly_round_trip() {
         let c0 = QM31::from_m31_array([M31(42), M31(0), M31(0), M31(0)]);
         let c1 = QM31::from_m31_array([M31(17), M31(0), M31(0), M31(0)]);
         let n = 8usize;
         let log_n = 3u32;
-        let domain = Coset::half_coset(log_n);
+        let domain = Coset::half_odds(log_n);
 
         // Build BRT-ordered evaluations: brt_eval[j] = p(domain.at(br(j, log_n)).x)
         let brt_eval: Vec<QM31> = (0..n)
@@ -500,7 +500,7 @@ mod tests {
         let c3 = QM31::from_m31_array([M31(7), M31(0), M31(0), M31(0)]);
         let n = 8usize;
         let log_n = 3u32;
-        let domain = Coset::half_coset(log_n);
+        let domain = Coset::half_odds(log_n);
 
         // Build BRT-ordered evaluations: p(x) = c0 + c1*x + c2*(2x²-1) + c3*x*(2x²-1)
         let brt_eval: Vec<QM31> = (0..n)
@@ -528,7 +528,7 @@ mod tests {
     fn test_fold_line_halves_size() {
         let n = 64;
         let log_n = 6u32;
-        let domain = Coset::half_coset(log_n);
+        let domain = Coset::half_odds(log_n);
 
         let values: Vec<QM31> = (0..n)
             .map(|i| {
@@ -585,7 +585,7 @@ mod tests {
     fn test_fold_line_deterministic() {
         let n = 32;
         let log_n = 5u32;
-        let domain = Coset::half_coset(log_n);
+        let domain = Coset::half_odds(log_n);
 
         let values: Vec<QM31> = (0..n)
             .map(|i| QM31::from_m31_array([M31(i as u32 + 1), M31::ZERO, M31::ZERO, M31::ZERO]))

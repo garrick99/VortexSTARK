@@ -121,6 +121,20 @@ impl Coset {
         }
     }
 
+    /// Half-odds coset: used by stwo for FRI line-fold domains.
+    /// Coset = G^(2^(29-log_size)) * subgroup(log_size).
+    /// This matches `Coset::half_odds` in the stwo library.
+    pub fn half_odds(log_size: u32) -> Self {
+        assert!(log_size <= 29);
+        let step = CirclePoint::GENERATOR.repeated_double(31 - log_size);
+        let initial = CirclePoint::GENERATOR.repeated_double(29 - log_size);
+        Self {
+            initial,
+            step,
+            log_size,
+        }
+    }
+
     pub fn size(&self) -> usize {
         1 << self.log_size
     }
