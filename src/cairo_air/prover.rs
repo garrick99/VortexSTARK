@@ -468,20 +468,33 @@ fn cairo_prove_program_inner(
 
     let n = 1usize << log_n;
 
+    // Sanity check: caller must have chosen log_n >= ceil(log2(n_steps)).
+    if n_steps > n {
+        return Err(ProveError::TraceSizeMismatch { n_steps, log_n });
+    }
+
     // ── Height check: can the GPU fit this proof? ──────────────────────────
     // Allocate the twiddle caches first so that vram_query() reflects their
     // footprint; the remaining free VRAM is what the NTT loop needs.
     let cache = CairoProverCache::new(log_n);
     cairo_check_vram(log_n)?;
 
-    // Set up the Cairo calling convention: place a return sentinel (pc=0, fp=0) below the
-    // initial frame so that the program's top-level `ret` instruction halts cleanly.
-    let initial_sp = program.bytecode.len() as u64 + 100; // frame base
-    let initial_ap = initial_sp + 2;                       // AP/FP after the call frame
-    let mut mem = Memory::with_capacity(initial_ap as usize + n_steps + 200);
+    // Set up the Cairo calling convention: place a return sentinel below the initial frame.
+    // pad_addr hosts a 2-word "jmp rel 0" self-loop (instruction + immediate 0) so that
+    // the program's top-level `ret` lands there and fills remaining trace rows up to 2^log_n
+    // with valid Cairo steps without violating any constraints.
+    let pad_addr = program.bytecode.len() as u64; // first free address after bytecode
+    let initial_sp = pad_addr + 100;              // frame base (well above pad_addr)
+    let initial_ap = initial_sp + 2;              // AP/FP after the call frame
+    let mut mem = Memory::with_capacity(initial_ap as usize + n + 200);
     mem.load_program(&program.bytecode);
-    mem.set(initial_sp,     0); // saved fp  = 0 (sentinel)
-    mem.set(initial_sp + 1, 0); // return pc = 0 (halt sentinel)
+    // Padding: jmp rel [pc+1] with immediate 0 → next_pc = pc + 0 = pc (infinite self-loop).
+    // Encoding: op1_imm=1 (bit 2), pc_jump_rel=1 (bit 8), off2=0x8001 (+1 bias = pc+1),
+    //           off0=off1=0x8000 (zero offsets), ap/fp updates all zero.
+    mem.set(pad_addr,     0x0104_8001_8000_8000); // jmp rel 0 instruction
+    mem.set(pad_addr + 1, 0);                     // immediate value = 0 (jump delta)
+    mem.set(initial_sp,     0);        // saved fp  = 0 (sentinel)
+    mem.set(initial_sp + 1, pad_addr); // return pc = pad_addr (self-loop on halt)
 
     // Thread HintContext externally so the prover can inspect dict accesses after execution.
     let mut hint_ctx = if let Some(sc) = syscall_state {
@@ -489,8 +502,10 @@ fn cairo_prove_program_inner(
     } else {
         super::hints::HintContext::new()
     };
+    // Execute n steps total: n_steps real program steps + (n - n_steps) self-loop padding.
+    // The padding self-loop at pad_addr fills remaining rows with valid Cairo transitions.
     let columns = super::vm::execute_to_columns_with_hints(
-        &mut mem, n_steps, log_n, &program.hints,
+        &mut mem, n, log_n, &program.hints,
         program.entry_point, initial_ap,
         &mut hint_ctx,
     );
@@ -500,16 +515,6 @@ fn cairo_prove_program_inner(
     // a different computation. Closing GAP-2: reject at prove time rather than silently mismatch.
     if hint_ctx.execution_overflows > 0 {
         return Err(ProveError::ExecutionRangeViolation { count: hint_ctx.execution_overflows });
-    }
-
-    // ── Trace size check ─────────────────────────────────────────────────────
-    // n_steps must exactly equal 2^log_n. Padding (n_steps < 2^log_n) is not supported:
-    // all-zero padding rows violate the LogUp and Cairo step-transition constraints at
-    // the boundary, producing a non-polynomial quotient that FRI rejects.
-    // Checked after execution (and after overflow detection) so that ExecutionRangeViolation
-    // takes priority — both represent invalid programs, but overflow is more informative.
-    if n_steps != n {
-        return Err(ProveError::TraceSizeMismatch { n_steps, log_n });
     }
 
     // Verify dict access chain consistency (CPU-side check).
@@ -530,7 +535,7 @@ fn cairo_prove_program_inner(
     drop(mem);
 
     let proof = cairo_prove_cached_with_columns(
-        &program.bytecode, columns, n_steps, log_n, &cache, None,
+        &program.bytecode, columns, n, log_n, &cache, None,
         &hint_ctx.dict_accesses, bitwise_rows,
     );
     Ok((proof, hint_ctx))
@@ -584,14 +589,12 @@ fn cairo_prove_cached_with_columns(
     bitwise_rows: Vec<[u32; 5]>,
 ) -> CairoProof {
     let n = 1usize << log_n;
-    // n_steps MUST equal n exactly. When n_steps < n, padding rows are all-zero which violates
-    // the LogUp and Cairo step-transition constraints at the boundary, producing a non-polynomial
-    // quotient that FRI rejects. Use ProveError::TraceSizeMismatch on the public API instead of
-    // panicking here — internal callers already check at the public boundary.
+    // n_steps MUST equal n exactly. Callers are responsible for padding:
+    // cairo_prove_program_inner passes n (not n_steps) after installing the self-loop pad.
+    // cairo_prove_cached (test path) requires exact power-of-two step counts.
     assert_eq!(n_steps, n,
         "VortexSTARK: n_steps ({n_steps}) must equal 2^log_n ({n}). \
-         Padding is not supported — ensure the program runs for exactly 2^log_n steps. \
-         See ProveError::TraceSizeMismatch.");
+         Use cairo_prove_program for auto-padded execution.");
     assert_eq!(cache.log_n, log_n);
     let log_eval_size = log_n + BLOWUP_BITS;
     let eval_size = 1usize << log_eval_size;

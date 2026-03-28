@@ -333,16 +333,20 @@ pub fn detect_steps(program: &CasmProgram, max_steps: usize) -> usize {
     use super::decode::Instruction;
     use super::hints::{HintContext, run_hints};
 
-    // Initial state must match cairo_prove_program exactly.
-    let initial_sp = program.bytecode.len() as u64 + 100;
+    // Initial state must match cairo_prove_program exactly (same pad_addr setup).
+    let pad_addr = program.bytecode.len() as u64;
+    let initial_sp = pad_addr + 100;
     let initial_ap = initial_sp + 2;
 
     let mut memory = Memory::with_capacity(initial_ap as usize + max_steps + 1000);
     memory.load_program(&program.bytecode);
 
     // Calling convention: sentinel frame below initial AP/FP.
-    memory.set(initial_sp,     0); // saved fp  = 0
-    memory.set(initial_sp + 1, 0); // return pc = 0 (halt)
+    // return_pc = pad_addr (self-loop): same as prover setup so detect_steps halts correctly.
+    memory.set(pad_addr,     0x0104_8001_8000_8000); // jmp rel 0 self-loop (padding instruction)
+    memory.set(pad_addr + 1, 0);                     // immediate value = 0
+    memory.set(initial_sp,     0);        // saved fp  = 0
+    memory.set(initial_sp + 1, pad_addr); // return pc = pad_addr (halt via self-loop)
 
     let mut state = CairoState {
         pc: program.entry_point,
@@ -353,6 +357,11 @@ pub fn detect_steps(program: &CasmProgram, max_steps: usize) -> usize {
     let mut ctx = HintContext::new();
 
     for step in 0..max_steps {
+        // Halt detection: program returned to the padding self-loop.
+        if state.pc == pad_addr {
+            return step;
+        }
+
         // Run hints before executing the instruction (same order as prove path).
         run_hints(&program.hints, state.pc, step, &state, &mut memory, &mut ctx);
 
@@ -409,10 +418,8 @@ pub fn detect_steps(program: &CasmProgram, max_steps: usize) -> usize {
             else if instr.opcode_ret == 1 { dst }
             else { state.fp };
 
-        // Halt detection: ret jumped pc to 0 (sentinel)
-        if next_pc == 0 && instr.opcode_ret == 1 {
-            return step + 1;
-        }
+        // Halt detection: ret jumped pc to pad_addr (sentinel); caught at top of next iteration.
+        // (No early return here — let next iteration's pad_addr check fire cleanly.)
 
         // Infinite loop detection: pc didn't change
         if next_pc == state.pc && instr.op1_imm == 0 {
