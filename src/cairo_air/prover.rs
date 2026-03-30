@@ -1709,7 +1709,7 @@ fn cairo_prove_cached_with_columns(
     let mut current = line_eval;
     let mut current_log = log_eval_size - 1;
 
-    let fri_stop_log = fri::LOG_LAST_LAYER_DEGREE_BOUND + BLOWUP_BITS;
+    let fri_stop_log = fri::LOG_LAST_LAYER_DEGREE_BOUND;
     while current_log > fri_stop_log {
         // Commit BRT-ordered layer (matches stwo).
         let layer_commitment = MerkleTree::commit_root_soa4(
@@ -1734,12 +1734,13 @@ fn cairo_prove_cached_with_columns(
     let current_qm31 = current.to_qm31();
     let fri_last_layer = current_qm31.clone();
     // Compute LinePoly coefficients and BRT-permute for stwo channel mixing.
-    let fri_last_layer_coeffs_nat = fri::last_layer_poly_coeffs(current_qm31);
+    let stwo_deg = fri::LOG_LAST_LAYER_DEGREE_BOUND.saturating_sub(BLOWUP_BITS);
+    let stwo_n = 1usize << stwo_deg;
     let fri_last_layer_coeffs: Vec<QM31> = {
-        let n = fri_last_layer_coeffs_nat.len();
-        let log_n = fri::LOG_LAST_LAYER_DEGREE_BOUND;
-        let mut brt = vec![QM31::ZERO; n];
-        for i in 0..n { brt[i.reverse_bits() >> (usize::BITS - log_n)] = fri_last_layer_coeffs_nat[i]; }
+        let mut nat = fri::last_layer_poly_coeffs(current_qm31);
+        nat.truncate(stwo_n);
+        let mut brt = vec![QM31::ZERO; stwo_n];
+        for i in 0..stwo_n { brt[i.reverse_bits() >> (usize::BITS - stwo_deg)] = nat[i]; }
         brt
     };
 
@@ -2382,7 +2383,7 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
     // ---- Verify FRI structure ----
     // FRI layers: from log_eval_size-1 down to 4 = log_eval_size-4 layers
     // Plus the circle fold layer = log_eval_size-4 total committed FRI layers
-    let fri_stop_log = fri::LOG_LAST_LAYER_DEGREE_BOUND + BLOWUP_BITS;
+    let fri_stop_log = fri::LOG_LAST_LAYER_DEGREE_BOUND;
     let expected_fri_layers = (log_eval_size - 1).saturating_sub(fri_stop_log);
     if proof.fri_commitments.len() != expected_fri_layers as usize {
         return Err(format!("Expected {} FRI layers, got {}",
@@ -2397,12 +2398,13 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
     }
 
     // ---- Verify proof-of-work + re-derive query indices ----
-    let fri_last_layer_coeffs_nat = fri::last_layer_poly_coeffs(proof.fri_last_layer.clone());
+    let stwo_deg = fri::LOG_LAST_LAYER_DEGREE_BOUND.saturating_sub(BLOWUP_BITS);
+    let stwo_n = 1usize << stwo_deg;
     let fri_last_layer_coeffs: Vec<QM31> = {
-        let n = fri_last_layer_coeffs_nat.len();
-        let log_n = fri::LOG_LAST_LAYER_DEGREE_BOUND;
-        let mut brt = vec![QM31::ZERO; n];
-        for i in 0..n { brt[i.reverse_bits() >> (usize::BITS - log_n)] = fri_last_layer_coeffs_nat[i]; }
+        let mut nat = fri::last_layer_poly_coeffs(proof.fri_last_layer.clone());
+        nat.truncate(stwo_n);
+        let mut brt = vec![QM31::ZERO; stwo_n];
+        for i in 0..stwo_n { brt[i.reverse_bits() >> (usize::BITS - stwo_deg)] = nat[i]; }
         brt
     };
     channel.mix_felts(&fri_last_layer_coeffs);
