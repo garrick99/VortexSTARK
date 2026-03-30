@@ -135,6 +135,17 @@ impl Coset {
         }
     }
 
+    /// Odds coset: matches stwo's CanonicCoset::new(log_size).coset().
+    /// Coset = G^(2^(30-log_size)) * subgroup(log_size).
+    /// Same initial as half_coset but covers ALL n points (not just n/2).
+    /// Used as the circle fold twiddle domain for BRT-canonic FRI.
+    pub fn odds(log_size: u32) -> Self {
+        assert!(log_size <= 30);
+        let step = CirclePoint::GENERATOR.repeated_double(31 - log_size);
+        let initial = CirclePoint::GENERATOR.repeated_double(30 - log_size);
+        Self { initial, step, log_size }
+    }
+
     pub fn size(&self) -> usize {
         1 << self.log_size
     }

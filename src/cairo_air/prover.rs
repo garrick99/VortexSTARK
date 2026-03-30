@@ -99,18 +99,21 @@ impl std::fmt::Display for ProveError {
 }
 
 /// Permute data from half_coset BRT-NTT order to stwo CanonicCoset (CircleDomain) order.
+/// Permute data from half_coset BRT-NTT order to BRT-canonic order (stwo BitReversedOrder).
+///
+/// BRT-canonic: position j has the value at canonic_domain_point(BRT(j)).
+/// This is what stwo stores in `SecureEvaluation<B, BitReversedOrder>`.
 fn permute_half_coset_to_canonic(data: &[u32], log_n: u32) -> Vec<u32> {
     let n = 1usize << log_n;
     assert_eq!(data.len(), n);
     let mut out = vec![0u32; n];
     for i in 0..n {
-        let k = {
-            let mut r = 0usize;
-            let mut v = i;
-            for _ in 0..log_n { r = (r << 1) | (v & 1); v >>= 1; }
-            r
-        };
-        let j = if k % 2 == 0 { k / 2 } else { n - 1 - k / 2 };
+        // NTT position i → half_coset natural index k = bit_reverse(i)
+        let k = i.reverse_bits() >> (usize::BITS - log_n);
+        // Natural half_coset index k → canonic natural position
+        let cn = if k % 2 == 0 { k / 2 } else { n - 1 - k / 2 };
+        // Canonic natural → BRT-canonic position
+        let j = cn.reverse_bits() >> (usize::BITS - log_n);
         out[j] = data[i];
     }
     out
@@ -145,12 +148,17 @@ fn canonic_domain_point(j: usize, log_eval_size: u32) -> crate::circle::CirclePo
     if j < half_n { ho.at(j) } else { ho.at(j - half_n).conjugate() }
 }
 
-/// Compute canonic "next trace step" position from canonic position qi.
+/// Compute "next trace step" position from BRT-canonic position qi.
+/// Maps: BRT-canonic qi → canonic natural → half_coset NTT → +1 → canonic natural → BRT-canonic.
 pub fn canonic_next(qi: usize, log_eval_size: u32) -> usize {
+    // BRT-canonic qi → canonic natural
+    let cn = qi.reverse_bits() >> (usize::BITS - log_eval_size);
     let eval_size = 1usize << log_eval_size;
-    let hc = canonic_to_hc_ntt(qi, log_eval_size);
+    // canonic natural → half_coset NTT → +1 → canonic natural → BRT-canonic
+    let hc = canonic_to_hc_ntt(cn, log_eval_size);
     let hc_next = (hc + 1) % eval_size;
-    hc_ntt_to_canonic(hc_next, log_eval_size)
+    let cn_next = hc_ntt_to_canonic(hc_next, log_eval_size);
+    cn_next.reverse_bits() >> (usize::BITS - log_eval_size)
 }
 
 /// Compute peak VRAM (bytes) needed for a Cairo proof of the given size.
@@ -1396,13 +1404,17 @@ fn cairo_prove_cached_with_columns(
             // For OODS point evaluation, we need half_coset-ordered data for INTT.
             // Interaction host data is canonic; inverse-permute to half_coset for INTT.
             let srcs_hc: [Vec<Vec<u32>>; 3] = {
+                // Inverse permutation: BRT-canonic → half_coset NTT order.
+                // BRT-canonic position j has value at canonic_domain_point(BRT(j)).
+                // Half_coset NTT position for that value is canonic_to_hc_ntt(BRT(j)).
                 let inv_perm = |cn: &[Vec<u32>; 4]| -> Vec<Vec<u32>> {
                     cn.iter().map(|col| {
                         let n = col.len();
                         let log_n = n.trailing_zeros();
                         let mut hc = vec![0u32; n];
                         for j in 0..n {
-                            hc[canonic_to_hc_ntt(j, log_n)] = col[j];
+                            let cn_nat = j.reverse_bits() >> (usize::BITS - log_n);
+                            hc[canonic_to_hc_ntt(cn_nat, log_n)] = col[j];
                         }
                         hc
                     }).collect()
@@ -1581,21 +1593,17 @@ fn cairo_prove_cached_with_columns(
         drop(d_interaction_eval); // eval-domain interaction GPU buffers no longer needed
 
         // ── Phase 2d: compute domain points; combine into OODS quotient ──────
-        // Domain points in canonic order (matching the canonic-ordered d_eval_cols).
+        // BRT-canonic domain points (matching the BRT-canonic-ordered d_eval_cols).
         let mut d_dom_xs = DeviceBuffer::<u32>::alloc(eval_size);
         let mut d_dom_ys = DeviceBuffer::<u32>::alloc(eval_size);
         {
-            let ho = Coset::half_odds(log_eval_size - 1);
-            let half_n = eval_size / 2;
             let mut xs = vec![0u32; eval_size];
             let mut ys = vec![0u32; eval_size];
-            for i in 0..half_n {
-                let pt = ho.at(i);
+            for i in 0..eval_size {
+                let brt_i = i.reverse_bits() >> (usize::BITS - log_eval_size);
+                let pt = canonic_domain_point(brt_i, log_eval_size);
                 xs[i] = pt.x.0;
                 ys[i] = pt.y.0;
-                let conj = pt.conjugate();
-                xs[half_n + i] = conj.x.0;
-                ys[half_n + i] = conj.y.0;
             }
             d_dom_xs = DeviceBuffer::from_host(&xs);
             d_dom_ys = DeviceBuffer::from_host(&ys);
@@ -1663,29 +1671,38 @@ fn cairo_prove_cached_with_columns(
 
     // OODS quotient was computed from canonic-ordered trace data and canonic domain points,
     // so it's ALREADY in canonic order. No permutation needed.
+    // OODS quotient was computed from BRT-canonic data with BRT-canonic domain points.
+    // It's ALREADY in BRT-canonic order — no additional permutation needed.
     let (oods_quotient_commitment, tile_roots_oods_q) =
         MerkleTree::commit_root_soa4_with_subtrees(&quotient_col.cols[0], &quotient_col.cols[1],
             &quotient_col.cols[2], &quotient_col.cols[3], log_eval_size);
     let fri_start_channel_state = channel.state_words();
     channel.mix_digest(&oods_quotient_commitment);
+    // BRT-canonic host data for decommitment.
     let host_oods_q0 = quotient_col.cols[0].to_host_fast();
     let host_oods_q1 = quotient_col.cols[1].to_host_fast();
     let host_oods_q2 = quotient_col.cols[2].to_host_fast();
     let host_oods_q3 = quotient_col.cols[3].to_host_fast();
 
-    // Circle fold with natural-order half_odds y-inv twiddles
+    // BRT circle fold twiddles from the canonic domain.
+    // The BRT-canonic data at position j has the value at canonic_domain_point(BRT(j)).
+    // The fold pairs (2i, 2i+1) and the twiddle[i] = 1/y at the even pair's domain point.
     let fri_alpha = channel.draw_felt();
     let d_twid = {
-        let ho = Coset::half_odds(log_eval_size - 1);
         let half_n = eval_size / 2;
         let mut tw = vec![0u32; half_n];
-        for i in 0..half_n { tw[i] = ho.at(i).y.inverse().0; }
+        for i in 0..half_n {
+            let brt_2i = (2*i).reverse_bits() >> (usize::BITS - log_eval_size);
+            let pt = canonic_domain_point(brt_2i, log_eval_size);
+            tw[i] = pt.y.inverse().0;
+        }
         DeviceBuffer::from_host(&tw)
     };
     let mut line_eval = SecureColumn::zeros(eval_size / 2);
     fri::fold_circle_into_line_with_twiddles(&mut line_eval, &quotient_col, fri_alpha, &d_twid);
     drop(d_twid);
     drop(quotient_col);
+    // line_eval is now BRT-ordered (BRT circle fold on BRT input → BRT output).
 
     let mut fri_commitments = Vec::new();
     let mut fri_evals: Vec<SecureColumn> = Vec::new();
@@ -1694,7 +1711,7 @@ fn cairo_prove_cached_with_columns(
 
     let fri_stop_log = fri::LOG_LAST_LAYER_DEGREE_BOUND + BLOWUP_BITS;
     while current_log > fri_stop_log {
-        // Commit current layer
+        // Commit BRT-ordered layer (matches stwo).
         let layer_commitment = MerkleTree::commit_root_soa4(
             &current.cols[0], &current.cols[1], &current.cols[2], &current.cols[3],
             current_log,
@@ -1702,14 +1719,10 @@ fn cairo_prove_cached_with_columns(
         channel.mix_digest(&layer_commitment);
         fri_commitments.push(layer_commitment);
 
+        // BRT line fold twiddles (standard convention matching BRT data).
         let fold_alpha = channel.draw_felt();
-        let d_twid = {
-            let ho = Coset::half_odds(current_log);
-            let half = (1usize << current_log) / 2;
-            let mut tw = vec![0u32; half];
-            for i in 0..half { tw[i] = ho.at(i).x.inverse().0; }
-            DeviceBuffer::from_host(&tw)
-        };
+        let line_domain = Coset::half_odds(current_log);
+        let d_twid = fri::compute_fold_twiddles_on_demand(&line_domain, false);
         let folded = fri::fold_line_with_twiddles(&current, fold_alpha, &d_twid);
         drop(d_twid);
 
@@ -1720,7 +1733,15 @@ fn cairo_prove_cached_with_columns(
 
     let current_qm31 = current.to_qm31();
     let fri_last_layer = current_qm31.clone();
-    let fri_last_layer_coeffs = fri::last_layer_poly_coeffs(current_qm31);
+    // Compute LinePoly coefficients and BRT-permute for stwo channel mixing.
+    let fri_last_layer_coeffs_nat = fri::last_layer_poly_coeffs(current_qm31);
+    let fri_last_layer_coeffs: Vec<QM31> = {
+        let n = fri_last_layer_coeffs_nat.len();
+        let log_n = fri::LOG_LAST_LAYER_DEGREE_BOUND;
+        let mut brt = vec![QM31::ZERO; n];
+        for i in 0..n { brt[i.reverse_bits() >> (usize::BITS - log_n)] = fri_last_layer_coeffs_nat[i]; }
+        brt
+    };
 
     // ---- Phase 5: Proof-of-Work grinding + Query + decommitment ----
     channel.mix_felts(&fri_last_layer_coeffs);
@@ -2376,7 +2397,14 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
     }
 
     // ---- Verify proof-of-work + re-derive query indices ----
-    let fri_last_layer_coeffs = fri::last_layer_poly_coeffs(proof.fri_last_layer.clone());
+    let fri_last_layer_coeffs_nat = fri::last_layer_poly_coeffs(proof.fri_last_layer.clone());
+    let fri_last_layer_coeffs: Vec<QM31> = {
+        let n = fri_last_layer_coeffs_nat.len();
+        let log_n = fri::LOG_LAST_LAYER_DEGREE_BOUND;
+        let mut brt = vec![QM31::ZERO; n];
+        for i in 0..n { brt[i.reverse_bits() >> (usize::BITS - log_n)] = fri_last_layer_coeffs_nat[i]; }
+        brt
+    };
     channel.mix_felts(&fri_last_layer_coeffs);
     if !channel.verify_pow_nonce(POW_BITS, proof.pow_nonce) {
         return Err(format!(
@@ -2408,16 +2436,17 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
         let mut current_idx = qi;
         let mut current_log = log_eval_size;
 
-        // Circle fold: OODS quotient → FRI layer 0
+        // Circle fold: OODS quotient (BRT-canonic ordered) → FRI layer 0 (BRT line order)
         {
-            let ho = Coset::half_odds(current_log - 1);
             let folded_idx = current_idx / 2;
             let (f0, f1) = get_pair_from_decom_4(
                 &proof.oods_quotient_decommitment.values[q],
                 &proof.oods_quotient_decommitment.sibling_values[q],
                 current_idx,
             );
-            let twiddle = ho.at(folded_idx).y.inverse();
+            // Circle fold twiddle: 1/y at the canonic domain point for the even element.
+            let brt_even = (current_idx & !1).reverse_bits() >> (usize::BITS - log_eval_size);
+            let twiddle = canonic_domain_point(brt_even, log_eval_size).y.inverse();
             let expected = fold_pair(f0, f1, fri_alphas[0], twiddle);
             if n_fri_layers > 0 {
                 let actual = QM31::from_u32_array(proof.fri_decommitments[0].values[q]);
@@ -2441,7 +2470,7 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
             let (f0, f1) = get_pair_from_decom_4(
                 &decom.values[q], &decom.sibling_values[q], current_idx,
             );
-            let twiddle = ho.at(folded_idx).x.inverse();
+            let twiddle = fold_twiddle_at(&ho, folded_idx, false);
             let expected = fold_pair(f0, f1, fri_alphas[layer + 1], twiddle);
             let actual = QM31::from_u32_array(proof.fri_decommitments[layer + 1].values[q]);
             if expected != actual {
@@ -2459,7 +2488,7 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
             let (f0, f1) = get_pair_from_decom_4(
                 &last_decom.values[q], &last_decom.sibling_values[q], current_idx,
             );
-            let twiddle = ho.at(folded_idx).x.inverse();
+            let twiddle = fold_twiddle_at(&ho, folded_idx, false);
             let expected = fold_pair(f0, f1, fri_alphas[n_fri_layers], twiddle);
             if expected != proof.fri_last_layer[folded_idx] {
                 return Err(format!("FRI last layer mismatch at query {q}"));
@@ -2887,7 +2916,7 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
         // The GPU quotient kernel outputs Q(x) = C(x)/Z_H(x).
         // So the committed quotient value times the vanishing polynomial must equal
         // the constraint sum: C(x) == Q(x) * Z_H(x).
-        let eval_point = canonic_domain_point(qi, log_eval_size);
+        let eval_point = canonic_domain_point(bit_reverse(qi, log_eval_size), log_eval_size);
         let zh = crate::circle::Coset::circle_vanishing_poly_at(eval_point.x, log_n);
 
         let q_val = QM31::from_u32_array(proof.quotient_decommitment.values[q]);
@@ -2914,7 +2943,7 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
         {
             use crate::oods::{oods_denom, qm31_from_m31};
             // p_nat: natural-order domain point at index qi (matching GPU's cuda_compute_coset_points)
-            let p_nat = canonic_domain_point(qi, log_eval_size);
+            let p_nat = canonic_domain_point(bit_reverse(qi, log_eval_size), log_eval_size);
             let px = p_nat.x;
             let py = p_nat.y;
             let py_q = qm31_from_m31(py);
@@ -4142,7 +4171,7 @@ mod tests {
     #[test]
     fn test_step_transition_boundary_wrap() {
         // Verify step-transition decommitments correctly handle the wrap-around at the
-        // last eval-domain position: next_qi = (qi + 1) % eval_size.
+        // last eval-domain position: next_qi = canonic_next(qi, log_eval_size).
         // At qi = eval_size - 1 the "next row" is qi = 0, not qi + 1 = eval_size
         // (out of bounds). This test checks:
         //   1. All next-query indices are correctly bounded within eval_size.
@@ -4157,7 +4186,7 @@ mod tests {
 
         // Check all next-query indices are in-bounds and boundary wraps correctly
         for &qi in &proof.query_indices {
-            let next_qi = (qi + 1) % eval_size;
+            let next_qi = canonic_next(qi, log_eval_size);
             assert!(next_qi < eval_size,
                 "next_qi={next_qi} out of bounds for eval_size={eval_size}");
             if qi == eval_size - 1 {
