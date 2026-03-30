@@ -609,7 +609,7 @@ fn build_trace_witness(
     auth_paths_next: &[Vec<[u32; 8]>],
     tree_height: usize,
 ) -> Vec<TwoHash> {
-    let eval_size = 1usize << tree_height;
+    let log_eval_size = tree_height as u32;
     // Collect merged positions in sorted order; for each position keep one auth path.
     // Current positions take priority over next positions on collision.
     let mut pos_to_auth: BTreeMap<usize, &Vec<[u32; 8]>> = BTreeMap::new();
@@ -618,7 +618,7 @@ fn build_trace_witness(
     }
     if !auth_paths_next.is_empty() {
         for (i, &pos) in query_indices.iter().enumerate() {
-            let next_pos = (pos + 1) % eval_size;
+            let next_pos = crate::cairo_air::prover::canonic_next(pos, log_eval_size);
             pos_to_auth.entry(next_pos).or_insert(&auth_paths_next[i]);
         }
     }
@@ -790,7 +790,7 @@ pub fn verify_all_merkle_witnesses(
     // Build merged sorted+deduped position list.
     let mut merged: Vec<usize> = Vec::with_capacity(2 * n_queries);
     merged.extend_from_slice(query_indices);
-    merged.extend(query_indices.iter().map(|&qi| (qi + 1) % eval_size));
+    merged.extend(query_indices.iter().map(|&qi| crate::cairo_air::prover::canonic_next(qi, log_eval as u32)));
     merged.sort_unstable();
     merged.dedup();
 
@@ -798,7 +798,7 @@ pub fn verify_all_merkle_witnesses(
     let cur_idx: std::collections::HashMap<usize, usize> = query_indices.iter()
         .enumerate().map(|(i, &qi)| (qi, i)).collect();
     let next_idx: std::collections::HashMap<usize, usize> = query_indices.iter()
-        .enumerate().map(|(i, &qi)| ((qi + 1) % eval_size, i)).collect();
+        .enumerate().map(|(i, &qi)| (crate::cairo_air::prover::canonic_next(qi, log_eval as u32), i)).collect();
 
     // Tree col ranges: [0..16], [16..31], [31..34]
     let ranges = [(0usize, 16usize), (16, 31), (31, 34)];
@@ -1225,10 +1225,10 @@ mod tests {
         let cur_idx: std::collections::HashMap<usize, usize> =
             proof.query_indices.iter().enumerate().map(|(i, &qi)| (qi, i)).collect();
         let next_idx: std::collections::HashMap<usize, usize> =
-            proof.query_indices.iter().enumerate().map(|(i, &qi)| ((qi + 1) % eval_size, i)).collect();
+            proof.query_indices.iter().enumerate().map(|(i, &qi)| (crate::cairo_air::prover::canonic_next(qi, log_eval as u32), i)).collect();
         let mut merged: Vec<usize> = Vec::with_capacity(2 * n_q);
         merged.extend(proof.query_indices.iter().copied());
-        merged.extend(proof.query_indices.iter().map(|&qi| (qi + 1) % eval_size));
+        merged.extend(proof.query_indices.iter().map(|&qi| crate::cairo_air::prover::canonic_next(qi, log_eval as u32)));
         merged.sort_unstable();
         merged.dedup();
 
@@ -1781,7 +1781,7 @@ mod tests {
     /// 4. FriVerifier::decommit() — verify fold equations at all query points
     ///
     /// STATUS: FriVerifier::commit() succeeds (layer counts, LinePoly coefficients, channel match).
-    /// FriVerifier::decommit() fails: Merkle leaf ordering mismatch.
+    /// FriVerifier::decommit() fails: SoA4 leaf hashing convention mismatch.
     ///
     /// Root cause: VortexSTARK commits all trees in half_coset BRT-NTT order; stwo expects
     /// CanonicCoset (conjugate-pair) order. The `permute_half_coset_to_canonic` function
@@ -1796,8 +1796,9 @@ mod tests {
     ///
     /// Fold equations ARE algebraically identical (both use (f0+f1) + alpha * inv_twiddle * (f0-f1)).
     /// The FRI layer count and LinePoly coefficient mixing already match stwo.
+    /// Canonic domain ordering now matches. Remaining: SoA4 leaf hash convention.
     #[test]
-    #[ignore = "Merkle leaf ordering: half_coset BRT-NTT vs CanonicCoset (all 7+ trees)"]
+    #[ignore = "FRI first layer: SoA4 leaf hash vs stwo per-SecureField leaf hash"]
     fn test_stwo_fri_verifier_e2e() {
         use crate::cairo_air::decode::Instruction;
         use crate::cairo_air::prover::cairo_prove;
