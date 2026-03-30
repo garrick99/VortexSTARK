@@ -1790,14 +1790,21 @@ fn cairo_prove_cached_with_columns(
             let odd = QM31::from_u32_array(circle_coeffs[n + k]);
             even + fri_alpha * odd
         }).collect();
-        // Apply COMMITTED line fold alphas to reduce 32 → 16 → 8.
-        // all_fold_alphas[0] = circle fold, [1..n_committed+1] = committed line folds.
-        let n_committed = fri_commitments.len();
-        for alpha_idx in 1..=n_committed {
-            let alpha = all_fold_alphas[alpha_idx];
-            let half = coeffs.len() / 2;
-            coeffs = (0..half).map(|k| coeffs[2*k] + alpha * coeffs[2*k+1]).collect();
+        // Apply COMMITTED line fold alphas using stwo's fold convention.
+        // fold(values, [a1, a2]) = fold(left, [a2]) + fold(right, [a2]) * a1
+        fn coeff_fold(vals: &[QM31], alphas: &[QM31]) -> Vec<QM31> {
+            if alphas.is_empty() { return vals.to_vec(); }
+            let half = vals.len() / 2;
+            let left = coeff_fold(&vals[..half], &alphas[1..]);
+            let right = coeff_fold(&vals[half..], &alphas[1..]);
+            left.iter().zip(right.iter())
+                .map(|(&l, &r)| l + r * alphas[0])
+                .collect()
         }
+        let n_committed = fri_commitments.len();
+        let committed_alphas: Vec<QM31> = (1..=n_committed)
+            .map(|i| all_fold_alphas[i]).collect();
+        coeffs = coeff_fold(&coeffs, &committed_alphas);
         // BRT-permute.
         let final_n = coeffs.len();
         let final_deg = final_n.ilog2();
