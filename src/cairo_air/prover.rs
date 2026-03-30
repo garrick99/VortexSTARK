@@ -1735,14 +1735,15 @@ fn cairo_prove_cached_with_columns(
     let current_qm31 = current.to_qm31();
     let fri_last_layer = current_qm31.clone();
 
-    // Compute LinePoly coefficients and BRT-permute for stwo channel mixing.
-    let stwo_deg = fri::LOG_LAST_LAYER_DEGREE_BOUND.saturating_sub(BLOWUP_BITS);
-    let stwo_n = 1usize << stwo_deg;
+    // Compute LinePoly BRT coefficients for channel mixing.
+    // With fri_stop_log = LOG_LAST_LAYER_DEGREE_BOUND, the 8-element last layer
+    // IS the full polynomial — all 8 LinePoly coefficients are valid.
+    let poly_deg = fri::LOG_LAST_LAYER_DEGREE_BOUND;
+    let poly_n = 1usize << poly_deg;
     let fri_last_layer_coeffs: Vec<QM31> = {
-        let mut nat = fri::last_layer_poly_coeffs(current_qm31);
-        nat.truncate(stwo_n);
-        let mut brt = vec![QM31::ZERO; stwo_n];
-        for i in 0..stwo_n { brt[i.reverse_bits() >> (usize::BITS - stwo_deg)] = nat[i]; }
+        let nat = fri::last_layer_poly_coeffs(current_qm31);
+        let mut brt = vec![QM31::ZERO; poly_n];
+        for i in 0..poly_n { brt[i.reverse_bits() >> (usize::BITS - poly_deg)] = nat[i]; }
         brt
     };
 
@@ -2400,13 +2401,12 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
     }
 
     // ---- Verify proof-of-work + re-derive query indices ----
-    let stwo_deg = fri::LOG_LAST_LAYER_DEGREE_BOUND.saturating_sub(BLOWUP_BITS);
-    let stwo_n = 1usize << stwo_deg;
+    let poly_deg = fri::LOG_LAST_LAYER_DEGREE_BOUND;
+    let poly_n = 1usize << poly_deg;
     let fri_last_layer_coeffs: Vec<QM31> = {
-        let mut nat = fri::last_layer_poly_coeffs(proof.fri_last_layer.clone());
-        nat.truncate(stwo_n);
-        let mut brt = vec![QM31::ZERO; stwo_n];
-        for i in 0..stwo_n { brt[i.reverse_bits() >> (usize::BITS - stwo_deg)] = nat[i]; }
+        let nat = fri::last_layer_poly_coeffs(proof.fri_last_layer.clone());
+        let mut brt = vec![QM31::ZERO; poly_n];
+        for i in 0..poly_n { brt[i.reverse_bits() >> (usize::BITS - poly_deg)] = nat[i]; }
         brt
     };
     channel.mix_felts(&fri_last_layer_coeffs);

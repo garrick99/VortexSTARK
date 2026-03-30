@@ -345,29 +345,35 @@ pub fn last_layer_poly_coeffs(mut eval: Vec<QM31>) -> Vec<QM31> {
 /// `last_idx` is the BRT (bit-reversed) index into the last-layer `half_odds` domain.
 pub fn eval_last_layer_poly(coeffs: &[QM31], last_idx: usize, log_last_layer_size: u32) -> QM31 {
     let domain = Coset::half_odds(log_last_layer_size);
-    let natural_idx = {
-        let mut result = 0usize;
-        let mut val = last_idx;
-        for _ in 0..log_last_layer_size {
-            result = (result << 1) | (val & 1);
-            val >>= 1;
-        }
-        result
-    };
+    let natural_idx = last_idx.reverse_bits() >> (usize::BITS - log_last_layer_size);
     let x: M31 = domain.at(natural_idx).x;
 
-    let mut acc = coeffs[0];
-    if coeffs.len() > 1 {
-        acc = acc + coeffs[1] * x;
+    // Evaluate using stwo's fold algorithm: recursively split coefficients and combine
+    // with doublings [x, double_x(x), double_x(double_x(x)), ...].
+    let n = coeffs.len();
+    if n == 1 { return coeffs[0]; }
+
+    let mut doublings = Vec::new();
+    let mut xi = x;
+    let log_n = n.ilog2();
+    for _ in 0..log_n {
+        doublings.push(xi);
+        xi = M31(2) * xi * xi - M31::ONE; // double_x
     }
-    if coeffs.len() > 2 {
-        let dx = M31(2) * x * x - M31::ONE;
-        acc = acc + coeffs[2] * dx;
-        if coeffs.len() > 3 {
-            acc = acc + coeffs[3] * x * dx;
-        }
+
+    fn fold_eval(brt_coeffs: &[QM31], doublings: &[M31]) -> QM31 {
+        let n = brt_coeffs.len();
+        if n == 1 { return brt_coeffs[0]; }
+        let half = n / 2;
+        let lhs = fold_eval(&brt_coeffs[..half], &doublings[1..]);
+        let rhs = fold_eval(&brt_coeffs[half..], &doublings[1..]);
+        lhs + rhs * doublings[0]
     }
-    acc
+
+    // BRT the natural-order coefficients for fold_eval (stwo's LinePoly convention).
+    let mut brt = vec![QM31::ZERO; n];
+    for i in 0..n { brt[i.reverse_bits() >> (usize::BITS - log_n)] = coeffs[i]; }
+    fold_eval(&brt, &doublings)
 }
 
 /// FRI fold_line on CPU (small data path).

@@ -625,13 +625,12 @@ pub fn cairo_proof_to_stwo(proof: &CairoProof) -> TwoStarkProof {
     // Convert FRI last layer evaluations to LinePoly BRT-ordered coefficients.
     // last_layer_poly_coeffs returns natural-order coefficients; BRT-permute for LinePoly::new.
     let last_layer_poly: Vec<TwoSecureField> = {
-        let mut coeffs = crate::fri::last_layer_poly_coeffs(proof.fri_last_layer.clone());
-        let stwo_deg = crate::fri::LOG_LAST_LAYER_DEGREE_BOUND.saturating_sub(crate::prover::BLOWUP_BITS);
-        let stwo_n = 1usize << stwo_deg;
-        coeffs.truncate(stwo_n);
-        let mut brt = vec![crate::field::QM31::ZERO; stwo_n];
-        for i in 0..stwo_n {
-            brt[i.reverse_bits() >> (usize::BITS - stwo_deg)] = coeffs[i];
+        let coeffs = crate::fri::last_layer_poly_coeffs(proof.fri_last_layer.clone());
+        let deg = crate::fri::LOG_LAST_LAYER_DEGREE_BOUND;
+        let n = coeffs.len();
+        let mut brt = vec![crate::field::QM31::ZERO; n];
+        for i in 0..n {
+            brt[i.reverse_bits() >> (usize::BITS - deg)] = coeffs[i];
         }
         brt.iter().map(|q| q.to_u32_array()).collect()
     };
@@ -643,7 +642,7 @@ pub fn cairo_proof_to_stwo(proof: &CairoProof) -> TwoStarkProof {
         log_blowup_factor: BLOWUP_BITS,
         n_queries: N_QUERIES as u32,
         pow_bits: POW_BITS,
-        log_last_layer_degree_bound: crate::fri::LOG_LAST_LAYER_DEGREE_BOUND.saturating_sub(crate::prover::BLOWUP_BITS),
+        log_last_layer_degree_bound: crate::fri::LOG_LAST_LAYER_DEGREE_BOUND,
     };
 
     TwoStarkProof {
@@ -1492,7 +1491,7 @@ mod tests {
     ///   - first_layer (OODS quotient, circle domain log_size=log_eval)
     ///   - inner_layers[i] (line domain log_size=log_eval-1-i)
     #[test]
-    #[ignore = "FRI last layer: line IFFT shows degree 7 (pre-existing issue, needs line domain investigation)"]
+    #[ignore = "FRI layer count: VortexSTARK folds to 8 elements (4 inner layers) vs stwo expects 2"]
     fn test_stwo_fri_merkle_witnesses() {
         use crate::cairo_air::prover::cairo_prove;
         use crate::cuda::ffi;
@@ -1811,7 +1810,7 @@ mod tests {
         }
 
         // Mix last layer polynomial BRT coefficients (same as prover).
-        let stwo_deg_t = crate::fri::LOG_LAST_LAYER_DEGREE_BOUND.saturating_sub(BLOWUP_BITS);
+        let stwo_deg_t = crate::fri::LOG_LAST_LAYER_DEGREE_BOUND;
         let stwo_n_t = 1usize << stwo_deg_t;
         let mut nat_c = crate::fri::last_layer_poly_coeffs(proof.fri_last_layer.clone());
         nat_c.truncate(stwo_n_t);
@@ -1864,7 +1863,7 @@ mod tests {
     /// Fold equations ARE algebraically identical (both use (f0+f1) + alpha * inv_twiddle * (f0-f1)).
     /// The FRI layer count and LinePoly coefficient mixing already match stwo.
     #[test]
-    #[ignore = "FRI last layer: line IFFT shows degree 7 (pre-existing issue, needs line domain investigation)"]
+    #[ignore = "FRI layer count: VortexSTARK provides 4 inner layers, stwo expects 2 (log_n-1-log_last_layer_degree_bound)"]
     fn test_stwo_fri_verifier_e2e() {
         use crate::cairo_air::decode::Instruction;
         use crate::cairo_air::prover::cairo_prove;
@@ -1994,7 +1993,7 @@ mod tests {
             .collect();
 
         let nat_c2 = crate::fri::last_layer_poly_coeffs(proof.fri_last_layer.clone());
-        let sd2 = crate::fri::LOG_LAST_LAYER_DEGREE_BOUND.saturating_sub(BLOWUP_BITS);
+        let sd2 = crate::fri::LOG_LAST_LAYER_DEGREE_BOUND;
         let sn2 = 1usize << sd2;
         let trunc: Vec<SSecureField> = nat_c2[..sn2].iter().map(|q| sf(q.to_u32_array())).collect();
         let stwo_last_layer = LinePoly::from_ordered_coefficients(trunc);
@@ -2006,7 +2005,7 @@ mod tests {
         };
 
         let fri_config = FriConfig::new(
-            crate::fri::LOG_LAST_LAYER_DEGREE_BOUND.saturating_sub(BLOWUP_BITS), // log_last_layer_degree_bound
+            crate::fri::LOG_LAST_LAYER_DEGREE_BOUND, // log_last_layer_degree_bound
             BLOWUP_BITS,                              // log_blowup_factor = 1
             N_QUERIES,                                // n_queries = 80
             1,                                        // line_fold_step = 1
