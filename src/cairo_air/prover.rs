@@ -1761,15 +1761,9 @@ fn cairo_prove_cached_with_columns(
     // Circle polynomial has 2n coefficients: n even + n odd. The circle fold combines
     // them: line[k] = even[k] + fri_alpha * odd[k] (k=0..n/2-1). Each subsequent
     // line fold halves: coeffs[k] = coeffs[2k] + fold_alpha * coeffs[2k+1].
-    let poly_n = {
-        let mut c = 1usize << (log_n - 1); // after circle fold: n/2 = 32
-        // After committed line folds:
-        let n_committed = fri_commitments.len();
-        c >>= n_committed;
-        // After uncommitted line folds:
-        c >>= BLOWUP_BITS;
-        c
-    };
+    // After circle fold: 32 coefficients. After n_committed line folds: 32 >> n_committed.
+    // With LOG_LAST_LAYER_DEGREE_BOUND = 3 and n_committed = 2: 32 >> 2 = 8.
+    let poly_n = (1usize << (log_n - 1)) >> fri_commitments.len();
     let poly_deg = poly_n.ilog2();
     let fri_last_layer_coeffs: Vec<QM31> = {
         // Circle INTT: BRT-canonic OODS → half_coset NTT → INTT → circle coefficients.
@@ -1790,14 +1784,16 @@ fn cairo_prove_cached_with_columns(
         }
         // Circle fold: line[k] = even[k] + fri_alpha * odd[k]
         let half_n = n / 2; // 32
+        // Circle fold: line[k] = even[k] + fri_alpha * odd[k]
         let mut coeffs: Vec<QM31> = (0..half_n).map(|k| {
             let even = QM31::from_u32_array(circle_coeffs[k]);
             let odd = QM31::from_u32_array(circle_coeffs[n + k]);
             even + fri_alpha * odd
         }).collect();
-        // Apply line fold alphas (committed + uncommitted).
-        // all_fold_alphas[0] = circle fold, [1..] = line folds.
-        for alpha_idx in 1..all_fold_alphas.len() {
+        // Apply COMMITTED line fold alphas to reduce 32 → 16 → 8.
+        // all_fold_alphas[0] = circle fold, [1..n_committed+1] = committed line folds.
+        let n_committed = fri_commitments.len();
+        for alpha_idx in 1..=n_committed {
             let alpha = all_fold_alphas[alpha_idx];
             let half = coeffs.len() / 2;
             coeffs = (0..half).map(|k| coeffs[2*k] + alpha * coeffs[2*k+1]).collect();
