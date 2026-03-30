@@ -1735,7 +1735,6 @@ fn cairo_prove_cached_with_columns(
     let current_qm31 = current.to_qm31();
     let fri_last_layer = current_qm31.clone();
 
-
     // Compute LinePoly coefficients and BRT-permute for stwo channel mixing.
     let stwo_deg = fri::LOG_LAST_LAYER_DEGREE_BOUND.saturating_sub(BLOWUP_BITS);
     let stwo_n = 1usize << stwo_deg;

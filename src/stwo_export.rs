@@ -1492,7 +1492,7 @@ mod tests {
     ///   - first_layer (OODS quotient, circle domain log_size=log_eval)
     ///   - inner_layers[i] (line domain log_size=log_eval-1-i)
     #[test]
-    #[ignore = "FRI last layer degree: polynomial degree 7 after fold chain (soundness investigation needed)"]
+    #[ignore = "FRI last layer: line IFFT shows degree 7 (pre-existing issue, needs line domain investigation)"]
     fn test_stwo_fri_merkle_witnesses() {
         use crate::cairo_air::prover::cairo_prove;
         use crate::cuda::ffi;
@@ -1863,9 +1863,8 @@ mod tests {
     ///
     /// Fold equations ARE algebraically identical (both use (f0+f1) + alpha * inv_twiddle * (f0-f1)).
     /// The FRI layer count and LinePoly coefficient mixing already match stwo.
-    /// Canonic + BRT domain ordering now matches stwo. Remaining: last layer poly eval.
     #[test]
-    #[ignore = "FRI last layer degree: polynomial degree 7 after fold chain (soundness investigation needed)"]
+    #[ignore = "FRI last layer: line IFFT shows degree 7 (pre-existing issue, needs line domain investigation)"]
     fn test_stwo_fri_verifier_e2e() {
         use crate::cairo_air::decode::Instruction;
         use crate::cairo_air::prover::cairo_prove;
