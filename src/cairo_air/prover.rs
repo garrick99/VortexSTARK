@@ -1762,54 +1762,33 @@ fn cairo_prove_cached_with_columns(
     // them: line[k] = even[k] + fri_alpha * odd[k] (k=0..n/2-1). Each subsequent
     // line fold halves: coeffs[k] = coeffs[2k] + fold_alpha * coeffs[2k+1].
     // After circle fold: 32 coefficients. After n_committed line folds: 32 >> n_committed.
-    // With LOG_LAST_LAYER_DEGREE_BOUND = 3 and n_committed = 2: 32 >> 2 = 8.
-    let poly_n = (1usize << (log_n - 1)) >> fri_commitments.len();
-    let poly_deg = poly_n.ilog2();
+    // LinePoly coefficients: CPU-fold the 32-element last layer through the committed +
+    // uncommitted line folds to get 8 evaluations on half_odds(3), then line-IFFT.
+    let poly_deg = fri::LOG_LAST_LAYER_DEGREE_BOUND;
+    let poly_n = 1usize << poly_deg;
     let fri_last_layer_coeffs: Vec<QM31> = {
-        // Circle INTT: BRT-canonic OODS → half_coset NTT → INTT → circle coefficients.
-        let oods_data = [host_oods_q0.clone(), host_oods_q1.clone(),
-                         host_oods_q2.clone(), host_oods_q3.clone()];
-        let n = 1usize << log_n;
-        let mut circle_coeffs: Vec<[u32; 4]> = vec![[0; 4]; eval_size];
-        for comp in 0..4 {
-            let mut hc_data = vec![0u32; eval_size];
-            for j in 0..eval_size {
-                let cn = j.reverse_bits() >> (usize::BITS - log_eval_size);
-                hc_data[canonic_to_hc_ntt(cn, log_eval_size)] = oods_data[comp][j];
-            }
-            let mut d = DeviceBuffer::from_host(&hc_data);
-            ntt::interpolate(&mut d, &cache.eval_inv_cache);
-            let c = d.to_host();
-            for i in 0..eval_size { circle_coeffs[i][comp] = c[i]; }
-        }
-        // Circle fold: line[k] = even[k] + fri_alpha * odd[k]
-        let half_n = n / 2; // 32
-        // Circle fold: line[k] = even[k] + fri_alpha * odd[k]
-        let mut coeffs: Vec<QM31> = (0..half_n).map(|k| {
-            let even = QM31::from_u32_array(circle_coeffs[k]);
-            let odd = QM31::from_u32_array(circle_coeffs[n + k]);
-            even + fri_alpha * odd
-        }).collect();
-        // Apply COMMITTED line fold alphas using stwo's fold convention.
-        // fold(values, [a1, a2]) = fold(left, [a2]) + fold(right, [a2]) * a1
-        fn coeff_fold(vals: &[QM31], alphas: &[QM31]) -> Vec<QM31> {
-            if alphas.is_empty() { return vals.to_vec(); }
-            let half = vals.len() / 2;
-            let left = coeff_fold(&vals[..half], &alphas[1..]);
-            let right = coeff_fold(&vals[half..], &alphas[1..]);
-            left.iter().zip(right.iter())
-                .map(|(&l, &r)| l + r * alphas[0])
-                .collect()
-        }
+        let mut data = fri_last_layer.clone();
+        let mut dl = committed_stop_log;
+        // Fold through UNCOMMITTED line fold alphas only.
+        // Committed alphas are at indices 1..=n_committed, uncommitted at n_committed+1..
         let n_committed = fri_commitments.len();
-        let committed_alphas: Vec<QM31> = (1..=n_committed)
-            .map(|i| all_fold_alphas[i]).collect();
-        coeffs = coeff_fold(&coeffs, &committed_alphas);
-        // BRT-permute.
-        let final_n = coeffs.len();
-        let final_deg = final_n.ilog2();
-        let mut brt = vec![QM31::ZERO; final_n];
-        for i in 0..final_n { brt[i.reverse_bits() >> (usize::BITS - final_deg)] = coeffs[i]; }
+        for alpha_idx in (n_committed + 1)..all_fold_alphas.len() {
+            let alpha = all_fold_alphas[alpha_idx];
+            let ho = Coset::half_odds(dl);
+            let half = data.len() / 2;
+            let mut folded = vec![QM31::ZERO; half];
+            for i in 0..half {
+                let twid = fold_twiddle_at(&ho, i, false);
+                folded[i] = fold_pair(data[2*i], data[2*i+1], alpha, twid);
+            }
+            data = folded;
+            dl -= 1;
+        }
+        // data now has 8 BRT evaluations on half_odds(3). IFFT → 8 LinePoly coefficients.
+        let nat = fri::last_layer_poly_coeffs(data);
+        // BRT-permute for stwo LinePoly::new convention.
+        let mut brt = vec![QM31::ZERO; poly_n];
+        for i in 0..poly_n { brt[i.reverse_bits() >> (usize::BITS - poly_deg)] = nat[i]; }
         brt
     };
 
