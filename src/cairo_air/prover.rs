@@ -253,8 +253,11 @@ pub struct CairoProof {
     pub fri_start_channel_state: [u32; 8],
     /// FRI layer commitments
     pub fri_commitments: Vec<[u32; 8]>,
-    /// Final FRI polynomial (2^3 = 8 QM31 values)
+    /// FRI last layer evaluations at committed_stop_log (32 elements, BRT-ordered).
     pub fri_last_layer: Vec<QM31>,
+    /// FRI last layer after uncommitted folds (8 elements, for LinePoly).
+    #[serde(default)]
+    pub fri_last_layer_poly: Vec<QM31>,
     /// Proof-of-work nonce: Blake2s(prefix_digest || nonce_le) must have >= POW_BITS trailing zeros.
     /// Prevents query index grinding attacks. Computed on GPU after all FRI commitments.
     pub pow_nonce: u64,
@@ -1710,9 +1713,10 @@ fn cairo_prove_cached_with_columns(
     let mut current = line_eval;
     let mut current_log = log_eval_size - 1;
 
-    let fri_stop_log = fri::LOG_LAST_LAYER_DEGREE_BOUND;
-    while current_log > fri_stop_log {
-        // Commit BRT-ordered layer (matches stwo).
+    // Phase 1: Committed FRI inner layers.
+    // stwo counts these: n_committed = log_n - 1 - LOG_LAST_LAYER_DEGREE_BOUND.
+    let committed_stop_log = fri::LOG_LAST_LAYER_DEGREE_BOUND + BLOWUP_BITS;
+    while current_log > committed_stop_log {
         let layer_commitment = MerkleTree::commit_root_soa4(
             &current.cols[0], &current.cols[1], &current.cols[2], &current.cols[3],
             current_log,
@@ -1720,7 +1724,6 @@ fn cairo_prove_cached_with_columns(
         channel.mix_digest(&layer_commitment);
         fri_commitments.push(layer_commitment);
 
-        // BRT line fold twiddles (standard convention matching BRT data).
         let fold_alpha = channel.draw_felt();
         let line_domain = Coset::half_odds(current_log);
         let d_twid = fri::compute_fold_twiddles_on_demand(&line_domain, false);
@@ -1732,12 +1735,27 @@ fn cairo_prove_cached_with_columns(
         current_log -= 1;
     }
 
-    let current_qm31 = current.to_qm31();
-    let fri_last_layer = current_qm31.clone();
+    // Save the intermediate evaluation at committed_stop_log (for the proof).
+    let fri_last_layer = current.to_qm31();
 
-    // Compute LinePoly BRT coefficients for channel mixing.
-    // With fri_stop_log = LOG_LAST_LAYER_DEGREE_BOUND, the 8-element last layer
-    // IS the full polynomial — all 8 LinePoly coefficients are valid.
+    // Phase 2: Uncommitted folds (BLOWUP_BITS extra folds, no Merkle commit).
+    // These reduce the polynomial to degree < 2^LOG_LAST_LAYER_DEGREE_BOUND
+    // on half_odds(LOG_LAST_LAYER_DEGREE_BOUND), producing valid LinePoly coefficients.
+    let fri_stop_log = fri::LOG_LAST_LAYER_DEGREE_BOUND;
+    while current_log > fri_stop_log {
+        let fold_alpha = channel.draw_felt();
+        let line_domain = Coset::half_odds(current_log);
+        let d_twid = fri::compute_fold_twiddles_on_demand(&line_domain, false);
+        let folded = fri::fold_line_with_twiddles(&current, fold_alpha, &d_twid);
+        drop(d_twid);
+        drop(current);
+        current = folded;
+        current_log -= 1;
+    }
+
+    // LinePoly coefficients from the final 8-element data (correct basis on half_odds(3)).
+    let current_qm31 = current.to_qm31();
+    let fri_last_layer_poly = current_qm31.clone();
     let poly_deg = fri::LOG_LAST_LAYER_DEGREE_BOUND;
     let poly_n = 1usize << poly_deg;
     let fri_last_layer_coeffs: Vec<QM31> = {
@@ -1987,6 +2005,7 @@ fn cairo_prove_cached_with_columns(
         fri_start_channel_state,
         fri_commitments,
         fri_last_layer,
+        fri_last_layer_poly,
         pow_nonce,
         query_indices,
         trace_values_at_queries,
@@ -2383,17 +2402,22 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
         fri_alphas.push(channel.draw_felt());
     }
 
+    // Draw BLOWUP_BITS uncommitted fold alphas.
+    for _ in 0..BLOWUP_BITS {
+        fri_alphas.push(channel.draw_felt());
+    }
+
     // ---- Verify FRI structure ----
-    // FRI layers: from log_eval_size-1 down to 4 = log_eval_size-4 layers
-    // Plus the circle fold layer = log_eval_size-4 total committed FRI layers
-    let fri_stop_log = fri::LOG_LAST_LAYER_DEGREE_BOUND;
-    let expected_fri_layers = (log_eval_size - 1).saturating_sub(fri_stop_log);
+    // Committed layers stop at committed_stop_log = LOG_LAST_LAYER_DEGREE_BOUND + BLOWUP_BITS.
+    // The prover then does BLOWUP_BITS uncommitted folds down to LOG_LAST_LAYER_DEGREE_BOUND.
+    let committed_stop_log = fri::LOG_LAST_LAYER_DEGREE_BOUND + BLOWUP_BITS;
+    let expected_fri_layers = (log_eval_size - 1).saturating_sub(committed_stop_log);
     if proof.fri_commitments.len() != expected_fri_layers as usize {
         return Err(format!("Expected {} FRI layers, got {}",
             expected_fri_layers, proof.fri_commitments.len()));
     }
 
-    let expected_last_layer_size = 1usize << fri_stop_log;
+    let expected_last_layer_size = 1usize << committed_stop_log;
     if proof.fri_last_layer.len() != expected_last_layer_size {
         return Err(format!("Expected {} FRI last layer evaluations, got {}",
             expected_last_layer_size,
@@ -2403,8 +2427,36 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
     // ---- Verify proof-of-work + re-derive query indices ----
     let poly_deg = fri::LOG_LAST_LAYER_DEGREE_BOUND;
     let poly_n = 1usize << poly_deg;
+    let n_fri_layers = proof.fri_decommitments.len();
+    let uncommitted_alpha_start = 1 + n_fri_layers; // 1 circle + committed layers
     let fri_last_layer_coeffs: Vec<QM31> = {
-        let nat = fri::last_layer_poly_coeffs(proof.fri_last_layer.clone());
+        // CPU fold: replicate the prover's uncommitted folds.
+        let mut data = proof.fri_last_layer.clone();
+        let mut dl = committed_stop_log;
+        for uf in 0..BLOWUP_BITS {
+            let alpha = fri_alphas[uncommitted_alpha_start + uf as usize];
+            let ho = Coset::half_odds(dl);
+            let half = data.len() / 2;
+            let mut folded = vec![QM31::ZERO; half];
+            for i in 0..half {
+                let twid = fold_twiddle_at(&ho, i, false);
+                folded[i] = fold_pair(data[2*i], data[2*i+1], alpha, twid);
+            }
+            data = folded;
+            dl -= 1;
+        }
+        // Debug: check CPU fold result matches eval_last_layer_poly round-trip
+        #[cfg(test)]
+        {
+            let test_coeffs = fri::last_layer_poly_coeffs(data.clone());
+            let mut ok = true;
+            for j in 0..data.len() {
+                let v = fri::eval_last_layer_poly(&test_coeffs, j, fri::LOG_LAST_LAYER_DEGREE_BOUND);
+                if v != data[j] { ok = false; break; }
+            }
+            eprintln!("[CPU-FOLD-RT] round_trip_ok={ok} data_len={}", data.len());
+        }
+        let nat = fri::last_layer_poly_coeffs(data);
         let mut brt = vec![QM31::ZERO; poly_n];
         for i in 0..poly_n { brt[i.reverse_bits() >> (usize::BITS - poly_deg)] = nat[i]; }
         brt
@@ -2434,8 +2486,6 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
     }
 
     // ---- Verify FRI fold equations ----
-    let n_fri_layers = proof.fri_decommitments.len();
-
     for (q, &qi) in proof.query_indices.iter().enumerate() {
         let mut current_idx = qi;
         let mut current_log = log_eval_size;
@@ -2458,6 +2508,7 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
                     return Err(format!("Circle fold mismatch at query {q} (qi={qi})"));
                 }
             } else {
+                // 0 committed layers: circle fold result lands directly in fri_last_layer.
                 if expected != proof.fri_last_layer[folded_idx] {
                     return Err(format!("Circle fold → last layer mismatch at query {q} (qi={qi})"));
                 }
@@ -2484,7 +2535,7 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
             current_log -= 1;
         }
 
-        // Verify: fold last FRI decommitment matches last-layer polynomial
+        // Verify: fold last committed decommitment matches fri_last_layer.
         if n_fri_layers > 0 {
             let last_decom = &proof.fri_decommitments[n_fri_layers - 1];
             let ho = Coset::half_odds(current_log);
@@ -3124,7 +3175,7 @@ fn bit_reverse(x: usize, n_bits: u32) -> usize {
 }
 
 #[allow(dead_code)]
-fn fold_twiddle_at(domain: &Coset, folded_index: usize, circle: bool) -> M31 {
+pub fn fold_twiddle_at(domain: &Coset, folded_index: usize, circle: bool) -> M31 {
     let domain_idx = bit_reverse(folded_index << 1, domain.log_size);
     let point = domain.at(domain_idx);
     let coord = if circle { point.y } else { point.x };
@@ -3139,7 +3190,7 @@ fn get_pair_from_decom_4(value: &[u32; 4], sibling: &[u32; 4], idx: usize) -> (Q
     }
 }
 
-fn fold_pair(f0: QM31, f1: QM31, alpha: QM31, twiddle: M31) -> QM31 {
+pub fn fold_pair(f0: QM31, f1: QM31, alpha: QM31, twiddle: M31) -> QM31 {
     let sum = f0 + f1;
     let diff = f0 - f1;
     sum + alpha * (diff * twiddle)
