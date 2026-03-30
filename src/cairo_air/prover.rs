@@ -1713,8 +1713,9 @@ fn cairo_prove_cached_with_columns(
     let mut current = line_eval;
     let mut current_log = log_eval_size - 1;
 
+    let mut all_fold_alphas: Vec<QM31> = vec![fri_alpha]; // [0] = circle fold alpha
+
     // Phase 1: Committed FRI inner layers.
-    // stwo counts these: n_committed = log_n - 1 - LOG_LAST_LAYER_DEGREE_BOUND.
     let committed_stop_log = fri::LOG_LAST_LAYER_DEGREE_BOUND + BLOWUP_BITS;
     while current_log > committed_stop_log {
         let layer_commitment = MerkleTree::commit_root_soa4(
@@ -1725,6 +1726,7 @@ fn cairo_prove_cached_with_columns(
         fri_commitments.push(layer_commitment);
 
         let fold_alpha = channel.draw_felt();
+        all_fold_alphas.push(fold_alpha);
         let line_domain = Coset::half_odds(current_log);
         let d_twid = fri::compute_fold_twiddles_on_demand(&line_domain, false);
         let folded = fri::fold_line_with_twiddles(&current, fold_alpha, &d_twid);
@@ -1738,12 +1740,11 @@ fn cairo_prove_cached_with_columns(
     // Save the intermediate evaluation at committed_stop_log (for the proof).
     let fri_last_layer = current.to_qm31();
 
-    // Phase 2: Uncommitted folds (BLOWUP_BITS extra folds, no Merkle commit).
-    // These reduce the polynomial to degree < 2^LOG_LAST_LAYER_DEGREE_BOUND
-    // on half_odds(LOG_LAST_LAYER_DEGREE_BOUND), producing valid LinePoly coefficients.
+    // Phase 2: Uncommitted folds (BLOWUP_BITS extra folds).
     let fri_stop_log = fri::LOG_LAST_LAYER_DEGREE_BOUND;
     while current_log > fri_stop_log {
         let fold_alpha = channel.draw_felt();
+        all_fold_alphas.push(fold_alpha);
         let line_domain = Coset::half_odds(current_log);
         let d_twid = fri::compute_fold_twiddles_on_demand(&line_domain, false);
         let folded = fri::fold_line_with_twiddles(&current, fold_alpha, &d_twid);
@@ -1753,15 +1754,59 @@ fn cairo_prove_cached_with_columns(
         current_log -= 1;
     }
 
-    // LinePoly coefficients from the final 8-element data (correct basis on half_odds(3)).
     let current_qm31 = current.to_qm31();
-    let fri_last_layer_poly = current_qm31.clone();
-    let poly_deg = fri::LOG_LAST_LAYER_DEGREE_BOUND;
-    let poly_n = 1usize << poly_deg;
+    let fri_last_layer_poly = current_qm31;
+
+    // LinePoly coefficients via circle INTT of the OODS quotient.
+    // Circle polynomial has 2n coefficients: n even + n odd. The circle fold combines
+    // them: line[k] = even[k] + fri_alpha * odd[k] (k=0..n/2-1). Each subsequent
+    // line fold halves: coeffs[k] = coeffs[2k] + fold_alpha * coeffs[2k+1].
+    let poly_n = {
+        let mut c = 1usize << (log_n - 1); // after circle fold: n/2 = 32
+        // After committed line folds:
+        let n_committed = fri_commitments.len();
+        c >>= n_committed;
+        // After uncommitted line folds:
+        c >>= BLOWUP_BITS;
+        c
+    };
+    let poly_deg = poly_n.ilog2();
     let fri_last_layer_coeffs: Vec<QM31> = {
-        let nat = fri::last_layer_poly_coeffs(current_qm31);
-        let mut brt = vec![QM31::ZERO; poly_n];
-        for i in 0..poly_n { brt[i.reverse_bits() >> (usize::BITS - poly_deg)] = nat[i]; }
+        // Circle INTT: BRT-canonic OODS → half_coset NTT → INTT → circle coefficients.
+        let oods_data = [host_oods_q0.clone(), host_oods_q1.clone(),
+                         host_oods_q2.clone(), host_oods_q3.clone()];
+        let n = 1usize << log_n;
+        let mut circle_coeffs: Vec<[u32; 4]> = vec![[0; 4]; eval_size];
+        for comp in 0..4 {
+            let mut hc_data = vec![0u32; eval_size];
+            for j in 0..eval_size {
+                let cn = j.reverse_bits() >> (usize::BITS - log_eval_size);
+                hc_data[canonic_to_hc_ntt(cn, log_eval_size)] = oods_data[comp][j];
+            }
+            let mut d = DeviceBuffer::from_host(&hc_data);
+            ntt::interpolate(&mut d, &cache.eval_inv_cache);
+            let c = d.to_host();
+            for i in 0..eval_size { circle_coeffs[i][comp] = c[i]; }
+        }
+        // Circle fold: line[k] = even[k] + fri_alpha * odd[k]
+        let half_n = n / 2; // 32
+        let mut coeffs: Vec<QM31> = (0..half_n).map(|k| {
+            let even = QM31::from_u32_array(circle_coeffs[k]);
+            let odd = QM31::from_u32_array(circle_coeffs[n + k]);
+            even + fri_alpha * odd
+        }).collect();
+        // Apply line fold alphas (committed + uncommitted).
+        // all_fold_alphas[0] = circle fold, [1..] = line folds.
+        for alpha_idx in 1..all_fold_alphas.len() {
+            let alpha = all_fold_alphas[alpha_idx];
+            let half = coeffs.len() / 2;
+            coeffs = (0..half).map(|k| coeffs[2*k] + alpha * coeffs[2*k+1]).collect();
+        }
+        // BRT-permute.
+        let final_n = coeffs.len();
+        let final_deg = final_n.ilog2();
+        let mut brt = vec![QM31::ZERO; final_n];
+        for i in 0..final_n { brt[i.reverse_bits() >> (usize::BITS - final_deg)] = coeffs[i]; }
         brt
     };
 
@@ -2005,7 +2050,7 @@ fn cairo_prove_cached_with_columns(
         fri_start_channel_state,
         fri_commitments,
         fri_last_layer,
-        fri_last_layer_poly,
+        fri_last_layer_poly: fri_last_layer_coeffs.clone(),
         pow_nonce,
         query_indices,
         trace_values_at_queries,
@@ -2425,43 +2470,9 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
     }
 
     // ---- Verify proof-of-work + re-derive query indices ----
-    let poly_deg = fri::LOG_LAST_LAYER_DEGREE_BOUND;
-    let poly_n = 1usize << poly_deg;
     let n_fri_layers = proof.fri_decommitments.len();
-    let uncommitted_alpha_start = 1 + n_fri_layers; // 1 circle + committed layers
-    let fri_last_layer_coeffs: Vec<QM31> = {
-        // CPU fold: replicate the prover's uncommitted folds.
-        let mut data = proof.fri_last_layer.clone();
-        let mut dl = committed_stop_log;
-        for uf in 0..BLOWUP_BITS {
-            let alpha = fri_alphas[uncommitted_alpha_start + uf as usize];
-            let ho = Coset::half_odds(dl);
-            let half = data.len() / 2;
-            let mut folded = vec![QM31::ZERO; half];
-            for i in 0..half {
-                let twid = fold_twiddle_at(&ho, i, false);
-                folded[i] = fold_pair(data[2*i], data[2*i+1], alpha, twid);
-            }
-            data = folded;
-            dl -= 1;
-        }
-        // Debug: check CPU fold result matches eval_last_layer_poly round-trip
-        #[cfg(test)]
-        {
-            let test_coeffs = fri::last_layer_poly_coeffs(data.clone());
-            let mut ok = true;
-            for j in 0..data.len() {
-                let v = fri::eval_last_layer_poly(&test_coeffs, j, fri::LOG_LAST_LAYER_DEGREE_BOUND);
-                if v != data[j] { ok = false; break; }
-            }
-            eprintln!("[CPU-FOLD-RT] round_trip_ok={ok} data_len={}", data.len());
-        }
-        let nat = fri::last_layer_poly_coeffs(data);
-        let mut brt = vec![QM31::ZERO; poly_n];
-        for i in 0..poly_n { brt[i.reverse_bits() >> (usize::BITS - poly_deg)] = nat[i]; }
-        brt
-    };
-    channel.mix_felts(&fri_last_layer_coeffs);
+    // Use the stored LinePoly coefficients (computed by prover via circle INTT).
+    channel.mix_felts(&proof.fri_last_layer_poly);
     if !channel.verify_pow_nonce(POW_BITS, proof.pow_nonce) {
         return Err(format!(
             "Proof-of-work check failed: nonce {} does not satisfy {}-bit PoW",

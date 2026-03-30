@@ -624,17 +624,9 @@ pub fn cairo_proof_to_stwo(proof: &CairoProof) -> TwoStarkProof {
     // Last layer: convert BRT-ordered half_odds evaluations to LinePoly coefficients.
     // Convert FRI last layer evaluations to LinePoly BRT-ordered coefficients.
     // last_layer_poly_coeffs returns natural-order coefficients; BRT-permute for LinePoly::new.
-    // LinePoly from the 8-element folded data (correct basis on half_odds(3)).
-    let last_layer_poly: Vec<TwoSecureField> = {
-        let coeffs = crate::fri::last_layer_poly_coeffs(proof.fri_last_layer_poly.clone());
-        let deg = crate::fri::LOG_LAST_LAYER_DEGREE_BOUND;
-        let n = coeffs.len();
-        let mut brt = vec![crate::field::QM31::ZERO; n];
-        for i in 0..n {
-            brt[i.reverse_bits() >> (usize::BITS - deg)] = coeffs[i];
-        }
-        brt.iter().map(|q| q.to_u32_array()).collect()
-    };
+    // LinePoly BRT coefficients from the proof (computed via circle INTT by the prover).
+    let last_layer_poly: Vec<TwoSecureField> = proof.fri_last_layer_poly.iter()
+        .map(|q| q.to_u32_array()).collect();
 
     let fri_proof = TwoFriProof { first_layer, inner_layers, last_layer_poly };
 
@@ -1492,7 +1484,6 @@ mod tests {
     ///   - first_layer (OODS quotient, circle domain log_size=log_eval)
     ///   - inner_layers[i] (line domain log_size=log_eval-1-i)
     #[test]
-    #[ignore = "stwo last layer domain mismatch: stwo adds blowup to last layer domain, VortexSTARK folds through blowup"]
     fn test_stwo_fri_merkle_witnesses() {
         use crate::cairo_air::prover::cairo_prove;
         use crate::cuda::ffi;
@@ -1809,46 +1800,12 @@ mod tests {
             ch.mix_u32s(fri_commit);
             ch.draw_secure_felt(); // fold alpha
         }
-        // Uncommitted fold alphas (BLOWUP_BITS extra draws, no commits).
-        // Save these for CPU fold replication.
-        let mut uncommitted_alphas = Vec::new();
+        // Draw uncommitted fold alphas (matching prover).
         for _ in 0..BLOWUP_BITS {
-            uncommitted_alphas.push(ch.draw_secure_felt());
+            ch.draw_secure_felt();
         }
-
-        // CPU fold: replicate prover's uncommitted folds to get 8-element data.
-        let folded_data = {
-            use crate::field::QM31 as VQMM;
-            use crate::cairo_air::prover::{fold_twiddle_at, fold_pair};
-            let mut data: Vec<VQMM> = proof.fri_last_layer.clone();
-            let mut dl = crate::fri::LOG_LAST_LAYER_DEGREE_BOUND + BLOWUP_BITS;
-            for uf in 0..BLOWUP_BITS as usize {
-                let alpha = {
-                    let sv = uncommitted_alphas[uf];
-                    let arr = sv.to_m31_array();
-                    VQMM::from_m31_array([
-                        crate::field::M31(arr[0].0), crate::field::M31(arr[1].0),
-                        crate::field::M31(arr[2].0), crate::field::M31(arr[3].0),
-                    ])
-                };
-                let ho = crate::circle::Coset::half_odds(dl);
-                let half = data.len() / 2;
-                let mut folded = vec![VQMM::ZERO; half];
-                for i in 0..half {
-                    let twid = fold_twiddle_at(&ho, i, false);
-                    folded[i] = fold_pair(data[2*i], data[2*i+1], alpha, twid);
-                }
-                data = folded;
-                dl -= 1;
-            }
-            data
-        };
-        let stwo_deg_t = crate::fri::LOG_LAST_LAYER_DEGREE_BOUND;
-        let stwo_n_t = 1usize << stwo_deg_t;
-        let nat_c = crate::fri::last_layer_poly_coeffs(folded_data);
-        let mut brt_coeffs = vec![crate::field::QM31::ZERO; stwo_n_t];
-        for i in 0..stwo_n_t { brt_coeffs[i.reverse_bits() >> (usize::BITS - stwo_deg_t)] = nat_c[i]; }
-        let last_layer_felts: Vec<SSecureField> = brt_coeffs.iter()
+        // Mix the proof's LinePoly BRT coefficients (from circle INTT).
+        let last_layer_felts: Vec<SSecureField> = proof.fri_last_layer_poly.iter()
             .map(|qm| sf(qm.to_u32_array()))
             .collect();
         ch.mix_felts(&last_layer_felts);
@@ -1895,7 +1852,6 @@ mod tests {
     /// Fold equations ARE algebraically identical (both use (f0+f1) + alpha * inv_twiddle * (f0-f1)).
     /// The FRI layer count and LinePoly coefficient mixing already match stwo.
     #[test]
-    #[ignore = "stwo last layer: LinePoly basis is domain-specific, half_odds(3) coeffs invalid on half_odds(5)"]
     fn test_stwo_fri_verifier_e2e() {
         use crate::cairo_air::decode::Instruction;
         use crate::cairo_air::prover::cairo_prove;
@@ -2024,11 +1980,10 @@ mod tests {
             })
             .collect();
 
-        let nat_c2 = crate::fri::last_layer_poly_coeffs(proof.fri_last_layer_poly.clone());
-        let sd2 = crate::fri::LOG_LAST_LAYER_DEGREE_BOUND;
-        let sn2 = 1usize << sd2;
-        let trunc: Vec<SSecureField> = nat_c2[..sn2].iter().map(|q| sf(q.to_u32_array())).collect();
-        let stwo_last_layer = LinePoly::from_ordered_coefficients(trunc);
+        // Use the proof's BRT LinePoly coefficients directly.
+        let stwo_last_layer = LinePoly::new(
+            proof.fri_last_layer_poly.iter().map(|q| sf(q.to_u32_array())).collect()
+        );
 
         let fri_proof = FriProof::<Blake2sMerkleHasher> {
             first_layer: stwo_first_layer,
