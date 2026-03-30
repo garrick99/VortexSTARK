@@ -208,5 +208,13 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=stdc++");
     }
 
-    println!("cargo:rerun-if-changed=cuda/");
+    // Emit per-file rerun-if-changed so cargo recompiles CUDA when any .cu file changes.
+    println!("cargo:rerun-if-changed=build.rs");
+    for src in &cuda_sources {
+        println!("cargo:rerun-if-changed={}", src.display());
+    }
+    // Also track the cuda include directory.
+    for entry in std::fs::read_dir("cuda/include").into_iter().flatten().filter_map(|e| e.ok()) {
+        println!("cargo:rerun-if-changed={}", entry.path().display());
+    }
 }

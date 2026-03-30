@@ -185,6 +185,9 @@ pub struct CairoProof {
     /// Committed after the OODS block so the channel state includes it before fri_alpha.
     #[serde(default)]
     pub oods_quotient_commitment: [u32; 8],
+    /// Channel state just before mixing oods_quotient_commitment (start of FRI phase).
+    #[serde(default)]
+    pub fri_start_channel_state: [u32; 8],
     /// FRI layer commitments
     pub fri_commitments: Vec<[u32; 8]>,
     /// Final FRI polynomial (2^3 = 8 QM31 values)
@@ -1568,6 +1571,7 @@ fn cairo_prove_cached_with_columns(
             &quotient_col.cols[2], &quotient_col.cols[3],
             log_eval_size,
         );
+    let fri_start_channel_state = channel.state_words();
     channel.mix_digest(&oods_quotient_commitment);
     // Download to host now — FRI will consume (drop) the DeviceBuffers.
     let host_oods_q0 = quotient_col.cols[0].to_host_fast();
@@ -1588,7 +1592,8 @@ fn cairo_prove_cached_with_columns(
     let mut current = line_eval;
     let mut current_log = log_eval_size - 1;
 
-    while current_log > 3 {
+    let fri_stop_log = fri::LOG_LAST_LAYER_DEGREE_BOUND + BLOWUP_BITS;
+    while current_log > fri_stop_log {
         // Commit current layer
         let layer_commitment = MerkleTree::commit_root_soa4(
             &current.cols[0], &current.cols[1], &current.cols[2], &current.cols[3],
@@ -1609,10 +1614,11 @@ fn cairo_prove_cached_with_columns(
     }
 
     let current_qm31 = current.to_qm31();
-    let fri_last_layer = current_qm31;
+    let fri_last_layer = current_qm31.clone();
+    let fri_last_layer_coeffs = fri::last_layer_poly_coeffs(current_qm31);
 
     // ---- Phase 5: Proof-of-Work grinding + Query + decommitment ----
-    channel.mix_felts(&fri_last_layer);
+    channel.mix_felts(&fri_last_layer_coeffs);
 
     // Grind PoW nonce on GPU.
     // prefix_digest = Blake2s(0x12345678_LE || [0u8;12] || channel_state || POW_BITS_LE)
@@ -1848,6 +1854,7 @@ fn cairo_prove_cached_with_columns(
         rc_interaction_commitment,
         quotient_commitment,
         oods_quotient_commitment,
+        fri_start_channel_state,
         fri_commitments,
         fri_last_layer,
         pow_nonce,
@@ -2249,20 +2256,23 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
     // ---- Verify FRI structure ----
     // FRI layers: from log_eval_size-1 down to 4 = log_eval_size-4 layers
     // Plus the circle fold layer = log_eval_size-4 total committed FRI layers
-    let expected_fri_layers = log_eval_size.saturating_sub(4);
+    let fri_stop_log = fri::LOG_LAST_LAYER_DEGREE_BOUND + BLOWUP_BITS;
+    let expected_fri_layers = (log_eval_size - 1).saturating_sub(fri_stop_log);
     if proof.fri_commitments.len() != expected_fri_layers as usize {
         return Err(format!("Expected {} FRI layers, got {}",
             expected_fri_layers, proof.fri_commitments.len()));
     }
 
-    if proof.fri_last_layer.len() != 1usize << 3 {
+    let expected_last_layer_size = 1usize << fri_stop_log;
+    if proof.fri_last_layer.len() != expected_last_layer_size {
         return Err(format!("Expected {} FRI last layer evaluations, got {}",
-            1usize << 3,
+            expected_last_layer_size,
             proof.fri_last_layer.len()));
     }
 
     // ---- Verify proof-of-work + re-derive query indices ----
-    channel.mix_felts(&proof.fri_last_layer);
+    let fri_last_layer_coeffs = fri::last_layer_poly_coeffs(proof.fri_last_layer.clone());
+    channel.mix_felts(&fri_last_layer_coeffs);
     if !channel.verify_pow_nonce(POW_BITS, proof.pow_nonce) {
         return Err(format!(
             "Proof-of-work check failed: nonce {} does not satisfy {}-bit PoW",
@@ -2304,9 +2314,15 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
             );
             let twiddle = fold_twiddle_at(&domain, folded_idx, true);
             let expected = fold_pair(f0, f1, fri_alphas[0], twiddle);
-            let actual = QM31::from_u32_array(proof.fri_decommitments[0].values[q]);
-            if expected != actual {
-                return Err(format!("Circle fold mismatch at query {q} (qi={qi})"));
+            if n_fri_layers > 0 {
+                let actual = QM31::from_u32_array(proof.fri_decommitments[0].values[q]);
+                if expected != actual {
+                    return Err(format!("Circle fold mismatch at query {q} (qi={qi})"));
+                }
+            } else {
+                if expected != proof.fri_last_layer[folded_idx] {
+                    return Err(format!("Circle fold → last layer mismatch at query {q} (qi={qi})"));
+                }
             }
             current_idx = folded_idx;
             current_log -= 1;

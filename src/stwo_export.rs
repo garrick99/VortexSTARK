@@ -609,6 +609,7 @@ fn build_trace_witness(
     auth_paths_next: &[Vec<[u32; 8]>],
     tree_height: usize,
 ) -> Vec<TwoHash> {
+    let eval_size = 1usize << tree_height;
     // Collect merged positions in sorted order; for each position keep one auth path.
     // Current positions take priority over next positions on collision.
     let mut pos_to_auth: BTreeMap<usize, &Vec<[u32; 8]>> = BTreeMap::new();
@@ -617,7 +618,7 @@ fn build_trace_witness(
     }
     if !auth_paths_next.is_empty() {
         for (i, &pos) in query_indices.iter().enumerate() {
-            let next_pos = pos + 1;
+            let next_pos = (pos + 1) % eval_size;
             pos_to_auth.entry(next_pos).or_insert(&auth_paths_next[i]);
         }
     }
@@ -1747,8 +1748,9 @@ mod tests {
             ch.draw_secure_felt(); // fold alpha
         }
 
-        // Mix last layer polynomial values.
-        let last_layer_felts: Vec<SSecureField> = proof.fri_last_layer.iter()
+        // Mix last layer polynomial coefficients (same as prover: convert evals → coeffs).
+        let last_layer_coeffs = crate::fri::last_layer_poly_coeffs(proof.fri_last_layer.clone());
+        let last_layer_felts: Vec<SSecureField> = last_layer_coeffs.iter()
             .map(|qm| sf(qm.to_u32_array()))
             .collect();
         ch.mix_felts(&last_layer_felts);
@@ -1768,5 +1770,207 @@ mod tests {
             &stwo_queries[..stwo_queries.len().min(8)],
             &proof.query_indices[..proof.query_indices.len().min(8)],
         );
+    }
+
+    /// End-to-end test: feed VortexSTARK's exported FRI proof to stwo's FriVerifier.
+    ///
+    /// Tests the full FRI verification pipeline:
+    /// 1. Replay Fiat-Shamir transcript up to FRI start
+    /// 2. FriVerifier::commit() — mix commitments and draw fold alphas
+    /// 3. PoW verification and query sampling
+    /// 4. FriVerifier::decommit() — verify fold equations at all query points
+    ///
+    /// STATUS: FriVerifier::commit() succeeds (layer counts, coefficients, channel match).
+    /// FriVerifier::decommit() fails: Merkle leaf ordering mismatch.
+    /// VortexSTARK commits all trees in half_coset BRT-NTT order; stwo expects CanonicCoset
+    /// (conjugate-pair) order. Fix requires reordering ALL commitment trees (trace, interaction,
+    /// quotient, FRI layers) to canonic order — or implementing a position-mapping layer in the
+    /// export that translates between the two conventions.
+    #[test]
+    #[ignore = "Merkle leaf ordering: half_coset BRT-NTT vs CanonicCoset (all 7+ trees)"]
+    fn test_stwo_fri_verifier_e2e() {
+        use crate::cairo_air::decode::Instruction;
+        use crate::cairo_air::prover::cairo_prove;
+        use crate::cairo_air::trace::N_CONSTRAINTS;
+        use crate::cuda::ffi;
+        use crate::prover::{BLOWUP_BITS, N_QUERIES, POW_BITS};
+
+        use stwo::core::channel::Channel as SChannel;
+        use stwo::core::channel::Blake2sChannel as SBlake2sChannel;
+        use stwo::core::fields::m31::M31 as SM31;
+        use stwo::core::fields::qm31::SecureField as SSecureField;
+        use stwo::core::fri::{FriConfig, FriVerifier, FriProof, FriLayerProof, CirclePolyDegreeBound};
+        use stwo::core::poly::line::LinePoly;
+        // PoW verification uses channel.verify_pow_nonce (no separate ProofOfWork struct).
+        use stwo::core::queries::Queries;
+        use stwo::core::vcs::blake2_hash::Blake2sHash as SBlake2sHash;
+        use stwo::core::vcs_lifted::blake2_merkle::{Blake2sMerkleChannel, Blake2sMerkleHasher};
+        use stwo::core::vcs_lifted::verifier::MerkleDecommitmentLifted;
+
+        ffi::init_memory_pool();
+
+        // Build a 64-step Fibonacci program.
+        let program: Vec<u64> = {
+            let assert_imm = Instruction {
+                off0: 0x8000, off1: 0x8000, off2: 0x8001,
+                op1_imm: 1, opcode_assert: 1, ap_add1: 1,
+                ..Default::default()
+            };
+            let add_instr = Instruction {
+                off0: 0x8000, off1: 0x8000u16.wrapping_sub(2), off2: 0x8000u16.wrapping_sub(1),
+                op1_ap: 1, res_add: 1, opcode_assert: 1, ap_add1: 1,
+                ..Default::default()
+            };
+            let mut p = Vec::new();
+            p.push(assert_imm.encode()); p.push(1u64);
+            p.push(assert_imm.encode()); p.push(1u64);
+            for _ in 0..62 { p.push(add_instr.encode()); }
+            p
+        };
+        let proof = cairo_prove(&program, 64, 6);
+        let log_n = 6u32;
+        let log_eval_size = log_n + BLOWUP_BITS;
+        let two = cairo_proof_to_stwo(&proof);
+
+        // Convenience: convert [u32;4] → stwo SecureField.
+        let sf = |v: [u32; 4]| -> SSecureField {
+            use stwo::core::fields::cm31::CM31;
+            SSecureField::from_m31_array([SM31(v[0]), SM31(v[1]), SM31(v[2]), SM31(v[3])])
+        };
+
+        // ── Replay Fiat-Shamir transcript up to FRI start ──────────────────────
+        let mut ch = SBlake2sChannel::default();
+
+        ch.mix_u32s(&proof.public_inputs.program_hash);
+        ch.mix_u32s(&proof.trace_commitment);
+        ch.mix_u32s(&proof.trace_commitment_hi);
+        ch.mix_u32s(&proof.dict_trace_commitment);
+        ch.draw_secure_felt(); // z_dict_link
+        ch.draw_secure_felt(); // alpha_dict_link
+        ch.mix_u32s(&proof.dict_main_interaction_commitment);
+        ch.mix_u32s(&[
+            proof.dict_link_final[0], proof.dict_link_final[1],
+            proof.dict_link_final[2], proof.dict_link_final[3],
+            0, 0, 0, 0,
+        ]);
+        ch.draw_secure_felt(); // z_mem
+        ch.draw_secure_felt(); // alpha_mem
+        ch.draw_secure_felt(); // z_rc
+        ch.mix_u32s(&proof.interaction_commitment);
+        ch.mix_u32s(&proof.rc_interaction_commitment);
+        ch.mix_u32s(&[
+            proof.logup_final_sum[0], proof.logup_final_sum[1],
+            proof.logup_final_sum[2], proof.logup_final_sum[3],
+            proof.rc_final_sum[0],    proof.rc_final_sum[1],
+            proof.rc_final_sum[2],    proof.rc_final_sum[3],
+        ]);
+        ch.mix_u32s(&proof.memory_table_commitment);
+        ch.mix_u32s(&proof.rc_counts_commitment);
+        for _ in 0..N_CONSTRAINTS { ch.draw_secure_felt(); }
+        ch.mix_u32s(&proof.quotient_commitment);
+        ch.draw_secure_felt(); // oods_z
+
+        // Mix OODS sampled values.
+        let n_trace = proof.oods_trace_at_z.len().min(proof.oods_trace_at_z_next.len());
+        let mut oods_felts: Vec<SSecureField> = Vec::new();
+        for i in 0..n_trace {
+            oods_felts.push(sf(proof.oods_trace_at_z[i]));
+            oods_felts.push(sf(proof.oods_trace_at_z_next[i]));
+        }
+        for pi in 0..3 {
+            for k in 0..4 {
+                oods_felts.push(sf(proof.oods_interaction_at_z[pi][k]));
+                oods_felts.push(sf(proof.oods_interaction_at_z_next[pi][k]));
+            }
+        }
+        for k in 0..4 {
+            oods_felts.push(sf(proof.oods_quotient_at_z[k]));
+        }
+        ch.mix_felts(&oods_felts);
+        ch.draw_secure_felt(); // oods_alpha
+
+        // ── Now at FRI start point. Build FriProof and call FriVerifier::commit. ──
+
+        // Convert TwoFriProof → stwo FriProof<Blake2sMerkleHasher>
+        let to_hash = |h: &TwoHash| -> SBlake2sHash { SBlake2sHash(h.0) };
+        let to_sf_arr = |v: &[u32; 4]| -> SSecureField { sf(*v) };
+
+        let stwo_first_layer = FriLayerProof::<Blake2sMerkleHasher> {
+            fri_witness: two.fri_proof.first_layer.fri_witness.iter()
+                .map(|v| to_sf_arr(v)).collect(),
+            decommitment: MerkleDecommitmentLifted::<Blake2sMerkleHasher> {
+                hash_witness: two.fri_proof.first_layer.decommitment.hash_witness.iter()
+                    .map(|h| to_hash(h)).collect(),
+            },
+            commitment: to_hash(&two.fri_proof.first_layer.commitment),
+        };
+
+        let stwo_inner_layers: Vec<FriLayerProof<Blake2sMerkleHasher>> = two.fri_proof.inner_layers.iter()
+            .map(|layer| FriLayerProof::<Blake2sMerkleHasher> {
+                fri_witness: layer.fri_witness.iter().map(|v| to_sf_arr(v)).collect(),
+                decommitment: MerkleDecommitmentLifted::<Blake2sMerkleHasher> {
+                    hash_witness: layer.decommitment.hash_witness.iter()
+                        .map(|h| to_hash(h)).collect(),
+                },
+                commitment: to_hash(&layer.commitment),
+            })
+            .collect();
+
+        let stwo_last_layer_coeffs: Vec<SSecureField> = two.fri_proof.last_layer_poly.iter()
+            .map(|v| to_sf_arr(v)).collect();
+        let stwo_last_layer = LinePoly::new(stwo_last_layer_coeffs);
+
+        let fri_proof = FriProof::<Blake2sMerkleHasher> {
+            first_layer: stwo_first_layer,
+            inner_layers: stwo_inner_layers,
+            last_layer_poly: stwo_last_layer,
+        };
+
+        let fri_config = FriConfig::new(
+            crate::fri::LOG_LAST_LAYER_DEGREE_BOUND, // log_last_layer_degree_bound = 3
+            BLOWUP_BITS,                              // log_blowup_factor = 1
+            N_QUERIES,                                // n_queries = 80
+            1,                                        // line_fold_step = 1
+        );
+
+        let column_bound = CirclePolyDegreeBound::new(log_n);
+
+        let mut fri_verifier = FriVerifier::<Blake2sMerkleChannel>::commit(
+            &mut ch,
+            fri_config,
+            fri_proof,
+            column_bound,
+        ).unwrap_or_else(|e| panic!("FriVerifier::commit failed: {e}"));
+
+        // ── PoW verification ──────────────────────────────────────────────────
+        assert!(ch.verify_pow_nonce(POW_BITS, proof.pow_nonce),
+            "PoW verification failed");
+        ch.mix_u64(proof.pow_nonce);
+
+        // ── Sample query positions ────────────────────────────────────────────
+        let query_positions = fri_verifier.sample_query_positions(&mut ch);
+
+        // ── Extract first-layer query evals (OODS quotient at query positions) ──
+        // The first_layer_query_evals are the OODS quotient column values at the
+        // sorted/deduped query positions (matching Queries::positions order).
+        let sorted_queries = Queries::new(&proof.query_indices, log_eval_size);
+        assert_eq!(query_positions, sorted_queries.positions,
+            "stwo query positions don't match VortexSTARK's");
+
+        // Map query_index → original proof index for value lookup.
+        let qi_to_proof_idx: std::collections::HashMap<usize, usize> =
+            proof.query_indices.iter().enumerate().map(|(i, &qi)| (qi, i)).collect();
+
+        let first_layer_evals: Vec<SSecureField> = sorted_queries.positions.iter()
+            .map(|&pos| {
+                let proof_idx = qi_to_proof_idx[&pos];
+                let v = proof.oods_quotient_decommitment.values[proof_idx];
+                sf(v)
+            })
+            .collect();
+
+        // ── Decommit: verify all FRI fold equations ───────────────────────────
+        fri_verifier.decommit(first_layer_evals)
+            .unwrap_or_else(|e| panic!("FriVerifier::decommit failed: {e}"));
     }
 }
