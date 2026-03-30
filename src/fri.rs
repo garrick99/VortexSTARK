@@ -517,6 +517,10 @@ mod tests {
         assert_eq!(coeffs[1], c1, "c1 mismatch");
         if coeffs.len() > 2 { assert_eq!(coeffs[2], c2, "c2 mismatch"); }
         if coeffs.len() > 3 { assert_eq!(coeffs[3], c3, "c3 mismatch"); }
+        // High coefficients should be zero for a degree-3 polynomial.
+        for i in 4..coeffs.len() {
+            assert_eq!(coeffs[i], QM31::ZERO, "coeff[{i}] should be zero for degree-3 poly");
+        }
 
         for j in 0..n {
             let recovered = eval_last_layer_poly(&coeffs, j, log_n);

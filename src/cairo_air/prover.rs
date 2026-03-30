@@ -1490,14 +1490,15 @@ fn cairo_prove_cached_with_columns(
 
         for col_idx in 0..N_COLS {
             let (a, b) = compute_line_coeffs(z, at_z[col_idx]);
-            b_coeffs_z.extend_from_slice(&a.to_u32_array());
+            // b_coeffs = alpha^c * a (stwo convention: kernel computes c*f - b = alpha*(f-a))
+            b_coeffs_z.extend_from_slice(&(alpha_pow * a).to_u32_array());
             c_coeffs_z.extend_from_slice(&alpha_pow.to_u32_array());
             linear_acc_z = linear_acc_z + alpha_pow * b;
             alpha_pow = alpha_pow * oods_alpha;
         }
         for k in 0..4 {
             let (a, b) = compute_line_coeffs(z, quot_at_z[k]);
-            b_coeffs_z.extend_from_slice(&a.to_u32_array());
+            b_coeffs_z.extend_from_slice(&(alpha_pow * a).to_u32_array());
             c_coeffs_z.extend_from_slice(&alpha_pow.to_u32_array());
             linear_acc_z = linear_acc_z + alpha_pow * b;
             alpha_pow = alpha_pow * oods_alpha;
@@ -1507,7 +1508,7 @@ fn cairo_prove_cached_with_columns(
             for k in 0..4 {
                 let val = QM31::from_u32_array(interaction_evals_raw[pi][k]);
                 let (a, b) = compute_line_coeffs(z, val);
-                b_coeffs_z.extend_from_slice(&a.to_u32_array());
+                b_coeffs_z.extend_from_slice(&(alpha_pow * a).to_u32_array());
                 c_coeffs_z.extend_from_slice(&alpha_pow.to_u32_array());
                 linear_acc_z = linear_acc_z + alpha_pow * b;
                 alpha_pow = alpha_pow * oods_alpha;
@@ -1515,7 +1516,7 @@ fn cairo_prove_cached_with_columns(
         }
         for col_idx in 0..N_COLS {
             let (a, b) = compute_line_coeffs(z_next, at_next[col_idx]);
-            b_coeffs_zn.extend_from_slice(&a.to_u32_array());
+            b_coeffs_zn.extend_from_slice(&(alpha_pow * a).to_u32_array());
             c_coeffs_zn.extend_from_slice(&alpha_pow.to_u32_array());
             linear_acc_zn = linear_acc_zn + alpha_pow * b;
             alpha_pow = alpha_pow * oods_alpha;
@@ -1525,7 +1526,7 @@ fn cairo_prove_cached_with_columns(
             for k in 0..4 {
                 let val = QM31::from_u32_array(interaction_evals_next_raw[pi][k]);
                 let (a, b) = compute_line_coeffs(z_next, val);
-                b_coeffs_zn.extend_from_slice(&a.to_u32_array());
+                b_coeffs_zn.extend_from_slice(&(alpha_pow * a).to_u32_array());
                 c_coeffs_zn.extend_from_slice(&alpha_pow.to_u32_array());
                 linear_acc_zn = linear_acc_zn + alpha_pow * b;
                 alpha_pow = alpha_pow * oods_alpha;
@@ -1733,6 +1734,8 @@ fn cairo_prove_cached_with_columns(
 
     let current_qm31 = current.to_qm31();
     let fri_last_layer = current_qm31.clone();
+
+
     // Compute LinePoly coefficients and BRT-permute for stwo channel mixing.
     let stwo_deg = fri::LOG_LAST_LAYER_DEGREE_BOUND.saturating_sub(BLOWUP_BITS);
     let stwo_n = 1usize << stwo_deg;
@@ -2961,14 +2964,14 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
             for j in 0..N_COLS {
                 let (a, b) = oods_line_z[j];
                 let f = qm31_from_m31(M31(row[j]));
-                partial_z = partial_z + alpha_pow * f - a;
+                partial_z = partial_z + alpha_pow * f - alpha_pow * a;
                 lin_acc_z = lin_acc_z + alpha_pow * b;
                 alpha_pow = alpha_pow * oods_alpha_val;
             }
             for k in 0..4 {
                 let (a, b) = oods_line_q[k];
                 let f = qm31_from_m31(M31(proof.quotient_decommitment.values[q][k]));
-                partial_z = partial_z + alpha_pow * f - a;
+                partial_z = partial_z + alpha_pow * f - alpha_pow * a;
                 lin_acc_z = lin_acc_z + alpha_pow * b;
                 alpha_pow = alpha_pow * oods_alpha_val;
             }
@@ -2982,7 +2985,7 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
                 for k in 0..4 {
                     let (a, b) = oods_line_interaction[pi][k];
                     let f = qm31_from_m31(M31(col_vals[k]));
-                    partial_z = partial_z + alpha_pow * f - a;
+                    partial_z = partial_z + alpha_pow * f - alpha_pow * a;
                     lin_acc_z = lin_acc_z + alpha_pow * b;
                     alpha_pow = alpha_pow * oods_alpha_val;
                 }
@@ -2995,7 +2998,7 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
             for j in 0..N_COLS {
                 let (a, b) = oods_line_zn[j];
                 let f = qm31_from_m31(M31(row[j]));
-                partial_zn = partial_zn + alpha_pow * f - a;
+                partial_zn = partial_zn + alpha_pow * f - alpha_pow * a;
                 lin_acc_zn = lin_acc_zn + alpha_pow * b;
                 alpha_pow = alpha_pow * oods_alpha_val;
             }
@@ -3009,7 +3012,7 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
                 for k in 0..4 {
                     let (a, b) = oods_line_interaction_next[pi][k];
                     let f = qm31_from_m31(M31(col_vals[k]));
-                    partial_zn = partial_zn + alpha_pow * f - a;
+                    partial_zn = partial_zn + alpha_pow * f - alpha_pow * a;
                     lin_acc_zn = lin_acc_zn + alpha_pow * b;
                     alpha_pow = alpha_pow * oods_alpha_val;
                 }
