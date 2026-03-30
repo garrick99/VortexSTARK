@@ -1780,12 +1780,22 @@ mod tests {
     /// 3. PoW verification and query sampling
     /// 4. FriVerifier::decommit() — verify fold equations at all query points
     ///
-    /// STATUS: FriVerifier::commit() succeeds (layer counts, coefficients, channel match).
+    /// STATUS: FriVerifier::commit() succeeds (layer counts, LinePoly coefficients, channel match).
     /// FriVerifier::decommit() fails: Merkle leaf ordering mismatch.
-    /// VortexSTARK commits all trees in half_coset BRT-NTT order; stwo expects CanonicCoset
-    /// (conjugate-pair) order. Fix requires reordering ALL commitment trees (trace, interaction,
-    /// quotient, FRI layers) to canonic order — or implementing a position-mapping layer in the
-    /// export that translates between the two conventions.
+    ///
+    /// Root cause: VortexSTARK commits all trees in half_coset BRT-NTT order; stwo expects
+    /// CanonicCoset (conjugate-pair) order. The `permute_half_coset_to_canonic` function
+    /// (defined in prover.rs) maps between the two orderings — same circle point set, different
+    /// array positions. The fix requires:
+    ///   1. Permute ALL column data to canonic order before Merkle commitment
+    ///   2. Compute circle fold twiddles in natural half_odds order (not BRT)
+    ///   3. Compute line fold twiddles in natural half_odds order
+    ///   4. Update the VortexSTARK verifier's domain point computations + constraint evaluation
+    ///      to use canonic position → domain point mapping
+    ///   5. Update all next-row indices from (qi+1)%n to canonic_next(qi)
+    ///
+    /// Fold equations ARE algebraically identical (both use (f0+f1) + alpha * inv_twiddle * (f0-f1)).
+    /// The FRI layer count and LinePoly coefficient mixing already match stwo.
     #[test]
     #[ignore = "Merkle leaf ordering: half_coset BRT-NTT vs CanonicCoset (all 7+ trees)"]
     fn test_stwo_fri_verifier_e2e() {
