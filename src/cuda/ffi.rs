@@ -479,7 +479,12 @@ unsafe extern "C" {
     pub fn cuda_cairo_quotient(
         trace_cols: *const *const u32,
         s_logup0: *const u32, s_logup1: *const u32, s_logup2: *const u32, s_logup3: *const u32,
+        t1l0: *const u32, t1l1: *const u32, t1l2: *const u32, t1l3: *const u32,
+        t2l0: *const u32, t2l1: *const u32, t2l2: *const u32, t2l3: *const u32,
+        t3l0: *const u32, t3l1: *const u32, t3l2: *const u32, t3l3: *const u32,
         s_rc0: *const u32, s_rc1: *const u32, s_rc2: *const u32, s_rc3: *const u32,
+        u1r0: *const u32, u1r1: *const u32, u1r2: *const u32, u1r3: *const u32,
+        u2r0: *const u32, u2r1: *const u32, u2r2: *const u32, u2r3: *const u32,
         s_dict0: *const u32, s_dict1: *const u32, s_dict2: *const u32, s_dict3: *const u32,
         out0: *mut u32, out1: *mut u32, out2: *mut u32, out3: *mut u32,
         alpha_coeffs: *const u32,

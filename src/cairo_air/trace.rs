@@ -288,7 +288,7 @@ pub fn eval_transition_constraints(
 
 /// Number of transition constraints.
 /// 31 main M31 constraints + 2 QM31 interaction step-transition constraints (LogUp + RC).
-pub const N_CONSTRAINTS: usize = 15 + 1 + 1 + 1 + 1 + 1 + 10 + 1 + 2 + 2; // 35
+pub const N_CONSTRAINTS: usize = 15 + 1 + 1 + 1 + 1 + 1 + 10 + 1 + 4 + 3 + 1 + 1; // 40 (LogUp:4, RC:3, binary:1, Dict:1)
 
 #[cfg(test)]
 mod tests {

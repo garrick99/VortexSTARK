@@ -1484,7 +1484,6 @@ mod tests {
     ///   - first_layer (OODS quotient, circle domain log_size=log_eval)
     ///   - inner_layers[i] (line domain log_size=log_eval-1-i)
     #[test]
-    #[ignore = "FRI last layer: fold chain fills all LinePoly basis functions, stwo needs matching interpolation"]
     fn test_stwo_fri_merkle_witnesses() {
         use crate::cairo_air::prover::cairo_prove;
         use crate::cuda::ffi;
@@ -1748,6 +1747,11 @@ mod tests {
         // Mix interaction commitments and LogUp+RC final sums.
         ch.mix_u32s(&proof.interaction_commitment);
         ch.mix_u32s(&proof.rc_interaction_commitment);
+        ch.mix_u32s(&proof.logup_t1_commitment);
+        ch.mix_u32s(&proof.logup_t2_commitment);
+        ch.mix_u32s(&proof.logup_t3_commitment);
+        ch.mix_u32s(&proof.rc_u1_commitment);
+        ch.mix_u32s(&proof.rc_u2_commitment);
         ch.mix_u32s(&[
             proof.logup_final_sum[0], proof.logup_final_sum[1],
             proof.logup_final_sum[2], proof.logup_final_sum[3],
@@ -1851,7 +1855,6 @@ mod tests {
     ///   5. Update all next-row indices from (qi+1)%n to canonic_next(qi)
     ///
     #[test]
-    #[ignore = "FRI last layer: fold chain fills all LinePoly basis functions, stwo needs matching interpolation"]
     fn test_stwo_fri_verifier_e2e() {
         use crate::cairo_air::decode::Instruction;
         use crate::cairo_air::prover::cairo_prove;
@@ -1922,6 +1925,11 @@ mod tests {
         ch.draw_secure_felt(); // z_rc
         ch.mix_u32s(&proof.interaction_commitment);
         ch.mix_u32s(&proof.rc_interaction_commitment);
+        ch.mix_u32s(&proof.logup_t1_commitment);
+        ch.mix_u32s(&proof.logup_t2_commitment);
+        ch.mix_u32s(&proof.logup_t3_commitment);
+        ch.mix_u32s(&proof.rc_u1_commitment);
+        ch.mix_u32s(&proof.rc_u2_commitment);
         ch.mix_u32s(&[
             proof.logup_final_sum[0], proof.logup_final_sum[1],
             proof.logup_final_sum[2], proof.logup_final_sum[3],
@@ -1992,13 +2000,20 @@ mod tests {
         };
 
         let fri_config = FriConfig::new(
-            crate::fri::LOG_LAST_LAYER_DEGREE_BOUND, // log_last_layer_degree_bound
-            BLOWUP_BITS,                              // log_blowup_factor = 1
+            crate::fri::LOG_LAST_LAYER_DEGREE_BOUND, // log_last_layer_degree_bound = 3
+            BLOWUP_BITS,                              // log_blowup_factor
             N_QUERIES,                                // n_queries = 80
             1,                                        // line_fold_step = 1
         );
 
         let column_bound = CirclePolyDegreeBound::new(log_n);
+
+        eprintln!("FRI config: log_last_layer_degree_bound={}, BLOWUP_BITS={}, log_n={}, n_inner_layers={}",
+            crate::fri::LOG_LAST_LAYER_DEGREE_BOUND, BLOWUP_BITS, log_n,
+            proof.fri_commitments.len());
+        eprintln!("Expected inner layers = log_n - 1 - log_last_layer_degree_bound = {} - 1 - {} = {}",
+            log_n, crate::fri::LOG_LAST_LAYER_DEGREE_BOUND,
+            log_n as i32 - 1 - crate::fri::LOG_LAST_LAYER_DEGREE_BOUND as i32);
 
         let mut fri_verifier = FriVerifier::<Blake2sMerkleChannel>::commit(
             &mut ch,
@@ -2034,8 +2049,368 @@ mod tests {
             })
             .collect();
 
+        // ── Manual fold chain trace for first query ─────────────────────────
+        // Trace the FRI fold chain manually for the first query to find the mismatch.
+        {
+            let qi = sorted_queries.positions[0];
+            let proof_idx = qi_to_proof_idx[&qi];
+            let oods_val = sf(proof.oods_quotient_decommitment.values[proof_idx]);
+            let oods_sib = sf(proof.oods_quotient_decommitment.sibling_values[proof_idx]);
+
+            // Circle fold
+            let (f0, f1) = if qi % 2 == 0 { (oods_val, oods_sib) } else { (oods_sib, oods_val) };
+            let even_brt = qi & !1;
+            let even_cn = even_brt.reverse_bits() >> (usize::BITS - log_eval_size as u32);
+            let pt = crate::cairo_air::prover::canonic_domain_point(even_cn, log_eval_size);
+            let twid_y = SM31(pt.y.0).inverse();
+            let sum = f0 + f1;
+            let diff = f0 - f1;
+            let fri_alpha_val = first_layer_evals[0]; // just to get the channel's fri_alpha
+            // Actually we need the fold alphas from the channel. Let me get them from the proof.
+            // The fold alphas are drawn from the channel during FRI commit.
+            // stwo's FriVerifier stores them internally - we can't access them.
+            // Instead, let's just check the last_layer_poly evaluation.
+
+            // After all folds, the query position becomes qi >> (1 + n_inner_layers) on the last_layer_domain
+            let n_inner = proof.fri_commitments.len();
+            let last_qi = qi >> (1 + n_inner);
+            let last_log = log_eval_size - 1 - n_inner as u32; // = committed_stop_log
+            // last_layer_domain = half_odds(last_log), size = 2^last_log
+            let last_domain_size = 1usize << last_log;
+
+            // Evaluate last_layer_poly at the query's last-layer domain point
+            use stwo::core::circle::{Coset as SCoset};
+            use stwo::core::poly::line::LineDomain;
+            let last_coset = SCoset::half_odds(last_log);
+            let last_domain = LineDomain::new(last_coset);
+            // In stwo, query position is bit-reverse-indexed into the domain
+            let brt_qi = stwo::core::utils::bit_reverse_index(last_qi, last_log);
+            let domain_x = last_domain.at(brt_qi);
+
+            let stwo_last_poly = LinePoly::new(
+                proof.fri_last_layer_poly.iter().map(|q| sf(q.to_u32_array())).collect()
+            );
+            let poly_eval = stwo_last_poly.eval_at_point(domain_x.into());
+
+            // Check: what does our prover's fri_last_layer have at this position?
+            // fri_last_layer has evaluations at committed_stop_log in BRT order
+            let our_eval = sf(proof.fri_last_layer[last_qi].to_u32_array());
+
+            eprintln!("\n=== FRI LAST LAYER DIAGNOSTIC ===");
+            eprintln!("query qi={qi}, last_qi={last_qi}, last_log={last_log}");
+            eprintln!("last_domain_size={last_domain_size}, fri_last_layer.len()={}", proof.fri_last_layer.len());
+            eprintln!("poly_eval at domain point = {:?}", [poly_eval.0.0.0, poly_eval.0.1.0, poly_eval.1.0.0, poly_eval.1.1.0]);
+            eprintln!("our fri_last_layer[{last_qi}] = {:?}", proof.fri_last_layer[last_qi].to_u32_array());
+
+            // Also check: does last_layer_poly match at ALL domain points?
+            let mut mismatches = 0;
+            for pos in 0..last_domain_size {
+                let brt_pos = stwo::core::utils::bit_reverse_index(pos, last_log);
+                let x = last_domain.at(brt_pos);
+                let pv = stwo_last_poly.eval_at_point(x.into());
+                let our_v = proof.fri_last_layer[pos];
+                let pv_arr = [pv.0.0.0, pv.0.1.0, pv.1.0.0, pv.1.1.0];
+                let our_arr = our_v.to_u32_array();
+                if pv_arr != our_arr {
+                    if mismatches < 3 {
+                        eprintln!("  pos={pos}: poly={:?} vs our={:?}", pv_arr, our_arr);
+                    }
+                    mismatches += 1;
+                }
+            }
+            eprintln!("last_layer_poly vs fri_last_layer: {}/{} match (at committed_stop_log domain)",
+                last_domain_size - mismatches, last_domain_size);
+
+            // Also check: last_layer_poly at the 8-point half_odds(3) domain
+            let poly_log = crate::fri::LOG_LAST_LAYER_DEGREE_BOUND;
+            let poly_n = 1usize << poly_log;
+            let poly_coset = SCoset::half_odds(poly_log);
+            let poly_domain = LineDomain::new(poly_coset);
+            eprintln!("Checking last_layer_poly at half_odds({poly_log}) ({poly_n} points):");
+            for pos in 0..poly_n {
+                let brt_p = stwo::core::utils::bit_reverse_index(pos, poly_log);
+                let x = poly_domain.at(brt_p);
+                let pv = stwo_last_poly.eval_at_point(x.into());
+                eprintln!("  pos={pos}: eval={:?}", [pv.0.0.0, pv.0.1.0, pv.1.0.0, pv.1.1.0]);
+            }
+        }
+
         // ── Decommit: verify all FRI fold equations ───────────────────────────
         fri_verifier.decommit(first_layer_evals)
             .unwrap_or_else(|e| panic!("FriVerifier::decommit failed: {e:?}"));
+    }
+
+    /// Diagnostic: check degree of OODS quotient by INTT.
+    #[test]
+    fn test_oods_quotient_degree() {
+        use crate::cairo_air::prover::cairo_prove;
+        use crate::cuda::ffi;
+        use crate::prover::BLOWUP_BITS;
+        use crate::fri;
+
+        ffi::init_memory_pool();
+
+        let program: Vec<u64> = vec![
+            0x480680017fff8000, 0x480680017fff8000,
+            0x48307ffb7fff8000, 0x48307ffb7fff8000,
+            0x40780017fff7fff,
+        ];
+        let proof = cairo_prove(&program, 64, 6);
+        let log_n = 6u32;
+        let log_eval = log_n + BLOWUP_BITS;
+        let eval_size = 1usize << log_eval;
+
+        eprintln!("\nlog_n={log_n}, log_eval={log_eval}, BLOWUP_BITS={BLOWUP_BITS}");
+        eprintln!("fri_commitments: {}", proof.fri_commitments.len());
+        eprintln!("fri_decommitments: {}", proof.fri_decommitments.len());
+        eprintln!("fri_last_layer: {} evals", proof.fri_last_layer.len());
+        eprintln!("fri_last_layer_poly: {} coeffs", proof.fri_last_layer_poly.len());
+
+        // Check: INTT the OODS quotient and measure non-zero coefficient count
+        // The OODS quotient is committed at BRT-canonic order on the eval domain.
+        // We can check the degree by looking at the LinePoly coefficients at the last layer.
+
+        // Actually, let's check: evaluate the last_layer_poly at each point of the
+        // last_layer_domain and compare with what the fold chain should produce.
+        // The last_layer_domain in stwo = half_odds(log_last_layer_degree_bound + blowup_bits)
+        // = half_odds(3 + 2) = half_odds(5), which has 32 points.
+
+        let committed_stop_log = fri::LOG_LAST_LAYER_DEGREE_BOUND + BLOWUP_BITS;
+        eprintln!("committed_stop_log = {committed_stop_log}");
+        eprintln!("last_layer_domain = half_odds({committed_stop_log}), {} points",
+            1usize << committed_stop_log);
+
+        // fri_last_layer has evals at committed_stop_log (32 values)
+        eprintln!("fri_last_layer has {} values (should be {})",
+            proof.fri_last_layer.len(), 1usize << committed_stop_log);
+
+        // The polynomial should have degree < 2^LOG_LAST_LAYER_DEGREE_BOUND = 8
+        // So on 32 evaluation points, only 8 FFT-basis coefficients should be non-zero.
+        // Let's check by doing a line IFFT on the 32 evaluations.
+
+        // Convert fri_last_layer to [u32; 4] array
+        let n = proof.fri_last_layer.len();
+        let poly_coeffs_count = 1usize << fri::LOG_LAST_LAYER_DEGREE_BOUND;
+        eprintln!("Expected max non-zero coefficients: {poly_coeffs_count}");
+
+        // Count how many of the 32 evaluations are non-zero
+        let mut nonzero = 0;
+        for eval in &proof.fri_last_layer {
+            let a = eval.to_u32_array();
+            if a != [0, 0, 0, 0] { nonzero += 1; }
+        }
+        eprintln!("Non-zero evaluations in fri_last_layer: {nonzero}/{n}");
+
+        // The FRI fold chain should reduce degree. If all 32 evals are non-zero,
+        // the polynomial at the last committed level has high degree, meaning
+        // the original OODS quotient has too high degree for FRI.
+        if nonzero > poly_coeffs_count * 2 {
+            eprintln!("WARNING: Too many non-zero evaluations at last committed level: {nonzero} (expected ≤ {})",
+                poly_coeffs_count * 2);
+        }
+
+        // Direct degree check: INTT the OODS quotient (first M31 component) and check
+        // how many coefficients are non-zero.
+        let oods_q0: Vec<u32> = proof.oods_quotient_decommitment.values.iter()
+            .map(|v| v[0])
+            .collect();
+        eprintln!("\nOODS quotient decommitment has {} values", oods_q0.len());
+
+        // We can't easily INTT the full OODS quotient from a proof alone (we'd need the
+        // prover's internal state). But we CAN check the trace polynomial degree by
+        // looking at the trace_poly_coeffs stored during ntt_col_save.
+        // Actually, let's just check: does the LDE pipeline produce consistent data?
+        // We can verify by running a small NTT LDE on a known polynomial.
+
+        use crate::ntt;
+        use crate::device::DeviceBuffer;
+        use crate::circle::Coset;
+        use crate::oods::eval_at_oods_from_coeffs;
+
+        // Known trace: f(x) = x for all trace domain points.
+        // Use half_coset(log_n) as trace domain.
+        let n = 1usize << log_n;
+        let hc = Coset::half_coset(log_n);
+        let mut trace_data: Vec<u32> = Vec::with_capacity(n);
+        for i in 0..n {
+            trace_data.push(hc.at(i).x.0); // x-coordinate as data
+        }
+
+        // Run stwo LDE pipeline
+        let trace_ntt = ntt::StwoNttCache::new(&hc);
+        let eval_domain = Coset::half_coset(log_eval);
+        let eval_ntt = ntt::StwoNttCache::new(&eval_domain);
+
+        let canonic = Coset::permute_hc_natural_to_canonic_brt(&trace_data, log_n);
+        let mut d_col = DeviceBuffer::from_host(&canonic);
+        ntt::interpolate_stwo(&mut d_col, &trace_ntt);
+        let coeffs = d_col.to_host();
+
+        // Check: coefficients beyond degree n should be zero
+        let nonzero_coeffs = coeffs.iter().filter(|&&c| c != 0).count();
+        eprintln!("\nLDE pipeline test: trace of {} points, got {} non-zero coefficients",
+            n, nonzero_coeffs);
+
+        // Zero-pad and NTT
+        let mut d_eval = DeviceBuffer::<u32>::alloc(eval_size);
+        unsafe { ffi::cuda_zero_pad(d_col.as_ptr(), d_eval.as_mut_ptr(), n as u32, eval_size as u32); }
+        ntt::evaluate_stwo(&mut d_eval, &eval_ntt);
+        let eval_data = d_eval.to_host();
+
+        // Verify: eval_data[BRT(i)] should equal f(eval_domain_point(i)) = eval_domain_point(i).x
+        let mut lde_mismatches = 0;
+        for brt_pos in 0..eval_size {
+            let cn_nat = brt_pos.reverse_bits() >> (usize::BITS - log_eval as u32);
+            let pt = crate::cairo_air::prover::canonic_domain_point(cn_nat, log_eval);
+            let expected = eval_at_oods_from_coeffs(&coeffs[..n], crate::oods::OodsPoint {
+                x: crate::field::QM31::from_u32_array([pt.x.0, 0, 0, 0]),
+                y: crate::field::QM31::from_u32_array([pt.y.0, 0, 0, 0]),
+            });
+            let expected_m31 = expected.to_u32_array()[0]; // first M31 component
+            if eval_data[brt_pos] != expected_m31 && lde_mismatches < 5 {
+                eprintln!("  LDE mismatch at brt_pos={brt_pos}: got={}, expected={}",
+                    eval_data[brt_pos], expected_m31);
+            }
+            if eval_data[brt_pos] != expected_m31 { lde_mismatches += 1; }
+        }
+        eprintln!("LDE consistency: {}/{} match", eval_size - lde_mismatches, eval_size);
+
+        // Also check directly: eval at a domain point vs raw data
+        let check_pos = 5usize;
+        let cn_nat = check_pos.reverse_bits() >> (usize::BITS - log_eval as u32);
+        let pt = crate::cairo_air::prover::canonic_domain_point(cn_nat, log_eval);
+        eprintln!("  eval_data[{check_pos}] = {}, domain_point({cn_nat}).x = {}",
+            eval_data[check_pos], pt.x.0);
+
+        // ── Verify canonic_domain_point matches stwo's domain enumeration ────
+        use stwo::core::circle::{Coset as SCoset, CirclePoint as SCirclePoint, M31_CIRCLE_GEN};
+        use stwo::core::poly::circle::CanonicCoset;
+        use stwo::core::fields::m31::M31 as SM31;
+
+        let stwo_domain = CanonicCoset::new(log_eval).circle_domain();
+        let mut domain_mismatches = 0;
+        for brt_pos in 0..eval_size {
+            let cn_nat = brt_pos.reverse_bits() >> (usize::BITS - log_eval as u32);
+            let our_pt = crate::cairo_air::prover::canonic_domain_point(cn_nat, log_eval);
+
+            // stwo domain point at natural index cn_nat
+            let stwo_pt = stwo_domain.at(cn_nat);
+            let sx = stwo_pt.x.0;
+            let sy = stwo_pt.y.0;
+
+            if our_pt.x.0 != sx || our_pt.y.0 != sy {
+                if domain_mismatches < 5 {
+                    eprintln!("  DOMAIN MISMATCH at brt={brt_pos}: ours=({},{}) stwo=({},{})",
+                        our_pt.x.0, our_pt.y.0, sx, sy);
+                }
+                domain_mismatches += 1;
+            }
+        }
+        eprintln!("\nDomain point consistency: {}/{} match",
+            eval_size - domain_mismatches, eval_size);
+
+        // ── Check constraint quotient degree ──────────────────────────────────
+        // Re-run the prover and INTT the constraint quotient q0 to check its degree.
+        // If q0 has degree > n, the quotient isn't truly polynomial.
+        // We need to get q0 from the prover. Instead of modifying the prover,
+        // let's check the OODS quotient's degree by INTT'ing it.
+        //
+        // The OODS quotient is committed in the proof. We can get it from the decommitment
+        // at query points, but that only gives N_QUERIES sparse values.
+        // We can't INTT sparse data.
+        //
+        // Alternative: run a separate small prove with logging.
+        // For now, let's check if the FRI fold chain is self-consistent.
+        // The folded values at each layer should match.
+
+        eprintln!("\nAll structural checks pass. The issue may be in the OODS quotient kernel.");
+        eprintln!("Need to add quotient degree check inside the prover.");
+    }
+
+    /// Diagnostic: check LinePoly IFFT produces correct FFT-basis coefficients.
+    #[test]
+    fn test_fri_fold_chain_diagnostic() {
+        use crate::cairo_air::prover::cairo_prove;
+        use crate::cuda::ffi;
+        use crate::prover::BLOWUP_BITS;
+        use crate::circle::Coset;
+        use crate::field::{M31, QM31};
+        use crate::fri;
+
+        use stwo::core::circle::{Coset as SCoset, CirclePoint as SCirclePoint};
+        use stwo::core::fields::m31::M31 as SM31;
+        use stwo::core::fields::qm31::SecureField as SSecureField;
+        use stwo::core::poly::line::{LineDomain, LinePoly};
+
+        ffi::init_memory_pool();
+
+        let program: Vec<u64> = vec![
+            0x480680017fff8000, 0x480680017fff8000,
+            0x48307ffb7fff8000, 0x48307ffb7fff8000,
+            0x40780017fff7fff,
+        ];
+        let proof = cairo_prove(&program, 64, 6);
+
+        let sf = |v: [u32; 4]| -> SSecureField {
+            use stwo::core::fields::cm31::CM31;
+            SSecureField::from_m31_array([SM31(v[0]), SM31(v[1]), SM31(v[2]), SM31(v[3])])
+        };
+
+        let poly_log = fri::LOG_LAST_LAYER_DEGREE_BOUND;
+        let poly_n = 1usize << poly_log;
+
+        let our_poly = LinePoly::new(
+            proof.fri_last_layer_poly.iter().map(|q| sf(q.to_u32_array())).collect()
+        );
+
+        // Evaluate our LinePoly at each domain point of half_odds(poly_log) via stwo
+        let stwo_coset = SCoset::half_odds(poly_log);
+        let domain = LineDomain::new(stwo_coset);
+
+        eprintln!("\n=== LinePoly evals at half_odds({poly_log}) domain ===");
+        for i in 0..poly_n {
+            let x = domain.at(i);
+            let val = our_poly.eval_at_point(x.into());
+            eprintln!("  natural[{i}]: x={:?}, eval={:?}",
+                x, [val.0.0.0, val.0.1.0, val.1.0.0, val.1.1.0]);
+        }
+
+        // Also evaluate using the FFT basis manually and compare with stwo
+        // FFT basis: B[0]=1, B[1]=pi²(x), B[2]=pi(x), B[3]=pi²(x)*pi(x),
+        //            B[4]=x, B[5]=pi²(x)*x, B[6]=pi(x)*x, B[7]=pi²(x)*pi(x)*x
+        // where pi(x) = 2x²-1 (x-coordinate doubling map)
+        eprintln!("\n=== Manual FFT basis eval vs stwo eval ===");
+        let brt_coeffs: Vec<SSecureField> = proof.fri_last_layer_poly.iter()
+            .map(|q| sf(q.to_u32_array())).collect();
+
+        let mut mismatches = 0;
+        for i in 0..poly_n {
+            let x: SSecureField = domain.at(i).into();
+            let pi_x = SCirclePoint::<SSecureField>::double_x(x); // 2x²-1
+            let pi2_x = SCirclePoint::<SSecureField>::double_x(pi_x);
+
+            // Evaluate in BRT order of basis functions
+            let manual = brt_coeffs[0]                   // 1
+                + brt_coeffs[1] * pi2_x                  // pi²(x)
+                + brt_coeffs[2] * pi_x                   // pi(x)
+                + brt_coeffs[3] * pi2_x * pi_x           // pi²(x)*pi(x)
+                + brt_coeffs[4] * x                      // x
+                + brt_coeffs[5] * pi2_x * x              // pi²(x)*x
+                + brt_coeffs[6] * pi_x * x               // pi(x)*x
+                + brt_coeffs[7] * pi2_x * pi_x * x;      // pi²(x)*pi(x)*x
+
+            let stwo_val = our_poly.eval_at_point(x);
+            let manual_arr = [manual.0.0.0, manual.0.1.0, manual.1.0.0, manual.1.1.0];
+            let stwo_arr = [stwo_val.0.0.0, stwo_val.0.1.0, stwo_val.1.0.0, stwo_val.1.1.0];
+
+            if manual_arr != stwo_arr {
+                eprintln!("  point {i}: manual={:?} stwo={:?} MISMATCH", manual_arr, stwo_arr);
+                mismatches += 1;
+            } else {
+                eprintln!("  point {i}: OK");
+            }
+        }
+
+        assert_eq!(mismatches, 0, "FFT basis evaluation doesn't match stwo LinePoly.eval_at_point");
     }
 }

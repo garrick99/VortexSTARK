@@ -157,14 +157,17 @@ fn main() {
             let d_dummy_interaction = DeviceBuffer::<u32>::alloc(eval_size);
             let zeros24 = vec![0u32; 24];
             let d_dummy_challenges = DeviceBuffer::from_host(&zeros24);
+            let dp = d_dummy_interaction.as_ptr();
             ffi::cuda_cairo_quotient(
                 d_col_ptrs.as_ptr() as *const *const u32,
-                d_dummy_interaction.as_ptr(), d_dummy_interaction.as_ptr(),
-                d_dummy_interaction.as_ptr(), d_dummy_interaction.as_ptr(),
-                d_dummy_interaction.as_ptr(), d_dummy_interaction.as_ptr(),
-                d_dummy_interaction.as_ptr(), d_dummy_interaction.as_ptr(),
-                d_dummy_interaction.as_ptr(), d_dummy_interaction.as_ptr(),
-                d_dummy_interaction.as_ptr(), d_dummy_interaction.as_ptr(),
+                dp, dp, dp, dp, // s_logup
+                dp, dp, dp, dp, // t1
+                dp, dp, dp, dp, // t2
+                dp, dp, dp, dp, // t3
+                dp, dp, dp, dp, // s_rc
+                dp, dp, dp, dp, // u1
+                dp, dp, dp, dp, // u2
+                dp, dp, dp, dp, // s_dict
                 q0.as_mut_ptr(), q1.as_mut_ptr(), q2.as_mut_ptr(), q3.as_mut_ptr(),
                 d_alpha.as_ptr(),
                 d_vh_inv.as_ptr(),

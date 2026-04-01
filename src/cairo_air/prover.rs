@@ -107,14 +107,11 @@ fn permute_half_coset_to_canonic(data: &[u32], log_n: u32) -> Vec<u32> {
     let n = 1usize << log_n;
     assert_eq!(data.len(), n);
     let mut out = vec![0u32; n];
-    for i in 0..n {
-        // NTT position i → half_coset natural index k = bit_reverse(i)
-        let k = i.reverse_bits() >> (usize::BITS - log_n);
-        // Natural half_coset index k → canonic natural position
+    for k in 0..n {
+        // data[k] is at half_coset natural index k (old NTT = natural order).
         let cn = if k % 2 == 0 { k / 2 } else { n - 1 - k / 2 };
-        // Canonic natural → BRT-canonic position
         let j = cn.reverse_bits() >> (usize::BITS - log_n);
-        out[j] = data[i];
+        out[j] = data[k];
     }
     out
 }
@@ -142,22 +139,23 @@ pub fn hc_ntt_to_canonic(i: usize, log_n: u32) -> usize {
 }
 
 /// Get the canonic domain point at position j.
-fn canonic_domain_point(j: usize, log_eval_size: u32) -> crate::circle::CirclePoint {
+pub fn canonic_domain_point(j: usize, log_eval_size: u32) -> crate::circle::CirclePoint {
     let ho = crate::circle::Coset::half_odds(log_eval_size - 1);
     let half_n = 1usize << (log_eval_size - 1);
     if j < half_n { ho.at(j) } else { ho.at(j - half_n).conjugate() }
 }
 
 /// Compute "next trace step" position from BRT-canonic position qi.
-/// Maps: BRT-canonic qi → canonic natural → half_coset NTT → +1 → canonic natural → BRT-canonic.
+/// Maps: BRT-canonic qi → canonic natural → half_coset NTT → +step → canonic natural → BRT-canonic.
+/// The trace step advances by 2^BLOWUP_BITS eval positions (1 trace step = 4 eval positions).
 pub fn canonic_next(qi: usize, log_eval_size: u32) -> usize {
-    // BRT-canonic qi → canonic natural
+    let n = 1usize << log_eval_size;
     let cn = qi.reverse_bits() >> (usize::BITS - log_eval_size);
-    let eval_size = 1usize << log_eval_size;
-    // canonic natural → half_coset NTT → +1 → canonic natural → BRT-canonic
-    let hc = canonic_to_hc_ntt(cn, log_eval_size);
-    let hc_next = (hc + 1) % eval_size;
-    let cn_next = hc_ntt_to_canonic(hc_next, log_eval_size);
+    // Canonic natural → half_coset natural (inverse sigma)
+    let k = if cn < n / 2 { 2 * cn } else { 2 * (n - 1 - cn) + 1 };
+    let step = 1usize << BLOWUP_BITS; // advance by 2^BLOWUP_BITS = 1 trace step
+    let k_next = (k + step) % n;
+    let cn_next = if k_next % 2 == 0 { k_next / 2 } else { n - 1 - k_next / 2 };
     cn_next.reverse_bits() >> (usize::BITS - log_eval_size)
 }
 
@@ -404,6 +402,18 @@ pub struct CairoProof {
     /// Multiplicity counts for range check values 0..2^16 (65536 entries).
     pub rc_counts_data: Vec<u32>,
 
+    /// Intermediate LogUp/RC interaction column commitments and decommitments.
+    #[serde(default)] pub logup_t1_commitment: [u32; 8],
+    #[serde(default)] pub logup_t2_commitment: [u32; 8],
+    #[serde(default)] pub logup_t3_commitment: [u32; 8],
+    #[serde(default)] pub rc_u1_commitment: [u32; 8],
+    #[serde(default)] pub rc_u2_commitment: [u32; 8],
+    #[serde(default)] pub logup_t1_decom: QueryDecommitment<[u32; 4]>,
+    #[serde(default)] pub logup_t2_decom: QueryDecommitment<[u32; 4]>,
+    #[serde(default)] pub logup_t3_decom: QueryDecommitment<[u32; 4]>,
+    #[serde(default)] pub rc_u1_decom: QueryDecommitment<[u32; 4]>,
+    #[serde(default)] pub rc_u2_decom: QueryDecommitment<[u32; 4]>,
+
     // ---- Out-Of-Domain Sampling (OODS) — stwo wire format ----
     //
     // After committing all trace trees, draw OODS point z ∈ QM31 circle from channel.
@@ -457,6 +467,8 @@ pub struct CairoProverCache {
     /// Inverse twiddles for the eval domain — used to INTT the AIR quotient polynomial
     /// back to coefficient form for OODS evaluation at the QM31 point z.
     pub eval_inv_cache: InverseTwiddleCache,
+    pub stwo_trace_ntt: ntt::StwoNttCache,
+    pub stwo_eval_ntt: ntt::StwoNttCache,
 }
 
 impl CairoProverCache {
@@ -469,6 +481,8 @@ impl CairoProverCache {
             inv_cache: InverseTwiddleCache::new(&trace_domain),
             fwd_cache: ForwardTwiddleCache::new(&eval_domain),
             eval_inv_cache: InverseTwiddleCache::new(&eval_domain),
+            stwo_trace_ntt: ntt::StwoNttCache::new(&trace_domain),
+            stwo_eval_ntt: ntt::StwoNttCache::new(&eval_domain),
         }
     }
 }
@@ -764,18 +778,18 @@ fn cairo_prove_cached_with_columns(
     const TRACE_LO: usize = 16; // Group A: cols 0..TRACE_LO (GPU hash cap = 16 cols per tree)
     const TRACE_VM_END: usize = 31; // end of original 31 VM columns; Group B: 16..31, Group C: 31..N_COLS
 
-    // Compute Z_H(x) once — shared across groups.
-    let eval_domain_for_zk = Coset::half_coset(log_eval_size);
-    let mut d_zh = DeviceBuffer::<u32>::alloc(eval_size);
-    unsafe {
-        ffi::cuda_compute_vanishing(
-            eval_domain_for_zk.initial.x.0, eval_domain_for_zk.initial.y.0,
-            eval_domain_for_zk.step.x.0,    eval_domain_for_zk.step.y.0,
-            d_zh.as_mut_ptr(),
-            log_eval_size, log_n,
-        );
-        ffi::cuda_device_sync();
-    }
+    // Compute Z_H(x) at BRT-canonic positions (matching stwo NTT output ordering).
+    let d_zh = {
+        let ho = Coset::half_odds(log_eval_size - 1);
+        let half_eval = eval_size / 2;
+        let mut zh = vec![0u32; eval_size];
+        for i in 0..eval_size {
+            let brt_i = i.reverse_bits() >> (usize::BITS - log_eval_size as u32);
+            let pt = if brt_i < half_eval { ho.at(brt_i) } else { ho.at(brt_i - half_eval).conjugate() };
+            zh[i] = Coset::circle_vanishing_poly_at(pt.x, log_n).0;
+        }
+        DeviceBuffer::from_host(&zh)
+    };
 
     // Pre-generate one random blinding scalar per ZK-blinded column.
     use rand::Rng;
@@ -791,17 +805,30 @@ fn cairo_prove_cached_with_columns(
     // Indexed by global column index [0..N_COLS).
     let mut trace_poly_coeffs: Vec<Vec<u32>> = Vec::with_capacity(N_COLS);
 
-    // Helper: NTT one column from trace domain → eval domain, saving coefficients.
-    // Returns (eval-domain DeviceBuffer, coefficients host vec).
+    // Stwo NTT LDE: trace column → stwo-basis coefficients → eval-domain BRT-canonic evaluations.
     let ntt_col_save = |src: &Vec<u32>| -> (DeviceBuffer<u32>, Vec<u32>) {
-        let mut d_col = DeviceBuffer::from_host(src);
-        ntt::interpolate(&mut d_col, &cache.inv_cache);
-        let coeffs = d_col.to_host();
+        let canonic = Coset::permute_hc_natural_to_canonic_brt(src, log_n);
+        let mut d_col = DeviceBuffer::from_host(&canonic);
+        ntt::interpolate_stwo(&mut d_col, &cache.stwo_trace_ntt);
+        let stwo_coeffs = d_col.to_host();
         let mut d_eval = DeviceBuffer::<u32>::alloc(eval_size);
         unsafe { ffi::cuda_zero_pad(d_col.as_ptr(), d_eval.as_mut_ptr(), n as u32, eval_size as u32); }
         drop(d_col);
-        ntt::evaluate(&mut d_eval, &cache.fwd_cache);
-        (d_eval, coeffs)
+        ntt::evaluate_stwo(&mut d_eval, &cache.stwo_eval_ntt);
+        (d_eval, stwo_coeffs)
+    };
+
+    // Stwo NTT LDE for interaction trace (natural trace-domain → BRT-canonic eval-domain).
+    let stwo_ntt_lde = |d_trace: DeviceBuffer<u32>| -> DeviceBuffer<u32> {
+        let natural = d_trace.to_host();
+        let canonic = Coset::permute_hc_natural_to_canonic_brt(&natural, log_n);
+        let mut d = DeviceBuffer::from_host(&canonic);
+        ntt::interpolate_stwo(&mut d, &cache.stwo_trace_ntt);
+        let mut d_eval = DeviceBuffer::<u32>::alloc(eval_size);
+        unsafe { ffi::cuda_zero_pad(d.as_ptr(), d_eval.as_mut_ptr(), n as u32, eval_size as u32); }
+        drop(d);
+        ntt::evaluate_stwo(&mut d_eval, &cache.stwo_eval_ntt);
+        d_eval
     };
 
     // ── Group A: cols 0..TRACE_LO ──────────────────────────────────────────
@@ -818,9 +845,9 @@ fn cairo_prove_cached_with_columns(
             }
         }
         unsafe { ffi::cuda_device_sync(); }
-        // Download half_coset data for constraint kernel, permute to canonic for commitment
-        let hc: Vec<Vec<u32>> = group.iter().map(|c| c.to_host_fast()).collect();
-        let cn: Vec<Vec<u32>> = hc.iter().map(|c| permute_half_coset_to_canonic(c, log_eval_size)).collect();
+        // Stwo NTT output is BRT-canonic. Inverse permute to natural for constraint kernel.
+        let cn: Vec<Vec<u32>> = group.iter().map(|c| c.to_host_fast()).collect();
+        let hc: Vec<Vec<u32>> = cn.iter().map(|c| Coset::permute_canonic_brt_to_hc_natural(c, log_eval_size)).collect();
         let cn_gpu: Vec<DeviceBuffer<u32>> = cn.iter().map(|c| DeviceBuffer::from_host(c)).collect();
         let (root, tile_roots) = MerkleTree::commit_root_only_with_subtrees(&cn_gpu, log_eval_size);
         (root, tile_roots, cn, hc)
@@ -841,9 +868,9 @@ fn cairo_prove_cached_with_columns(
             }
         }
         unsafe { ffi::cuda_device_sync(); }
-        // Download half_coset data for constraint kernel, permute to canonic for commitment
-        let hc: Vec<Vec<u32>> = group.iter().map(|c| c.to_host_fast()).collect();
-        let cn: Vec<Vec<u32>> = hc.iter().map(|c| permute_half_coset_to_canonic(c, log_eval_size)).collect();
+        // Stwo NTT output is BRT-canonic. Inverse permute to natural for constraint kernel.
+        let cn: Vec<Vec<u32>> = group.iter().map(|c| c.to_host_fast()).collect();
+        let hc: Vec<Vec<u32>> = cn.iter().map(|c| Coset::permute_canonic_brt_to_hc_natural(c, log_eval_size)).collect();
         let cn_gpu: Vec<DeviceBuffer<u32>> = cn.iter().map(|c| DeviceBuffer::from_host(c)).collect();
         let (root, tile_roots) = MerkleTree::commit_root_only_with_subtrees(&cn_gpu, log_eval_size);
         (root, tile_roots, cn, hc)
@@ -864,9 +891,9 @@ fn cairo_prove_cached_with_columns(
             }
         }
         unsafe { ffi::cuda_device_sync(); }
-        // Download half_coset data for constraint kernel, permute to canonic for commitment
-        let hc: Vec<Vec<u32>> = group.iter().map(|c| c.to_host_fast()).collect();
-        let cn: Vec<Vec<u32>> = hc.iter().map(|c| permute_half_coset_to_canonic(c, log_eval_size)).collect();
+        // Stwo NTT output is BRT-canonic. Inverse permute to natural for constraint kernel.
+        let cn: Vec<Vec<u32>> = group.iter().map(|c| c.to_host_fast()).collect();
+        let hc: Vec<Vec<u32>> = cn.iter().map(|c| Coset::permute_canonic_brt_to_hc_natural(c, log_eval_size)).collect();
         let cn_gpu: Vec<DeviceBuffer<u32>> = cn.iter().map(|c| DeviceBuffer::from_host(c)).collect();
         let (root, tile_roots) = MerkleTree::commit_root_only_with_subtrees(&cn_gpu, log_eval_size);
         (root, tile_roots, cn, hc)
@@ -931,23 +958,18 @@ fn cairo_prove_cached_with_columns(
     };
     let dict_link_final_arr = s_dict_final.to_u32_array();
 
-    // NTT S_dict trace to eval domain and commit (same pattern as RC interaction trace).
+    // NTT S_dict trace using stwo NTT LDE.
     let mut d_sdict_gpu: [DeviceBuffer<u32>; 4] = std::array::from_fn(|_| DeviceBuffer::<u32>::alloc(0));
     for c in 0..4 {
-        let mut d_col = DeviceBuffer::from_host(&dict_main_interaction_trace[c]);
-        ntt::interpolate(&mut d_col, &cache.inv_cache);
-        let mut d_eval = DeviceBuffer::<u32>::alloc(eval_size);
-        unsafe { ffi::cuda_zero_pad(d_col.as_ptr(), d_eval.as_mut_ptr(), n as u32, eval_size as u32); }
-        drop(d_col);
-        ntt::evaluate(&mut d_eval, &cache.fwd_cache);
-        d_sdict_gpu[c] = d_eval;
+        d_sdict_gpu[c] = stwo_ntt_lde(DeviceBuffer::from_host(&dict_main_interaction_trace[c]));
     }
     let [d_sdict0, d_sdict1, d_sdict2, d_sdict3] = d_sdict_gpu;
 
     let (dict_main_interaction_commitment, tile_roots_sdict, host_sdict, host_sdict_hc) = {
-        let hc = [d_sdict0.to_host(), d_sdict1.to_host(), d_sdict2.to_host(), d_sdict3.to_host()];
+        // Stwo output is BRT-canonic. Inverse permute for constraint kernel.
+        let cn = [d_sdict0.to_host(), d_sdict1.to_host(), d_sdict2.to_host(), d_sdict3.to_host()];
         drop(d_sdict0); drop(d_sdict1); drop(d_sdict2); drop(d_sdict3);
-        let cn: [Vec<u32>; 4] = std::array::from_fn(|i| permute_half_coset_to_canonic(&hc[i], log_eval_size));
+        let hc: [Vec<u32>; 4] = std::array::from_fn(|i| Coset::permute_canonic_brt_to_hc_natural(&cn[i], log_eval_size));
         let g0 = DeviceBuffer::from_host(&cn[0]); let g1 = DeviceBuffer::from_host(&cn[1]);
         let g2 = DeviceBuffer::from_host(&cn[2]); let g3 = DeviceBuffer::from_host(&cn[3]);
         let (root, tiles) = MerkleTree::commit_root_soa4_with_subtrees(&g0, &g1, &g2, &g3, log_eval_size);
@@ -1149,59 +1171,68 @@ fn cairo_prove_cached_with_columns(
         "range check LogUp sums don't cancel — offset out of range");
     let rc_final_sum = rc_exec_sum.to_u32_array();
 
+    // ── Compute intermediate LogUp columns T1, T2, T3 on CPU ──────────────
+    let alpha_mem_sq = alpha_mem * alpha_mem;
+    let (logup_t1_trace, logup_t2_trace, logup_t3_trace): ([Vec<u32>; 4], [Vec<u32>; 4], [Vec<u32>; 4]) = {
+        use crate::oods::qm31_from_m31;
+        let s0 = d_logup_trace[0].to_host(); let s1 = d_logup_trace[1].to_host();
+        let s2 = d_logup_trace[2].to_host(); let s3 = d_logup_trace[3].to_host();
+        let mut t1: [Vec<u32>; 4] = std::array::from_fn(|_| vec![0u32; n]);
+        let mut t2: [Vec<u32>; 4] = std::array::from_fn(|_| vec![0u32; n]);
+        let mut t3: [Vec<u32>; 4] = std::array::from_fn(|_| vec![0u32; n]);
+        for i in 0..n {
+            let s_i = QM31::from_u32_array([s0[i], s1[i], s2[i], s3[i]]);
+            let pc_v = M31(columns[COL_PC][i]); let ilo_v = M31(columns[COL_INST_LO][i]);
+            let ihi_v = M31(columns[COL_INST_HI][i]); let da_v = M31(columns[COL_DST_ADDR][i]);
+            let d_v = M31(columns[COL_DST][i]); let o0a_v = M31(columns[COL_OP0_ADDR][i]);
+            let o0_v = M31(columns[COL_OP0][i]); let o1a_v = M31(columns[COL_OP1_ADDR][i]);
+            let o1_v = M31(columns[COL_OP1][i]);
+            let e0 = qm31_from_m31(pc_v) + alpha_mem * qm31_from_m31(ilo_v) + alpha_mem_sq * qm31_from_m31(ihi_v);
+            let d0 = (z_mem - e0).inverse();
+            let d1 = (z_mem - (qm31_from_m31(da_v) + alpha_mem * qm31_from_m31(d_v))).inverse();
+            let d2 = (z_mem - (qm31_from_m31(o0a_v) + alpha_mem * qm31_from_m31(o0_v))).inverse();
+            let t1_i = s_i + d0; let t2_i = t1_i + d1; let t3_i = t2_i + d2;
+            let a1 = t1_i.to_u32_array(); let a2 = t2_i.to_u32_array(); let a3 = t3_i.to_u32_array();
+            for c in 0..4 { t1[c][i] = a1[c]; t2[c][i] = a2[c]; t3[c][i] = a3[c]; }
+        }
+        (t1, t2, t3)
+    };
+    // ── Compute intermediate RC columns U1, U2 on CPU ───────────────────
+    let (rc_u1_trace, rc_u2_trace): ([Vec<u32>; 4], [Vec<u32>; 4]) = {
+        use crate::oods::qm31_from_m31;
+        let s0 = d_rc_trace[0].to_host(); let s1 = d_rc_trace[1].to_host();
+        let s2 = d_rc_trace[2].to_host(); let s3 = d_rc_trace[3].to_host();
+        let mut u1: [Vec<u32>; 4] = std::array::from_fn(|_| vec![0u32; n]);
+        let mut u2: [Vec<u32>; 4] = std::array::from_fn(|_| vec![0u32; n]);
+        for i in 0..n {
+            let s_i = QM31::from_u32_array([s0[i], s1[i], s2[i], s3[i]]);
+            let r0 = (z_rc - crate::oods::qm31_from_m31(M31(columns[COL_OFF0][i]))).inverse();
+            let r1 = (z_rc - crate::oods::qm31_from_m31(M31(columns[COL_OFF1][i]))).inverse();
+            let u1_i = s_i + r0; let u2_i = u1_i + r1;
+            let a1 = u1_i.to_u32_array(); let a2 = u2_i.to_u32_array();
+            for c in 0..4 { u1[c][i] = a1[c]; u2[c][i] = a2[c]; }
+        }
+        (u1, u2)
+    };
+
     drop(columns); // trace-domain columns no longer needed
     drop(rc_offsets);
 
     let logup_final_sum = logup_final_qm31.to_u32_array();
 
-    // NTT the LogUp interaction trace: trace-domain (n) → eval-domain (eval_size).
-    let [mut lt0, mut lt1, mut lt2, mut lt3] = d_logup_trace;
-    ntt::interpolate(&mut lt0, &cache.inv_cache);
-    ntt::interpolate(&mut lt1, &cache.inv_cache);
-    ntt::interpolate(&mut lt2, &cache.inv_cache);
-    ntt::interpolate(&mut lt3, &cache.inv_cache);
-    let mut d_logup0 = DeviceBuffer::<u32>::alloc(eval_size);
-    let mut d_logup1 = DeviceBuffer::<u32>::alloc(eval_size);
-    let mut d_logup2 = DeviceBuffer::<u32>::alloc(eval_size);
-    let mut d_logup3 = DeviceBuffer::<u32>::alloc(eval_size);
-    unsafe {
-        ffi::cuda_zero_pad(lt0.as_ptr(), d_logup0.as_mut_ptr(), n as u32, eval_size as u32);
-        ffi::cuda_zero_pad(lt1.as_ptr(), d_logup1.as_mut_ptr(), n as u32, eval_size as u32);
-        ffi::cuda_zero_pad(lt2.as_ptr(), d_logup2.as_mut_ptr(), n as u32, eval_size as u32);
-        ffi::cuda_zero_pad(lt3.as_ptr(), d_logup3.as_mut_ptr(), n as u32, eval_size as u32);
-    }
-    drop(lt0); drop(lt1); drop(lt2); drop(lt3);
-    ntt::evaluate(&mut d_logup0, &cache.fwd_cache);
-    ntt::evaluate(&mut d_logup1, &cache.fwd_cache);
-    ntt::evaluate(&mut d_logup2, &cache.fwd_cache);
-    ntt::evaluate(&mut d_logup3, &cache.fwd_cache);
+    // NTT LogUp + RC interaction traces using stwo NTT LDE.
+    let [lt0, lt1, lt2, lt3] = d_logup_trace;
+    let d_logup0 = stwo_ntt_lde(lt0); let d_logup1 = stwo_ntt_lde(lt1);
+    let d_logup2 = stwo_ntt_lde(lt2); let d_logup3 = stwo_ntt_lde(lt3);
 
-    // NTT the RC interaction trace.
-    let [mut rc0, mut rc1, mut rc2, mut rc3] = d_rc_trace;
-    ntt::interpolate(&mut rc0, &cache.inv_cache);
-    ntt::interpolate(&mut rc1, &cache.inv_cache);
-    ntt::interpolate(&mut rc2, &cache.inv_cache);
-    ntt::interpolate(&mut rc3, &cache.inv_cache);
-    let mut rc_d0 = DeviceBuffer::<u32>::alloc(eval_size);
-    let mut rc_d1 = DeviceBuffer::<u32>::alloc(eval_size);
-    let mut rc_d2 = DeviceBuffer::<u32>::alloc(eval_size);
-    let mut rc_d3 = DeviceBuffer::<u32>::alloc(eval_size);
-    unsafe {
-        ffi::cuda_zero_pad(rc0.as_ptr(), rc_d0.as_mut_ptr(), n as u32, eval_size as u32);
-        ffi::cuda_zero_pad(rc1.as_ptr(), rc_d1.as_mut_ptr(), n as u32, eval_size as u32);
-        ffi::cuda_zero_pad(rc2.as_ptr(), rc_d2.as_mut_ptr(), n as u32, eval_size as u32);
-        ffi::cuda_zero_pad(rc3.as_ptr(), rc_d3.as_mut_ptr(), n as u32, eval_size as u32);
-    }
-    drop(rc0); drop(rc1); drop(rc2); drop(rc3);
-    ntt::evaluate(&mut rc_d0, &cache.fwd_cache);
-    ntt::evaluate(&mut rc_d1, &cache.fwd_cache);
-    ntt::evaluate(&mut rc_d2, &cache.fwd_cache);
-    ntt::evaluate(&mut rc_d3, &cache.fwd_cache);
+    let [rc0, rc1, rc2, rc3] = d_rc_trace;
+    let rc_d0 = stwo_ntt_lde(rc0); let rc_d1 = stwo_ntt_lde(rc1);
+    let rc_d2 = stwo_ntt_lde(rc2); let rc_d3 = stwo_ntt_lde(rc3);
 
     let (interaction_commitment, tile_roots_logup, host_logup, host_logup_hc) = {
-        let hc = [d_logup0.to_host(), d_logup1.to_host(), d_logup2.to_host(), d_logup3.to_host()];
+        let cn = [d_logup0.to_host(), d_logup1.to_host(), d_logup2.to_host(), d_logup3.to_host()];
         drop(d_logup0); drop(d_logup1); drop(d_logup2); drop(d_logup3);
-        let cn: [Vec<u32>; 4] = std::array::from_fn(|i| permute_half_coset_to_canonic(&hc[i], log_eval_size));
+        let hc: [Vec<u32>; 4] = std::array::from_fn(|i| Coset::permute_canonic_brt_to_hc_natural(&cn[i], log_eval_size));
         let g0 = DeviceBuffer::from_host(&cn[0]); let g1 = DeviceBuffer::from_host(&cn[1]);
         let g2 = DeviceBuffer::from_host(&cn[2]); let g3 = DeviceBuffer::from_host(&cn[3]);
         let (root, tiles) = MerkleTree::commit_root_soa4_with_subtrees(&g0, &g1, &g2, &g3, log_eval_size);
@@ -1210,15 +1241,37 @@ fn cairo_prove_cached_with_columns(
     channel.mix_digest(&interaction_commitment);
 
     let (rc_interaction_commitment, tile_roots_rc, host_rc_logup, host_rc_logup_hc) = {
-        let hc = [rc_d0.to_host(), rc_d1.to_host(), rc_d2.to_host(), rc_d3.to_host()];
+        let cn = [rc_d0.to_host(), rc_d1.to_host(), rc_d2.to_host(), rc_d3.to_host()];
         drop(rc_d0); drop(rc_d1); drop(rc_d2); drop(rc_d3);
-        let cn: [Vec<u32>; 4] = std::array::from_fn(|i| permute_half_coset_to_canonic(&hc[i], log_eval_size));
+        let hc: [Vec<u32>; 4] = std::array::from_fn(|i| Coset::permute_canonic_brt_to_hc_natural(&cn[i], log_eval_size));
         let g0 = DeviceBuffer::from_host(&cn[0]); let g1 = DeviceBuffer::from_host(&cn[1]);
         let g2 = DeviceBuffer::from_host(&cn[2]); let g3 = DeviceBuffer::from_host(&cn[3]);
         let (root, tiles) = MerkleTree::commit_root_soa4_with_subtrees(&g0, &g1, &g2, &g3, log_eval_size);
         (root, tiles, cn, hc)
     };
     channel.mix_digest(&rc_interaction_commitment);
+
+    // NTT + commit T/U intermediate columns.
+    let ntt_qm31 = |data: &[Vec<u32>; 4]| -> [DeviceBuffer<u32>; 4] {
+        std::array::from_fn(|c| stwo_ntt_lde(DeviceBuffer::from_host(&data[c])))
+    };
+    let commit_qm31 = |d: [DeviceBuffer<u32>; 4]| -> ([u32; 8], Vec<[u32; 8]>, [Vec<u32>; 4], [Vec<u32>; 4]) {
+        let cn: [Vec<u32>; 4] = std::array::from_fn(|i| d[i].to_host());
+        let hc: [Vec<u32>; 4] = std::array::from_fn(|i| Coset::permute_canonic_brt_to_hc_natural(&cn[i], log_eval_size));
+        let g: [DeviceBuffer<u32>; 4] = std::array::from_fn(|i| DeviceBuffer::from_host(&cn[i]));
+        let (root, tiles) = MerkleTree::commit_root_soa4_with_subtrees(&g[0], &g[1], &g[2], &g[3], log_eval_size);
+        (root, tiles, cn, hc)
+    };
+    let (logup_t1_commitment, _tr_t1, _cn_t1, host_t1_hc) = commit_qm31(ntt_qm31(&logup_t1_trace));
+    channel.mix_digest(&logup_t1_commitment);
+    let (logup_t2_commitment, _tr_t2, _cn_t2, host_t2_hc) = commit_qm31(ntt_qm31(&logup_t2_trace));
+    channel.mix_digest(&logup_t2_commitment);
+    let (logup_t3_commitment, _tr_t3, _cn_t3, host_t3_hc) = commit_qm31(ntt_qm31(&logup_t3_trace));
+    channel.mix_digest(&logup_t3_commitment);
+    let (rc_u1_commitment, _tr_u1, _cn_u1, host_u1_hc) = commit_qm31(ntt_qm31(&rc_u1_trace));
+    channel.mix_digest(&rc_u1_commitment);
+    let (rc_u2_commitment, _tr_u2, _cn_u2, host_u2_hc) = commit_qm31(ntt_qm31(&rc_u2_trace));
+    channel.mix_digest(&rc_u2_commitment);
 
     // Bind LogUp and RC final sums into Fiat-Shamir (tampering breaks FRI)
     channel.mix_digest(&[
@@ -1278,22 +1331,12 @@ fn cairo_prove_cached_with_columns(
 
     // Compute 1/Z_H for every NTT position in the eval domain.
     // Z_H(x) = 0 iff x is the x-coordinate of a trace domain point.
-    // The quotient Q(x) = C(x)/Z_H(x) is the polynomial that FRI proves low-degree.
+    // Pass V_H = 1 so kernel outputs constraint NUMERATOR C(x) without V_H division.
+    // V_H division is done in BRT-canonic coefficient space after permutation (per-block).
     let eval_domain = crate::circle::Coset::half_coset(log_eval_size);
-    let mut d_vh_inv = DeviceBuffer::<u32>::alloc(eval_size);
-    unsafe {
-        ffi::cuda_compute_vanishing_inv(
-            eval_domain.initial.x.0, eval_domain.initial.y.0,
-            eval_domain.step.x.0,   eval_domain.step.y.0,
-            d_vh_inv.as_mut_ptr(),
-            log_eval_size,
-            log_n,
-        );
-        ffi::cuda_device_sync();
-    }
+    let d_vh_inv = DeviceBuffer::from_host(&vec![1u32; eval_size]);
 
-    // Re-upload interaction columns in HALF_COSET order for the quotient kernel
-    // (must match the trace column ordering used by the constraint kernel).
+    // Upload interaction columns + T/U intermediate columns for constraint kernel.
     let d_slogup0 = DeviceBuffer::from_host(&host_logup_hc[0]);
     let d_slogup1 = DeviceBuffer::from_host(&host_logup_hc[1]);
     let d_slogup2 = DeviceBuffer::from_host(&host_logup_hc[2]);
@@ -1306,6 +1349,12 @@ fn cairo_prove_cached_with_columns(
     let d_sd1 = DeviceBuffer::from_host(&host_sdict_hc[1]);
     let d_sd2 = DeviceBuffer::from_host(&host_sdict_hc[2]);
     let d_sd3 = DeviceBuffer::from_host(&host_sdict_hc[3]);
+    // T/U intermediate columns for constraint kernel.
+    let dt1: [DeviceBuffer<u32>; 4] = std::array::from_fn(|c| DeviceBuffer::from_host(&host_t1_hc[c]));
+    let dt2: [DeviceBuffer<u32>; 4] = std::array::from_fn(|c| DeviceBuffer::from_host(&host_t2_hc[c]));
+    let dt3: [DeviceBuffer<u32>; 4] = std::array::from_fn(|c| DeviceBuffer::from_host(&host_t3_hc[c]));
+    let du1: [DeviceBuffer<u32>; 4] = std::array::from_fn(|c| DeviceBuffer::from_host(&host_u1_hc[c]));
+    let du2: [DeviceBuffer<u32>; 4] = std::array::from_fn(|c| DeviceBuffer::from_host(&host_u2_hc[c]));
 
     // Pack challenges: [z_mem(4), alpha_mem(4), alpha_mem_sq(4), z_rc(4), z_dict_link(4), alpha_dict_link(4)] = 24 u32s.
     let challenges_flat: Vec<u32> = z_mem.to_u32_array().iter()
@@ -1328,7 +1377,12 @@ fn cairo_prove_cached_with_columns(
         ffi::cuda_cairo_quotient(
             d_col_ptrs.as_ptr() as *const *const u32,
             d_slogup0.as_ptr(), d_slogup1.as_ptr(), d_slogup2.as_ptr(), d_slogup3.as_ptr(),
+            dt1[0].as_ptr(), dt1[1].as_ptr(), dt1[2].as_ptr(), dt1[3].as_ptr(),
+            dt2[0].as_ptr(), dt2[1].as_ptr(), dt2[2].as_ptr(), dt2[3].as_ptr(),
+            dt3[0].as_ptr(), dt3[1].as_ptr(), dt3[2].as_ptr(), dt3[3].as_ptr(),
             d_src0.as_ptr(), d_src1.as_ptr(), d_src2.as_ptr(), d_src3.as_ptr(),
+            du1[0].as_ptr(), du1[1].as_ptr(), du1[2].as_ptr(), du1[3].as_ptr(),
+            du2[0].as_ptr(), du2[1].as_ptr(), du2[2].as_ptr(), du2[3].as_ptr(),
             d_sd0.as_ptr(), d_sd1.as_ptr(), d_sd2.as_ptr(), d_sd3.as_ptr(),
             q0.as_mut_ptr(), q1.as_mut_ptr(), q2.as_mut_ptr(), q3.as_mut_ptr(),
             d_alpha.as_ptr(),
@@ -1348,11 +1402,204 @@ fn cairo_prove_cached_with_columns(
     drop(d_col_ptrs);
     drop(d_alpha);
 
+    // ── Diagnostic: check constraint quotient + trace column degree ────────
+    #[cfg(test)]
+    {
+        let n = 1usize << log_n;
+        // Check trace column 0 degree (should be exactly n)
+        let col0_cn = &host_eval_cols[0]; // BRT-canonic
+        let mut d_check = DeviceBuffer::from_host(col0_cn);
+        ntt::interpolate_stwo(&mut d_check, &cache.stwo_eval_ntt);
+        let col0_coeffs = d_check.to_host();
+        let col0_upper = col0_coeffs[n..].iter().filter(|&&c| c != 0).count();
+        eprintln!("[TRACE COL0 DEGREE] {} non-zero in [0..{n}), {} in [{n}..{eval_size})",
+            col0_coeffs[..n].iter().filter(|&&c| c != 0).count(), col0_upper);
+        drop(d_check);
+
+        // Check V_H coefficient structure in stwo basis
+        let vh_coeffs = {
+            let eval_dom = Coset::half_coset(log_eval_size);
+            let mut vh_vals = vec![0u32; eval_size];
+            let mut pt = eval_dom.initial;
+            for i in 0..eval_size {
+                vh_vals[i] = Coset::circle_vanishing_poly_at(pt.x, log_n).0;
+                pt = pt.mul(eval_dom.step);
+            }
+            let vh_cn = permute_half_coset_to_canonic(&vh_vals, log_eval_size);
+            let mut d = DeviceBuffer::from_host(&vh_cn);
+            ntt::interpolate_stwo(&mut d, &cache.stwo_eval_ntt);
+            d.to_host()
+        };
+        let vh_nonzero: Vec<usize> = vh_coeffs.iter().enumerate()
+            .filter(|(_, c)| **c != 0).map(|(i, _)| i).collect();
+        eprintln!("[V_H COEFFICIENTS] {} non-zero at positions {:?}, values c[0]={}, c[128]={}",
+            vh_nonzero.len(), vh_nonzero, vh_coeffs[0], vh_coeffs[128]);
+
+        // Verify per-block coset_vanishing constancy in BRT-canonic order
+        let mut block_cv_mismatches = 0;
+        let block_size = n;
+        let n_blocks = eval_size / block_size;
+        for blk in 0..n_blocks {
+            let first_brt = blk * block_size;
+            let first_cn = first_brt.reverse_bits() >> (usize::BITS - log_eval_size as u32);
+            let first_pt = canonic_domain_point(first_cn, log_eval_size);
+            let mut first_x = first_pt.x;
+            for _ in 1..log_n { first_x = M31(2) * first_x * first_x - M31::ONE; }
+            for off in 1..block_size {
+                let brt = first_brt + off;
+                let cn = brt.reverse_bits() >> (usize::BITS - log_eval_size as u32);
+                let pt = canonic_domain_point(cn, log_eval_size);
+                let mut x = pt.x;
+                for _ in 1..log_n { x = M31(2) * x * x - M31::ONE; }
+                if x != first_x {
+                    block_cv_mismatches += 1;
+                    if block_cv_mismatches <= 3 {
+                        eprintln!("[BLOCK CV] mismatch at blk={blk} off={off}: cv={} != first_cv={}",
+                            x.0, first_x.0);
+                    }
+                }
+            }
+        }
+        eprintln!("[BLOCK CV CHECK] {}/{} positions match within blocks",
+            eval_size - n_blocks - block_cv_mismatches, eval_size - n_blocks);
+
+        // Print the 4 block coset_vanishing values
+        for blk in 0..n_blocks {
+            let brt = blk * block_size;
+            let cn = brt.reverse_bits() >> (usize::BITS - log_eval_size as u32);
+            let pt = canonic_domain_point(cn, log_eval_size);
+            let mut x = pt.x;
+            for _ in 1..log_n { x = M31(2) * x * x - M31::ONE; }
+            eprintln!("[BLOCK CV] block {blk}: cv = {}", x.0);
+        }
+
+        // Check V_H zeros at eval domain positions
+        let vh_zeros = {
+            let eval_dom = Coset::half_coset(log_eval_size);
+            let mut count = 0;
+            let mut pt = eval_dom.initial;
+            for _i in 0..eval_size {
+                let vh = Coset::circle_vanishing_poly_at(pt.x, log_n);
+                if vh.0 == 0 { count += 1; }
+                pt = pt.mul(eval_dom.step);
+            }
+            count
+        };
+        eprintln!("[V_H CHECK] {vh_zeros}/{eval_size} eval domain positions have V_H=0");
+
+        // Check: does half_coset(log_eval).at(k) == canonic_domain_point(sigma(k))?
+        let eval_dom = Coset::half_coset(log_eval_size);
+        let mut ordering_mismatches = 0;
+        let mut pt = eval_dom.initial;
+        for k in 0..eval_size {
+            let sigma_k = if k % 2 == 0 { k / 2 } else { eval_size - 1 - k / 2 };
+            let canonic_pt = crate::cairo_air::prover::canonic_domain_point(sigma_k, log_eval_size);
+            if pt.x.0 != canonic_pt.x.0 || pt.y.0 != canonic_pt.y.0 {
+                if ordering_mismatches < 3 {
+                    eprintln!("[ORDERING] k={k}: hc=({},{}), cn({})=({},{})",
+                        pt.x.0, pt.y.0, sigma_k, canonic_pt.x.0, canonic_pt.y.0);
+                }
+                ordering_mismatches += 1;
+            }
+            pt = pt.mul(eval_dom.step);
+        }
+        eprintln!("[ORDERING CHECK] {}/{} match (hc.at(k) vs canonic(sigma(k)))",
+            eval_size - ordering_mismatches, eval_size);
+
+        // Check constraint quotient q0 degree
+        let q0_host = q0.to_host();
+        let q0_cn = permute_half_coset_to_canonic(&q0_host, log_eval_size);
+        let mut d_check = DeviceBuffer::from_host(&q0_cn);
+        ntt::interpolate_stwo(&mut d_check, &cache.stwo_eval_ntt);
+        let q_coeffs = d_check.to_host();
+        let q1 = q_coeffs[..n].iter().filter(|&&c| c != 0).count();
+        let q2 = q_coeffs[n..2*n].iter().filter(|&&c| c != 0).count();
+        let q3 = q_coeffs[2*n..3*n].iter().filter(|&&c| c != 0).count();
+        let q4 = q_coeffs[3*n..].iter().filter(|&&c| c != 0).count();
+        let upper = q2 + q3 + q4;
+        eprintln!("[CONSTRAINT Q DEGREE] {} in [0..{n}), {} in [{n}..{}), {} in [{}..{}), {} in [{}..{eval_size})",
+            q1, q2, 2*n, q3, 2*n, 3*n, q4, 3*n);
+        if upper > 0 {
+            eprintln!("[CONSTRAINT Q DEGREE] WARNING: constraint quotient degree > {}", n-1);
+        }
+        drop(d_check);
+
+        // Check constraint NUMERATOR degree (q0 * V_H)
+        // q0 is the quotient C/V_H in hc natural order. To get the numerator:
+        // numerator[i] = q0[i] * V_H(hc.at(i))
+        let eval_dom = Coset::half_coset(log_eval_size);
+        let mut numer = vec![0u32; eval_size];
+        let mut pt = eval_dom.initial;
+        for i in 0..eval_size {
+            let vh = Coset::circle_vanishing_poly_at(pt.x, log_n);
+            numer[i] = (crate::field::M31(q0_host[i]) * vh).0;
+            pt = pt.mul(eval_dom.step);
+        }
+        let numer_cn = permute_half_coset_to_canonic(&numer, log_eval_size);
+        let mut d_numer = DeviceBuffer::from_host(&numer_cn);
+        ntt::interpolate_stwo(&mut d_numer, &cache.stwo_eval_ntt);
+        let numer_coeffs = d_numer.to_host();
+        let numer_upper = numer_coeffs[2*n..].iter().filter(|&&c| c != 0).count();
+        let numer_mid = numer_coeffs[n..2*n].iter().filter(|&&c| c != 0).count();
+        let numer_lower = numer_coeffs[..n].iter().filter(|&&c| c != 0).count();
+        eprintln!("[NUMERATOR DEGREE] {} in [0..{}), {} in [{}..{}), {} in [{}..{})",
+            numer_lower, n, numer_mid, n, 2*n, numer_upper, 2*n, eval_size);
+        drop(d_numer);
+    }
+
     let (quotient_commitment, tile_roots_quotient, host_q0, host_q1, host_q2, host_q3) = {
-        let hq0 = permute_half_coset_to_canonic(&q0.to_host(), log_eval_size);
-        let hq1 = permute_half_coset_to_canonic(&q1.to_host(), log_eval_size);
-        let hq2 = permute_half_coset_to_canonic(&q2.to_host(), log_eval_size);
-        let hq3 = permute_half_coset_to_canonic(&q3.to_host(), log_eval_size);
+        // Per-block coset_vanishing division in BRT-canonic space.
+        // This is stwo's approach: multiply each BRT block by a SCALAR (not a polynomial),
+        // which preserves degree in the FFT basis.
+        let mut hq0 = permute_half_coset_to_canonic(&q0.to_host(), log_eval_size);
+        let mut hq1 = permute_half_coset_to_canonic(&q1.to_host(), log_eval_size);
+        let mut hq2 = permute_half_coset_to_canonic(&q2.to_host(), log_eval_size);
+        let mut hq3 = permute_half_coset_to_canonic(&q3.to_host(), log_eval_size);
+
+        let n_blocks = 1usize << BLOWUP_BITS;
+        let block_size = n;
+        let mut denom_inv = vec![M31::ZERO; n_blocks];
+        for blk in 0..n_blocks {
+            let brt_pos = blk * block_size;
+            let cn_nat = brt_pos.reverse_bits() >> (usize::BITS - log_eval_size as u32);
+            let pt = canonic_domain_point(cn_nat, log_eval_size);
+            // Use circle_vanishing_poly_at (degree 2n) instead of coset_vanishing (degree n).
+            // Q = C / circle_vanishing has degree 3n - 2n = n = 64 (lower than coset_vanishing quotient).
+            denom_inv[blk] = Coset::circle_vanishing_poly_at(pt.x, log_n).inverse();
+        }
+        for blk in 0..n_blocks {
+            let inv = denom_inv[blk].0;
+            let start = blk * block_size;
+            for j in start..start + block_size {
+                hq0[j] = (M31(hq0[j]) * M31(inv)).0;
+                hq1[j] = (M31(hq1[j]) * M31(inv)).0;
+                hq2[j] = (M31(hq2[j]) * M31(inv)).0;
+                hq3[j] = (M31(hq3[j]) * M31(inv)).0;
+            }
+        }
+
+        let hq0 = hq0; let hq1 = hq1; let hq2 = hq2; let hq3 = hq3;
+
+        // Diagnostic: check degree AFTER V_H division
+        #[cfg(test)]
+        {
+            // hq0 is in BRT-canonic order. INTT to get coefficients.
+            let mut d_check = DeviceBuffer::from_host(&hq0);
+            ntt::interpolate_stwo(&mut d_check, &cache.stwo_eval_ntt);
+            let qc = d_check.to_host();
+            let n = 1usize << log_n;
+            let q1c = qc[..n].iter().filter(|&&c| c != 0).count();
+            let q2c = qc[n..2*n].iter().filter(|&&c| c != 0).count();
+            let q3c = qc[2*n..3*n].iter().filter(|&&c| c != 0).count();
+            let q4c = qc[3*n..].iter().filter(|&&c| c != 0).count();
+            eprintln!("[QUOTIENT AFTER DIV] {} in [0..{n}), {} in [{n}..{}), {} in [{}..{}), {} in [{}..{})",
+                q1c, q2c, 2*n, q3c, 2*n, 3*n, q4c, 3*n, eval_size);
+            // Also print the last few non-zero coefficient positions
+            let last_nz: Vec<usize> = qc.iter().enumerate().rev()
+                .filter(|(_, c)| **c != 0).take(3).map(|(i, _)| i).collect();
+            eprintln!("[QUOTIENT DEGREE] last non-zero at BRT positions {:?}", last_nz);
+        }
+
         let g0 = DeviceBuffer::from_host(&hq0); let g1 = DeviceBuffer::from_host(&hq1);
         let g2 = DeviceBuffer::from_host(&hq2); let g3 = DeviceBuffer::from_host(&hq3);
         let (root, tiles) = MerkleTree::commit_root_soa4_with_subtrees(&g0, &g1, &g2, &g3, log_eval_size);
@@ -1424,12 +1671,13 @@ fn cairo_prove_cached_with_columns(
                 };
                 [inv_perm(&host_logup), inv_perm(&host_rc_logup), inv_perm(&host_sdict)]
             };
+            // Use BRT-canonic data → stwo INTT → first n coefficients → eval_at_oods.
+            let interact_cn: [&[Vec<u32>; 4]; 3] = [&host_logup, &host_rc_logup, &host_sdict];
             for pi in 0..3 {
                 for k in 0..4 {
-                    // Upload half_coset data for INTT → OODS evaluation
-                    let mut scratch = DeviceBuffer::from_host(&srcs_hc[pi][k]);
-                    ntt::interpolate(&mut scratch, &cache.eval_inv_cache);
-                    let coeffs = scratch.to_host();
+                    let mut d = DeviceBuffer::from_host(&interact_cn[pi][k]);
+                    ntt::interpolate_stwo(&mut d, &cache.stwo_eval_ntt);
+                    let coeffs = d.to_host();
                     let val_z  = eval_at_oods_from_coeffs(&coeffs[..n], z);
                     let val_zn = eval_at_oods_from_coeffs(&coeffs[..n], z_next);
                     raw_z[pi][k]  = val_z.to_u32_array();
@@ -1440,15 +1688,17 @@ fn cairo_prove_cached_with_columns(
         };
 
         // ── Phase 2a: evaluate AIR quotient columns at z ─────────────────────
-        // INTT each qk from eval domain → coefficients (first n are the polynomial).
-        // q0..q3 are still alive as DeviceBuffers — use them directly.
+        // q0..q3 are natural order → permute to BRT-canonic → stwo INTT → eval_at_oods.
+        // Quotient has degree ~2n, use ALL eval-domain coefficients.
         let quot_at_z: [QM31; 4] = {
             let qs: [&DeviceBuffer<u32>; 4] = [&q0, &q1, &q2, &q3];
             std::array::from_fn(|k| {
-                let mut d: DeviceBuffer<u32> = DeviceBuffer::from_host(&qs[k].to_host());
-                ntt::interpolate(&mut d, &cache.eval_inv_cache);
+                let natural = qs[k].to_host();
+                let canonic = permute_half_coset_to_canonic(&natural, log_eval_size);
+                let mut d = DeviceBuffer::from_host(&canonic);
+                ntt::interpolate_stwo(&mut d, &cache.stwo_eval_ntt);
                 let coeffs = d.to_host();
-                eval_at_oods_from_coeffs(&coeffs[..n], z)
+                eval_at_oods_from_coeffs(&coeffs, z)
             })
         };
 
@@ -1673,6 +1923,28 @@ fn cairo_prove_cached_with_columns(
     drop(q0); drop(q1); drop(q2); drop(q3);
     let quotient_col = oods_quotient_col;
 
+    // ── Diagnostic: check OODS quotient degree ──────────────────────────────
+    #[cfg(test)]
+    {
+        // INTT one component of the OODS quotient to check degree.
+        let oods_q0_host = quotient_col.cols[0].to_host_fast();
+        let mut d_check = DeviceBuffer::from_host(&oods_q0_host);
+        ntt::interpolate_stwo(&mut d_check, &cache.stwo_eval_ntt);
+        let oods_coeffs = d_check.to_host();
+        // Count non-zero coefficients in the upper half (should be zero for low-degree poly)
+        let n = 1usize << log_n;
+        let upper_nonzero = oods_coeffs[n..].iter().filter(|&&c| c != 0).count();
+        let lower_nonzero = oods_coeffs[..n].iter().filter(|&&c| c != 0).count();
+        eprintln!("[OODS DEGREE CHECK] {lower_nonzero} non-zero coeffs in [0..{n}), {upper_nonzero} in [{n}..{eval_size})");
+        if upper_nonzero > 0 {
+            eprintln!("[OODS DEGREE CHECK] WARNING: OODS quotient has degree > {} (expected ≤ {})",
+                n - 1, n - 1);
+            eprintln!("[OODS DEGREE CHECK] This means the quotient is NOT a low-degree polynomial.");
+            eprintln!("[OODS DEGREE CHECK] FRI verification will fail for stwo.");
+        }
+        drop(d_check);
+    }
+
     // OODS quotient was computed from canonic-ordered trace data and canonic domain points,
     // so it's ALREADY in canonic order. No permutation needed.
     // OODS quotient was computed from BRT-canonic data with BRT-canonic domain points.
@@ -1785,12 +2057,89 @@ fn cairo_prove_cached_with_columns(
             dl -= 1;
         }
         // data now has 8 BRT evaluations on half_odds(3). IFFT → 8 LinePoly coefficients.
+        let data_copy = data.clone(); // save for diagnostic
         let nat = fri::last_layer_poly_coeffs(data);
         // BRT-permute for stwo LinePoly::new convention.
         let mut brt = vec![QM31::ZERO; poly_n];
         for i in 0..poly_n { brt[i.reverse_bits() >> (usize::BITS - poly_deg)] = nat[i]; }
+
+        // Diagnostic: verify IFFT round-trip
+        #[cfg(test)]
+        {
+            use stwo::core::fields::m31::M31 as SM31;
+            use stwo::core::fields::qm31::SecureField as SSecureField;
+            use stwo::core::poly::line::{LineDomain, LinePoly as SLinePoly};
+            use stwo::core::circle::Coset as SCoset;
+            let sf = |v: [u32; 4]| -> SSecureField {
+                use stwo::core::fields::cm31::CM31;
+                SSecureField::from_m31_array([SM31(v[0]), SM31(v[1]), SM31(v[2]), SM31(v[3])])
+            };
+            let sp = SLinePoly::new(brt.iter().map(|q| sf(q.to_u32_array())).collect());
+            let poly_coset = SCoset::half_odds(poly_deg);
+            let poly_domain = LineDomain::new(poly_coset);
+            let mut ifft_ok = 0;
+            for i in 0..poly_n {
+                let brt_i = i.reverse_bits() >> (usize::BITS - poly_deg);
+                let x = poly_domain.at(brt_i);
+                let ev = sp.eval_at_point(x.into());
+                let ev_arr = [ev.0.0.0, ev.0.1.0, ev.1.0.0, ev.1.1.0];
+                let orig = data_copy[i].to_u32_array();
+                if ev_arr == orig { ifft_ok += 1; }
+                else if ifft_ok == 0 {
+                    eprintln!("[IFFT CHECK] pos {i}: eval={ev_arr:?} orig={orig:?}");
+                }
+            }
+            eprintln!("[IFFT CHECK] {ifft_ok}/{poly_n} match (LinePoly eval at fold domain vs CPU fold results)");
+        }
+
         brt
     };
+
+    // Diagnostic: verify last_layer_poly round-trips with fri_last_layer
+    #[cfg(test)]
+    {
+        use stwo::core::fields::m31::M31 as SM31;
+        use stwo::core::fields::qm31::SecureField as SSecureField;
+        use stwo::core::poly::line::{LineDomain, LinePoly};
+        use stwo::core::circle::Coset as SCoset;
+
+        let sf = |v: [u32; 4]| -> SSecureField {
+            use stwo::core::fields::cm31::CM31;
+            SSecureField::from_m31_array([SM31(v[0]), SM31(v[1]), SM31(v[2]), SM31(v[3])])
+        };
+
+        let stwo_poly = LinePoly::new(fri_last_layer_coeffs.iter().map(|q| sf(q.to_u32_array())).collect());
+        // Evaluate at half_odds(poly_deg) domain — should match the CPU-folded data
+        let poly_coset = SCoset::half_odds(poly_deg);
+        let poly_domain = LineDomain::new(poly_coset);
+        let mut roundtrip_ok = 0;
+        for i in 0..poly_n {
+            let brt_i = i.reverse_bits() >> (usize::BITS - poly_deg);
+            let x = poly_domain.at(brt_i);
+            let eval = stwo_poly.eval_at_point(x.into());
+            let eval_arr = [eval.0.0.0, eval.0.1.0, eval.1.0.0, eval.1.1.0];
+            // The CPU-folded data was `data` before it was consumed by last_layer_poly_coeffs.
+            // We don't have it anymore, but we can check consistency differently.
+            // Instead check: evaluating at committed_stop_log domain (32 points)
+            // should match fri_last_layer after uncommitted folds.
+            roundtrip_ok += 1; // placeholder
+        }
+
+        // Check at committed_stop_log domain (32 points = fri_last_layer)
+        let last_coset = SCoset::half_odds(committed_stop_log);
+        let last_domain = LineDomain::new(last_coset);
+        let last_n = 1usize << committed_stop_log;
+        let mut match_count = 0;
+        for i in 0..last_n {
+            let brt_i = i.reverse_bits() >> (usize::BITS - committed_stop_log);
+            let x = last_domain.at(brt_i);
+            let eval = stwo_poly.eval_at_point(x.into());
+            let eval_arr = [eval.0.0.0, eval.0.1.0, eval.1.0.0, eval.1.1.0];
+            let our = fri_last_layer[i].to_u32_array();
+            if eval_arr == our { match_count += 1; }
+        }
+        eprintln!("[LAST LAYER ROUNDTRIP] poly evals at committed_stop domain: {match_count}/{last_n} match");
+    }
 
     // ---- Phase 5: Proof-of-Work grinding + Query + decommitment ----
     channel.mix_felts(&fri_last_layer_coeffs);
@@ -1995,6 +2344,13 @@ fn cairo_prove_cached_with_columns(
     let dict_main_interaction_decommitment_next = decommit_from_host_soa4(&host_sdict, &tile_roots_sdict, &next_query_indices);
     drop(host_sdict);
 
+    // T/U decommitments at query points (from BRT-canonic Merkle trees, same as all other trees).
+    let logup_t1_decom = decommit_from_host_soa4(&_cn_t1, &_tr_t1, &query_indices);
+    let logup_t2_decom = decommit_from_host_soa4(&_cn_t2, &_tr_t2, &query_indices);
+    let logup_t3_decom = decommit_from_host_soa4(&_cn_t3, &_tr_t3, &query_indices);
+    let rc_u1_decom = decommit_from_host_soa4(&_cn_u1, &_tr_u1, &query_indices);
+    let rc_u2_decom = decommit_from_host_soa4(&_cn_u2, &_tr_u2, &query_indices);
+
     // Dict sub-AIR: full trace data is included in the proof (dict_exec_data_opt /
     // dict_sorted_data_opt). No per-query decommitment needed — verifier recomputes
     // the Merkle roots from the full data and checks all step-transition constraints.
@@ -2071,6 +2427,10 @@ fn cairo_prove_cached_with_columns(
         memory_table_data,
         memory_instr_data,
         rc_counts_commitment,
+        logup_t1_commitment, logup_t2_commitment, logup_t3_commitment,
+        rc_u1_commitment, rc_u2_commitment,
+        logup_t1_decom, logup_t2_decom, logup_t3_decom,
+        rc_u1_decom, rc_u2_decom,
         rc_counts_data,
         oods_z,
         oods_trace_at_z,
@@ -2282,6 +2642,11 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
         return Err("RC interaction commitment is zero".into());
     }
     channel.mix_digest(&proof.rc_interaction_commitment);
+    channel.mix_digest(&proof.logup_t1_commitment);
+    channel.mix_digest(&proof.logup_t2_commitment);
+    channel.mix_digest(&proof.logup_t3_commitment);
+    channel.mix_digest(&proof.rc_u1_commitment);
+    channel.mix_digest(&proof.rc_u2_commitment);
     channel.mix_digest(&[
         proof.logup_final_sum[0], proof.logup_final_sum[1],
         proof.logup_final_sum[2], proof.logup_final_sum[3],
@@ -2907,25 +3272,40 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
             let accesses = [(pc_v, inst_lo_v), (dst_addr, dst_v), (op0_addr, op0_v), (op1_addr, op1_v)];
             let delta_logup = logup_row_contribution(z_mem_v, alpha_v, alpha_sq, &accesses, inst_hi_v);
 
-            // Constraint 31: S_logup[i+1] - S_logup[i] - delta(row_i) = 0
-            let c31 = s_logup_qi1 - s_logup_qi - delta_logup;
-            constraint_sum = constraint_sum + constraint_alphas[ci] * c31;
-            ci += 1;
+            // Constraints 31a-31d (polynomial form using decommitted T1/T2/T3)
+            {
+                use super::logup::qm31_from_m31;
+                let t1_v = QM31::from_u32_array(proof.logup_t1_decom.values[q]);
+                let t2_v = QM31::from_u32_array(proof.logup_t2_decom.values[q]);
+                let t3_v = QM31::from_u32_array(proof.logup_t3_decom.values[q]);
+                let e0 = qm31_from_m31(M31(row[COL_PC])) + alpha_v * qm31_from_m31(M31(row[COL_INST_LO]))
+                    + alpha_sq * qm31_from_m31(M31(row[COL_INST_HI]));
+                let d0 = z_mem_v - e0;
+                let d1 = z_mem_v - (qm31_from_m31(M31(row[COL_DST_ADDR])) + alpha_v * qm31_from_m31(M31(row[COL_DST])));
+                let d2 = z_mem_v - (qm31_from_m31(M31(row[COL_OP0_ADDR])) + alpha_v * qm31_from_m31(M31(row[COL_OP0])));
+                let d3 = z_mem_v - (qm31_from_m31(M31(row[COL_OP1_ADDR])) + alpha_v * qm31_from_m31(M31(row[COL_OP1])));
+                constraint_sum = constraint_sum + constraint_alphas[ci] * ((t1_v - s_logup_qi) * d0 - QM31::ONE); ci += 1;
+                constraint_sum = constraint_sum + constraint_alphas[ci] * ((t2_v - t1_v) * d1 - QM31::ONE); ci += 1;
+                constraint_sum = constraint_sum + constraint_alphas[ci] * ((t3_v - t2_v) * d2 - QM31::ONE); ci += 1;
+                constraint_sum = constraint_sum + constraint_alphas[ci] * ((s_logup_qi1 - t3_v) * d3 - QM31::ONE); ci += 1;
+            }
 
             // S_rc values from RC interaction decommitment
             let s_rc_qi  = QM31::from_u32_array(proof.rc_interaction_decommitment.values[q]);
             let s_rc_qi1 = QM31::from_u32_array(proof.rc_interaction_decommitment_next.values[q]);
 
-            // Compute expected RC delta for this row
-            let off0_v = M31(row[27]);
-            let off1_v = M31(row[28]);
-            let off2_v = M31(row[29]);
-            let delta_rc = rc_row_contribution(z_rc_v, &[off0_v, off1_v, off2_v]);
-
-            // Constraint 32: S_rc[i+1] - S_rc[i] - delta(row_i) = 0
-            let c32 = s_rc_qi1 - s_rc_qi - delta_rc;
-            constraint_sum = constraint_sum + constraint_alphas[ci] * c32;
-            ci += 1;
+            // Constraints 32a-32c (polynomial form using decommitted U1/U2)
+            {
+                use super::logup::qm31_from_m31;
+                let u1_v = QM31::from_u32_array(proof.rc_u1_decom.values[q]);
+                let u2_v = QM31::from_u32_array(proof.rc_u2_decom.values[q]);
+                let r0 = z_rc_v - qm31_from_m31(M31(row[27]));
+                let r1 = z_rc_v - qm31_from_m31(M31(row[28]));
+                let r2 = z_rc_v - qm31_from_m31(M31(row[29]));
+                constraint_sum = constraint_sum + constraint_alphas[ci] * ((u1_v - s_rc_qi) * r0 - QM31::ONE); ci += 1;
+                constraint_sum = constraint_sum + constraint_alphas[ci] * ((u2_v - u1_v) * r1 - QM31::ONE); ci += 1;
+                constraint_sum = constraint_sum + constraint_alphas[ci] * ((s_rc_qi1 - u2_v) * r2 - QM31::ONE); ci += 1;
+            }
         }
 
         // Constraint 33: dict_active binary (dict_active * (1 - dict_active) = 0)
@@ -2936,8 +3316,7 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
             ci += 1;
         }
 
-        // Constraint 34: S_dict step-transition
-        // S_dict[i+1] - S_dict[i] = dict_active[i] * inv(z_dict_link - (dict_key[i] + α * dict_new[i]))
+        // Constraint 34 (polynomial form): (S_next - S_curr) * (z_dict - entry) - dict_active = 0
         {
             use super::logup::qm31_from_m31;
             let chal = &proof.logup_challenges;
@@ -2946,20 +3325,16 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
             let s_dict_qi  = QM31::from_u32_array(proof.dict_main_interaction_decommitment.values[q]);
             let s_dict_qi1 = QM31::from_u32_array(proof.dict_main_interaction_decommitment_next.values[q]);
             let dict_active = M31(row[COL_DICT_ACTIVE]);
-            let dict_delta = if dict_active == M31(0) {
-                QM31::ZERO
-            } else {
-                let key     = qm31_from_m31(M31(row[COL_DICT_KEY]));
-                let new_val = qm31_from_m31(M31(row[COL_DICT_NEW]));
-                let entry = key + alpha_dlink * new_val;
-                let denom = z_dlink - entry;
-                denom.inverse()
-            };
-            let c34 = s_dict_qi1 - s_dict_qi - dict_delta;
+            let key     = qm31_from_m31(M31(row[COL_DICT_KEY]));
+            let new_val = qm31_from_m31(M31(row[COL_DICT_NEW]));
+            let entry = key + alpha_dlink * new_val;
+            let denom = z_dlink - entry;
+            let diff = s_dict_qi1 - s_dict_qi;
+            let c34 = diff * denom - qm31_from_m31(dict_active);
             constraint_sum = constraint_sum + constraint_alphas[ci] * c34;
             ci += 1;
         }
-        let _ = ci; // all 35 constraints evaluated
+        let _ = ci; // all 40 constraints evaluated
 
         // The GPU quotient kernel outputs Q(x) = C(x)/Z_H(x).
         // So the committed quotient value times the vanishing polynomial must equal
@@ -3150,6 +3525,13 @@ pub fn cairo_verify(proof: &CairoProof) -> Result<(), String> {
         &next_query_indices,
         "S_dict interaction trace (next)",
     )?;
+
+    // ---- Verify Merkle auth paths: T/U intermediate columns ----
+    verify_decommitment_auth_paths_soa4(&proof.logup_t1_commitment, &proof.logup_t1_decom, &proof.query_indices, "T1_logup")?;
+    verify_decommitment_auth_paths_soa4(&proof.logup_t2_commitment, &proof.logup_t2_decom, &proof.query_indices, "T2_logup")?;
+    verify_decommitment_auth_paths_soa4(&proof.logup_t3_commitment, &proof.logup_t3_decom, &proof.query_indices, "T3_logup")?;
+    verify_decommitment_auth_paths_soa4(&proof.rc_u1_commitment, &proof.rc_u1_decom, &proof.query_indices, "U1_rc")?;
+    verify_decommitment_auth_paths_soa4(&proof.rc_u2_commitment, &proof.rc_u2_decom, &proof.query_indices, "U2_rc")?;
 
     Ok(())
 }

@@ -135,6 +135,28 @@ impl Coset {
         }
     }
 
+    /// Half_coset-derived line domain: the line domain after circle folding half_coset data.
+    /// Same step as half_odds but initial = half_odds.initial.double() (one circle-doubling ahead).
+    pub fn half_coset_line(log_size: u32) -> Self {
+        let ho = Self::half_odds(log_size);
+        let initial = ho.initial.mul(ho.initial);
+        Self { initial, step: ho.step, log_size }
+    }
+
+    /// Permute data from half_coset BRT-NTT order to BRT-canonic (CircleDomain) order.
+    pub fn permute_half_coset_to_canonic(data: &[u32], log_n: u32) -> Vec<u32> {
+        let n = 1usize << log_n;
+        assert_eq!(data.len(), n);
+        let mut out = vec![0u32; n];
+        for i in 0..n {
+            let k = i.reverse_bits() >> (usize::BITS - log_n);
+            let cn = if k % 2 == 0 { k / 2 } else { n - 1 - k / 2 };
+            let j = cn.reverse_bits() >> (usize::BITS - log_n);
+            out[j] = data[i];
+        }
+        out
+    }
+
     /// Odds coset: matches stwo's CanonicCoset::new(log_size).coset().
     /// Coset = G^(2^(30-log_size)) * subgroup(log_size).
     /// Same initial as half_coset but covers ALL n points (not just n/2).
@@ -155,17 +177,73 @@ impl Coset {
         self.initial.mul(self.step.mul_scalar(i as u32))
     }
 
-    /// Evaluate the vanishing polynomial of half_coset(log_size) at x.
+    /// Permute data from half_coset NATURAL order to BRT-canonic (CircleDomain) order.
     ///
-    /// Z_H(x) = 0 iff x is the x-coordinate of a point in the trace domain.
-    /// Formula: Z_H(x) = f_{log_size}(x) + 1,
-    ///   where f_0(x) = x, f_{i+1}(x) = 2x^2 − 1  (circle group doubling).
+    /// Input: data[k] = value at half_coset.at(k) (natural order).
+    /// Output: out[j] = value at canonic_domain_point(BRT(j)) (BRT-canonic order).
+    /// This is the format expected by stwo's INTT.
+    pub fn permute_hc_natural_to_canonic_brt(data: &[u32], log_n: u32) -> Vec<u32> {
+        let n = 1usize << log_n;
+        assert_eq!(data.len(), n);
+        let mut out = vec![0u32; n];
+        for k in 0..n {
+            // half_coset natural k → canonic natural cn
+            let cn = if k % 2 == 0 { k / 2 } else { n - 1 - k / 2 };
+            // canonic natural → BRT-canonic position
+            let j = cn.reverse_bits() >> (usize::BITS - log_n);
+            out[j] = data[k];
+        }
+        out
+    }
+
+    /// Inverse permutation: BRT-canonic → natural half_coset order.
+    pub fn permute_canonic_brt_to_hc_natural(data: &[u32], log_n: u32) -> Vec<u32> {
+        let n = 1usize << log_n;
+        assert_eq!(data.len(), n);
+        let mut out = vec![0u32; n];
+        for k in 0..n {
+            let cn = if k % 2 == 0 { k / 2 } else { n - 1 - k / 2 };
+            let j = cn.reverse_bits() >> (usize::BITS - log_n);
+            // Forward: out[j] = data[k]. Inverse: out[k] = data[j].
+            out[k] = data[j];
+        }
+        out
+    }
+
+    /// Map a natural half_coset index to its BRT-canonic position.
+    /// Used for query index translation between trace trees (natural) and OODS quotient tree (BRT-canonic).
+    pub fn hc_natural_to_canonic_brt_index(k: usize, log_n: u32) -> usize {
+        let n = 1usize << log_n;
+        let cn = if k % 2 == 0 { k / 2 } else { n - 1 - k / 2 };
+        cn.reverse_bits() >> (usize::BITS - log_n)
+    }
+
+    /// Evaluate the vanishing polynomial of half_coset(log_size) at x.
+    /// Vanishes on the STANDARD subgroup (half_coset domain).
     pub fn circle_vanishing_poly_at(x: M31, log_size: u32) -> M31 {
         let mut v = x;
         for _ in 0..log_size {
             v = M31(2) * v * v - M31::ONE;
         }
         v + M31::ONE
+    }
+
+    /// Evaluate the vanishing polynomial for a specific coset at a circle point.
+    /// Matches stwo's `coset_vanishing(coset, p)`.
+    /// Vanishes iff p is a member of the given coset.
+    pub fn coset_vanishing_at(coset: &Coset, p: CirclePoint) -> M31 {
+        // Rotate: p' = p - coset.initial + step_half_point
+        // In stwo: step_half_point = G^(step_exponent / 2), NOT step^(size/2).
+        // For step = G^s, step_half_point = G^(s/2).
+        // G^(s/2) is the generator's repeated_double at (31 - log(s/2)) = 31 - (31 - coset.log_size) + 1
+        // Since s = 2^(31 - coset.log_size), s/2 = 2^(30 - coset.log_size).
+        let step_half_point = CirclePoint::GENERATOR.repeated_double(30 - coset.log_size);
+        let rotated = p.mul(coset.initial.conjugate()).mul(step_half_point);
+        let mut x = rotated.x;
+        for _ in 1..coset.log_size {
+            x = M31(2) * x * x - M31::ONE;
+        }
+        x
     }
 
     /// Generate all coset points at once using sequential multiplication.

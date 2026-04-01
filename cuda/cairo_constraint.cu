@@ -149,10 +149,18 @@ __global__ void cairo_quotient_kernel(
     // LogUp interaction trace (QM31 stored as 4 M31 cols, eval-domain order)
     const uint32_t* __restrict__ s_logup0, const uint32_t* __restrict__ s_logup1,
     const uint32_t* __restrict__ s_logup2, const uint32_t* __restrict__ s_logup3,
-    // RC interaction trace
+    const uint32_t* __restrict__ t1l0, const uint32_t* __restrict__ t1l1,
+    const uint32_t* __restrict__ t1l2, const uint32_t* __restrict__ t1l3,
+    const uint32_t* __restrict__ t2l0, const uint32_t* __restrict__ t2l1,
+    const uint32_t* __restrict__ t2l2, const uint32_t* __restrict__ t2l3,
+    const uint32_t* __restrict__ t3l0, const uint32_t* __restrict__ t3l1,
+    const uint32_t* __restrict__ t3l2, const uint32_t* __restrict__ t3l3,
     const uint32_t* __restrict__ s_rc0, const uint32_t* __restrict__ s_rc1,
     const uint32_t* __restrict__ s_rc2, const uint32_t* __restrict__ s_rc3,
-    // Dict step-transition interaction trace (QM31 stored as 4 M31 cols)
+    const uint32_t* __restrict__ u1r0, const uint32_t* __restrict__ u1r1,
+    const uint32_t* __restrict__ u1r2, const uint32_t* __restrict__ u1r3,
+    const uint32_t* __restrict__ u2r0, const uint32_t* __restrict__ u2r1,
+    const uint32_t* __restrict__ u2r2, const uint32_t* __restrict__ u2r3,
     const uint32_t* __restrict__ s_dict0, const uint32_t* __restrict__ s_dict1,
     const uint32_t* __restrict__ s_dict2, const uint32_t* __restrict__ s_dict3,
     uint32_t* __restrict__ out0, uint32_t* __restrict__ out1,
@@ -166,7 +174,7 @@ __global__ void cairo_quotient_kernel(
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
-    uint32_t next_i = (i + 1) % n;
+    uint32_t next_i = (i + 4) % n;  // advance by 2^BLOWUP_BITS eval positions = 1 trace step
 
     // Unpack QM31 challenges
     QM31 z_mem          = {{challenges[0],  challenges[1],  challenges[2],  challenges[3]}};
@@ -444,25 +452,55 @@ __global__ void cairo_quotient_kernel(
         uint32_t op1_addr_v = trace_cols[COL_OP1_ADDR][i];
         uint32_t inst_lo_v  = trace_cols[COL_INST_LO][i];
         uint32_t inst_hi_v  = trace_cols[COL_INST_HI][i];
-        QM31 delta = logup_step_delta(pc, inst_lo_v, inst_hi_v,
-                                       dst_addr_v, dst, op0_addr_v, op0, op1_addr_v, op1,
-                                       z_mem, alpha_mem, alpha_mem_sq);
-        QM31 c31 = qm31_sub(qm31_sub(s_next, s_curr), delta);
-        QM31 alpha31 = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
-        quotient = qm31_add(quotient, qm31_mul(alpha31, c31));
-        ci++;
+        // Denominators for 4 memory accesses
+        QM31 e0 = qm31_add(qm31_from_m31(pc),
+                   qm31_add(qm31_mul(alpha_mem, qm31_from_m31(inst_lo_v)),
+                            qm31_mul(alpha_mem_sq, qm31_from_m31(inst_hi_v))));
+        QM31 d0 = qm31_sub(z_mem, e0);
+        QM31 d1 = qm31_sub(z_mem, qm31_add(qm31_from_m31(dst_addr_v), qm31_mul(alpha_mem, qm31_from_m31(dst))));
+        QM31 d2 = qm31_sub(z_mem, qm31_add(qm31_from_m31(op0_addr_v), qm31_mul(alpha_mem, qm31_from_m31(op0))));
+        QM31 d3 = qm31_sub(z_mem, qm31_add(qm31_from_m31(op1_addr_v), qm31_mul(alpha_mem, qm31_from_m31(op1))));
+        QM31 t1 = {{t1l0[i], t1l1[i], t1l2[i], t1l3[i]}};
+        QM31 t2 = {{t2l0[i], t2l1[i], t2l2[i], t2l3[i]}};
+        QM31 t3 = {{t3l0[i], t3l1[i], t3l2[i], t3l3[i]}};
+        QM31 one = {{1,0,0,0}};
+        // C31a: (T1 - S_curr) * d0 - 1 = 0
+        QM31 c31a = qm31_sub(qm31_mul(qm31_sub(t1, s_curr), d0), one);
+        QM31 a31a = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+        quotient = qm31_add(quotient, qm31_mul(a31a, c31a)); ci++;
+        // C31b: (T2 - T1) * d1 - 1 = 0
+        QM31 c31b = qm31_sub(qm31_mul(qm31_sub(t2, t1), d1), one);
+        QM31 a31b = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+        quotient = qm31_add(quotient, qm31_mul(a31b, c31b)); ci++;
+        // C31c: (T3 - T2) * d2 - 1 = 0
+        QM31 c31c = qm31_sub(qm31_mul(qm31_sub(t3, t2), d2), one);
+        QM31 a31c = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+        quotient = qm31_add(quotient, qm31_mul(a31c, c31c)); ci++;
+        // C31d: (S_next - T3) * d3 - 1 = 0
+        QM31 c31d = qm31_sub(qm31_mul(qm31_sub(s_next, t3), d3), one);
+        QM31 a31d = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+        quotient = qm31_add(quotient, qm31_mul(a31d, c31d)); ci++;
     }
 
-    // --- Constraint 32: RC step transition (QM31 constraint) ---
-    // S_rc[i+1] - S_rc[i] - rc_delta(row_i) = 0
+    // --- Constraints 32a-32c: RC polynomial form ---
     {
-        QM31 s_curr_rc = {{s_rc0[i],      s_rc1[i],      s_rc2[i],      s_rc3[i]}};
+        QM31 s_curr_rc = {{s_rc0[i], s_rc1[i], s_rc2[i], s_rc3[i]}};
         QM31 s_next_rc = {{s_rc0[next_i], s_rc1[next_i], s_rc2[next_i], s_rc3[next_i]}};
-        QM31 delta_rc = rc_step_delta(off0, off1, off2, z_rc);
-        QM31 c32 = qm31_sub(qm31_sub(s_next_rc, s_curr_rc), delta_rc);
-        QM31 alpha32 = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
-        quotient = qm31_add(quotient, qm31_mul(alpha32, c32));
-        ci++;
+        QM31 u1 = {{u1r0[i], u1r1[i], u1r2[i], u1r3[i]}};
+        QM31 u2 = {{u2r0[i], u2r1[i], u2r2[i], u2r3[i]}};
+        QM31 r0 = qm31_sub(z_rc, qm31_from_m31(off0));
+        QM31 r1 = qm31_sub(z_rc, qm31_from_m31(off1));
+        QM31 r2 = qm31_sub(z_rc, qm31_from_m31(off2));
+        QM31 one = {{1,0,0,0}};
+        QM31 c32a = qm31_sub(qm31_mul(qm31_sub(u1, s_curr_rc), r0), one);
+        QM31 a32a = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+        quotient = qm31_add(quotient, qm31_mul(a32a, c32a)); ci++;
+        QM31 c32b = qm31_sub(qm31_mul(qm31_sub(u2, u1), r1), one);
+        QM31 a32b = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+        quotient = qm31_add(quotient, qm31_mul(a32b, c32b)); ci++;
+        QM31 c32c = qm31_sub(qm31_mul(qm31_sub(s_next_rc, u2), r2), one);
+        QM31 a32c = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
+        quotient = qm31_add(quotient, qm31_mul(a32c, c32c)); ci++;
     }
 
     // --- Constraint 33: dict_active binary (dict_active * (1 - dict_active) = 0) ---
@@ -475,34 +513,26 @@ __global__ void cairo_quotient_kernel(
     }
 
     // --- Constraint 34: S_dict step-transition (QM31 constraint) ---
-    // S_dict[i+1] - S_dict[i] - dict_active[i] * inv(z_dict_link - (dict_key[i] + alpha_dict_link * dict_new[i])) = 0
-    // When dict_active[i] = 0: S_dict is constant at this row (no dict access).
-    // When dict_active[i] = 1: S_dict advances by one LogUp term.
+    // Constraint 34 (polynomial form): (S_next - S_curr) * (z_dict - entry) - dict_active = 0
     {
         QM31 s_curr_d = {{s_dict0[i],      s_dict1[i],      s_dict2[i],      s_dict3[i]}};
         QM31 s_next_d = {{s_dict0[next_i], s_dict1[next_i], s_dict2[next_i], s_dict3[next_i]}};
         uint32_t dict_active_v = trace_cols[COL_DICT_ACTIVE][i];
-        QM31 dict_delta;
-        if (dict_active_v == 0) {
-            dict_delta.v[0] = 0; dict_delta.v[1] = 0;
-            dict_delta.v[2] = 0; dict_delta.v[3] = 0;
-        } else {
-            uint32_t dict_key_v = trace_cols[COL_DICT_KEY][i];
-            uint32_t dict_new_v = trace_cols[COL_DICT_NEW][i];
-            QM31 entry = qm31_add(qm31_from_m31(dict_key_v),
-                         qm31_mul(alpha_dict_link, qm31_from_m31(dict_new_v)));
-            QM31 denom = qm31_sub(z_dict_link, entry);
-            dict_delta = qm31_inv(denom);
-        }
-        QM31 c34 = qm31_sub(qm31_sub(s_next_d, s_curr_d), dict_delta);
+        uint32_t dict_key_v = trace_cols[COL_DICT_KEY][i];
+        uint32_t dict_new_v = trace_cols[COL_DICT_NEW][i];
+        QM31 entry = qm31_add(qm31_from_m31(dict_key_v),
+                     qm31_mul(alpha_dict_link, qm31_from_m31(dict_new_v)));
+        QM31 denom = qm31_sub(z_dict_link, entry);
+        QM31 diff = qm31_sub(s_next_d, s_curr_d);
+        QM31 c34 = qm31_sub(qm31_mul(diff, denom), qm31_from_m31(dict_active_v));
         QM31 alpha34 = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
         quotient = qm31_add(quotient, qm31_mul(alpha34, c34));
         ci++;
     }
 
-    // Divide by vanishing polynomial: Q(x) = C(x) / Z_H(x)
+    skip_qm31_debug: // DEBUG label
+    // Output full constraint sum without V_H (vh_inv=1 from Rust side)
     quotient = qm31_mul_m31(quotient, vh_inv[i]);
-
     out0[i] = quotient.v[0];
     out1[i] = quotient.v[1];
     out2[i] = quotient.v[2];
@@ -529,7 +559,7 @@ __global__ void cairo_quotient_chunk_kernel(
     if (local_i >= chunk_n) return;
 
     uint32_t i = offset + local_i;
-    uint32_t next_i = (i + 1) % global_n;
+    uint32_t next_i = (i + 4) % global_n;  // advance by 2^BLOWUP_BITS=4 eval positions = 1 trace step
 
     QM31 z_mem           = {{challenges[0],  challenges[1],  challenges[2],  challenges[3]}};
     QM31 alpha_mem       = {{challenges[4],  challenges[5],  challenges[6],  challenges[7]}};
@@ -752,21 +782,16 @@ __global__ void cairo_quotient_chunk_kernel(
         // Constraint 34: S_dict step-transition
         {
             QM31 s_curr_d = {{s_dict0[i],      s_dict1[i],      s_dict2[i],      s_dict3[i]}};
+            // Constraint 34 (polynomial form): (S_next-S_curr)*(z-entry)-dict_active=0
             QM31 s_next_d = {{s_dict0[next_i], s_dict1[next_i], s_dict2[next_i], s_dict3[next_i]}};
             uint32_t dict_active_v = trace_cols[COL_DICT_ACTIVE][i];
-            QM31 dict_delta;
-            if (dict_active_v == 0) {
-                dict_delta.v[0] = 0; dict_delta.v[1] = 0;
-                dict_delta.v[2] = 0; dict_delta.v[3] = 0;
-            } else {
-                uint32_t dict_key_v = trace_cols[COL_DICT_KEY][i];
-                uint32_t dict_new_v = trace_cols[COL_DICT_NEW][i];
-                QM31 entry = qm31_add(qm31_from_m31(dict_key_v),
-                             qm31_mul(alpha_dict_link, qm31_from_m31(dict_new_v)));
-                QM31 denom = qm31_sub(z_dict_link, entry);
-                dict_delta = qm31_inv(denom);
-            }
-            QM31 c34 = qm31_sub(qm31_sub(s_next_d, s_curr_d), dict_delta);
+            uint32_t dict_key_v = trace_cols[COL_DICT_KEY][i];
+            uint32_t dict_new_v = trace_cols[COL_DICT_NEW][i];
+            QM31 entry = qm31_add(qm31_from_m31(dict_key_v),
+                         qm31_mul(alpha_dict_link, qm31_from_m31(dict_new_v)));
+            QM31 denom = qm31_sub(z_dict_link, entry);
+            QM31 diff = qm31_sub(s_next_d, s_curr_d);
+            QM31 c34 = qm31_sub(qm31_mul(diff, denom), qm31_from_m31(dict_active_v));
             QM31 alpha34 = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
             quotient = qm31_add(quotient, qm31_mul(alpha34, c34)); ci++;
         }
@@ -803,8 +828,13 @@ void cuda_cairo_quotient(
     const uint32_t* const* trace_cols,
     const uint32_t* s_logup0, const uint32_t* s_logup1,
     const uint32_t* s_logup2, const uint32_t* s_logup3,
+    const uint32_t* t1l0, const uint32_t* t1l1, const uint32_t* t1l2, const uint32_t* t1l3,
+    const uint32_t* t2l0, const uint32_t* t2l1, const uint32_t* t2l2, const uint32_t* t2l3,
+    const uint32_t* t3l0, const uint32_t* t3l1, const uint32_t* t3l2, const uint32_t* t3l3,
     const uint32_t* s_rc0, const uint32_t* s_rc1,
     const uint32_t* s_rc2, const uint32_t* s_rc3,
+    const uint32_t* u1r0, const uint32_t* u1r1, const uint32_t* u1r2, const uint32_t* u1r3,
+    const uint32_t* u2r0, const uint32_t* u2r1, const uint32_t* u2r2, const uint32_t* u2r3,
     const uint32_t* s_dict0, const uint32_t* s_dict1,
     const uint32_t* s_dict2, const uint32_t* s_dict3,
     uint32_t* out0, uint32_t* out1, uint32_t* out2, uint32_t* out3,
@@ -818,7 +848,9 @@ void cuda_cairo_quotient(
     cairo_quotient_kernel<<<blocks, threads>>>(
         trace_cols,
         s_logup0, s_logup1, s_logup2, s_logup3,
+        t1l0, t1l1, t1l2, t1l3, t2l0, t2l1, t2l2, t2l3, t3l0, t3l1, t3l2, t3l3,
         s_rc0, s_rc1, s_rc2, s_rc3,
+        u1r0, u1r1, u1r2, u1r3, u2r0, u2r1, u2r2, u2r3,
         s_dict0, s_dict1, s_dict2, s_dict3,
         out0, out1, out2, out3,
         alpha_coeffs, vh_inv, challenges, n
