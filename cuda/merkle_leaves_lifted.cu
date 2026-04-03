@@ -47,10 +47,15 @@ __global__ void build_leaves_lifted_kernel(
     uint32_t total_bytes = 0;
 
     // Accumulate values across chunks into a 16-word message buffer.
-    // Only compress when we have a full 64-byte block (16 words) or at the end.
-    // This matches the blake2 crate's buffering semantics.
+    // Matches blake2 crate buffering: only compress a full block as non-final
+    // when more data follows. The last (possibly full) block is always final.
     uint32_t buf[16] = {0};
     uint32_t buf_pos = 0;  // words in buffer (0-16)
+
+    // Total columns across all chunks — needed to detect the last value.
+    uint32_t total_cols = 0;
+    for (uint32_t ci = 0; ci < n_chunks; ci++) total_cols += schedule[ci].n_cols;
+    uint32_t word_idx = 0;
 
     for (uint32_t chunk_idx = 0; chunk_idx < n_chunks; chunk_idx++) {
         LeafHashChunk chunk = schedule[chunk_idx];
@@ -58,9 +63,10 @@ __global__ void build_leaves_lifted_kernel(
 
         for (uint32_t c = 0; c < chunk.n_cols; c++) {
             buf[buf_pos++] = col_ptrs[chunk.col_indices[c]][row];
+            word_idx++;
 
-            if (buf_pos == 16) {
-                // Full block — compress (not final).
+            if (buf_pos == 16 && word_idx < total_cols) {
+                // Full block with more data coming — compress non-final.
                 total_bytes += 64;
                 blake2s_compress(h0, h1, h2, h3, h4, h5, h6, h7,
                                  buf[0], buf[1], buf[2], buf[3],
@@ -75,7 +81,8 @@ __global__ void build_leaves_lifted_kernel(
         }
     }
 
-    // Final compression: remaining buffered data (padded with zeros).
+    // Final compression: remaining buffered data (buf_pos words, 0-16).
+    // buf_pos == 16 when total_cols is a multiple of 16 (last block is full but final).
     total_bytes += buf_pos * 4;
     blake2s_compress(h0, h1, h2, h3, h4, h5, h6, h7,
                      buf[0], buf[1], buf[2], buf[3],

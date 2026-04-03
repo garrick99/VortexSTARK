@@ -76,6 +76,18 @@ impl Column<BaseField> for CudaColumn<BaseField> {
         BaseField::from_u32_unchecked(val[0])
     }
 
+    fn gather(&self, indices: &[usize]) -> Vec<BaseField> {
+        if indices.is_empty() { return vec![]; }
+        let idx_u32: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
+        let d_idx = DeviceBuffer::from_host(&idx_u32);
+        let mut d_out = DeviceBuffer::<u32>::alloc(indices.len());
+        unsafe {
+            ffi::cuda_gather_u32(self.buf.as_ptr(), d_idx.as_ptr(), d_out.as_mut_ptr(), indices.len() as u32);
+            ffi::cuda_device_sync();
+        }
+        d_out.to_host().into_iter().map(|v| BaseField::from_u32_unchecked(v)).collect()
+    }
+
     fn set(&mut self, index: usize, value: BaseField) {
         assert!(index < self.len);
         let val = [value.0];
@@ -274,6 +286,24 @@ impl Column<Blake2sHash> for CudaColumn<Blake2sHash> {
             bytes[i*4..i*4+4].copy_from_slice(&w.to_le_bytes());
         }
         Blake2sHash(bytes)
+    }
+
+    fn gather(&self, indices: &[usize]) -> Vec<Blake2sHash> {
+        if indices.is_empty() { return vec![]; }
+        let idx_u32: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
+        let d_idx = DeviceBuffer::from_host(&idx_u32);
+        let mut d_out = DeviceBuffer::<u32>::alloc(indices.len() * 8);
+        unsafe {
+            ffi::cuda_gather_u256(self.buf.as_ptr(), d_idx.as_ptr(), d_out.as_mut_ptr(), indices.len() as u32);
+            ffi::cuda_device_sync();
+        }
+        d_out.to_host().chunks_exact(8).map(|c| {
+            let mut bytes = [0u8; 32];
+            for (i, &w) in c.iter().enumerate() {
+                bytes[i*4..i*4+4].copy_from_slice(&w.to_le_bytes());
+            }
+            Blake2sHash(bytes)
+        }).collect()
     }
 
     fn set(&mut self, index: usize, value: Blake2sHash) {

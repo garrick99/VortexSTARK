@@ -100,21 +100,6 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
         eprintln!("[LEAVES-GPU] {} cols, lift={lifting_log_size}, {} chunks, {} leaves",
             columns.len(), schedule.len(), n_leaves);
 
-        // Fall back to CPU for very large leaf counts (>16M).
-        // The preprocessed trace (67M leaves) is a one-time cost.
-        // TODO: fix the Blake2s slow-tests heap corruption (pre-existing Windows bug).
-        if n_leaves > 16 * 1024 * 1024 {
-            eprintln!("[LEAVES-GPU] Large leaf count, using CPU fallback");
-            let cpu_columns: Vec<Vec<BaseField>> = columns.iter().map(|c| c.to_cpu()).collect();
-            let cpu_col_refs: Vec<&Vec<BaseField>> = cpu_columns.iter().collect();
-            let cpu_result = <stwo::prover::backend::CpuBackend as MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M31_OUTPUT>>>::build_leaves(
-                &cpu_col_refs, lifting_log_size,
-            );
-            let result: CudaColumn<Blake2sHash> = cpu_result.into_iter().collect();
-            eprintln!("[LEAVES-GPU] CPU fallback done in {:.3}s", t0.elapsed().as_secs_f64());
-            return result;
-        }
-
         // Collect device pointers for all columns.
         let col_ptrs: Vec<*const u32> = columns.iter().map(|c| c.buf.as_ptr()).collect();
         let d_col_ptrs = DeviceBuffer::from_host(&col_ptrs);

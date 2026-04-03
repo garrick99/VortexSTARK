@@ -489,8 +489,10 @@ unsafe extern "C" {
         out0: *mut u32, out1: *mut u32, out2: *mut u32, out3: *mut u32,
         alpha_coeffs: *const u32,
         vh_inv: *const u32,
+        trans_factor: *const u32,
         challenges: *const u32,
         n: u32,
+        blowup_step: u32,
     );
 
     pub fn cuda_cairo_quotient_chunk(
@@ -501,8 +503,10 @@ unsafe extern "C" {
         out0: *mut u32, out1: *mut u32, out2: *mut u32, out3: *mut u32,
         alpha_coeffs: *const u32,
         vh_inv: *const u32,
+        trans_factor: *const u32,
         challenges: *const u32,
         offset: u32, chunk_n: u32, global_n: u32,
+        blowup_step: u32,
     );
 
     // Fp252 test
@@ -762,6 +766,16 @@ unsafe extern "C" {
         output_hashes: *mut u32,
         n_leaves: u32,
     );
+
+    // ── Batched gather ──────────────────────────────────────────────────
+
+    /// Gather u32 elements: dst[i] = src[idx[i]]
+    /// Used for batched CudaColumn<BaseField> decommitment.
+    pub fn cuda_gather_u32(src: *const u32, idx: *const u32, dst: *mut u32, n: u32);
+
+    /// Gather 8-word (256-bit) elements: dst[i*8..+8] = src[idx[i]*8..+8]
+    /// Used for batched CudaColumn<Blake2sHash> decommitment.
+    pub fn cuda_gather_u256(src: *const u32, idx: *const u32, dst: *mut u32, n: u32);
 
     // ── Barycentric evaluation ──────────────────────────────────────────
 
