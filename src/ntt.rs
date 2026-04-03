@@ -587,11 +587,12 @@ mod tests {
         }
     }
 
-    #[test]
     /// Determine the domain point at each old NTT output position, then build the
     /// correct permutation to stwo NTT ordering.
+    /// The permutation mapping fails because old and stwo NTTs use different polynomial
+    /// bases — basis function fingerprints don't match across the two systems.
     #[test]
-    #[ignore = "diagnostic: old NTT and stwo NTT use different polynomial bases"]
+    #[should_panic(expected = "Permutation mapping failed")]
     fn test_old_to_stwo_index_mapping() {
         crate::cuda::ffi::init_memory_pool();
         let log_n = 6u32;
@@ -906,8 +907,11 @@ mod tests {
     ///    on the half_coset domain
     ///
     /// If they differ, eval_at_oods_from_coeffs is incompatible with old INTT coefficients.
+    /// Verifies that old INTT coefficients are incompatible with eval_at_oods_from_coeffs.
+    /// The assertion documents the known basis mismatch — old INTT uses a different
+    /// polynomial basis than eval_at_oods expects (use stwo INTT for OODS evaluation).
     #[test]
-    #[ignore = "diagnostic: old INTT coefficients are incompatible with eval_at_oods_from_coeffs"]
+    #[should_panic(expected = "eval_at_oods_from_coeffs")]
     fn test_old_intt_eval_at_oods_correctness() {
         use crate::oods::{OodsPoint, eval_at_oods_from_coeffs, qm31_from_m31};
         use crate::channel::Channel;

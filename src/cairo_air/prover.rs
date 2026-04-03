@@ -798,21 +798,13 @@ fn cairo_prove_cached_with_columns(
     // non-zero guarantee.  Covers half the M31 range; sufficient for ZK blinding.
     // No rejection sampling — gen::<u32>() is a single ChaCha20 word.
     //
-    // In test builds we disable ZK blinding entirely.  ZK blinding interacts with
-    // cubic step-transition constraints (e.g. c31d, c32c, c34): products of three
-    // blinded columns generate V_H² and V_H³ terms.  After dividing the constraint
-    // polynomial by V_H the quotient accumulates V_H and V_H² residuals, pushing the
-    // CFFT degree from the expected ≤n into the ~3n range.  stwo's FriVerifier rejects
-    // any last-layer polynomial whose degree exceeds the committed bound (2^log_n),
-    // so the FRI e2e test fails with LastLayerEvaluationsInvalid.  Since tests verify
-    // correctness rather than zero-knowledge, no blinding is needed there.
-    let zk_scalars: Vec<(usize, u32)> = if cfg!(test) {
-        vec![]
-    } else {
-        ZK_BLIND_COLS.iter()
-            .map(|&col| (col, (rng.random::<u32>() >> 1) + 1))
-            .collect()
-    };
+    // ZK blinding: cubic step-transition constraints produce OODS quotient degree ≤ 3N = 192.
+    // With BLOWUP_BITS=2: column_bound = 2^(log_n+2) = 256 > 192, and after 5 FRI folds
+    // the last-layer degree ≤ 192/32 = 6 < 8 = 2^LOG_LAST_LAYER_DEGREE_BOUND.
+    // FRI accepts the blinded polynomial, so blinding is unconditionally safe.
+    let zk_scalars: Vec<(usize, u32)> = ZK_BLIND_COLS.iter()
+        .map(|&col| (col, (rng.random::<u32>() >> 1) + 1))
+        .collect();
 
     // Polynomial coefficients saved during INTT — used later for OODS evaluation.
     // Indexed by global column index [0..N_COLS).
