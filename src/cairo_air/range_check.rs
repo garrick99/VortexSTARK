@@ -90,20 +90,18 @@ pub fn extract_offsets(
     trace_cols: &[Vec<u32>],
     n_steps: usize,
 ) -> (Vec<[M31; 3]>, [u32; RC_TABLE_SIZE]) {
-    use super::trace::{COL_INST_LO, COL_INST_HI};
+    use super::trace::{COL_OFF0, COL_OFF1, COL_OFF2};
 
     let mut offsets_per_row = Vec::with_capacity(n_steps);
     let mut counts = [0u32; RC_TABLE_SIZE];
 
     for i in 0..n_steps {
-        // Reconstruct the instruction from lo/hi parts
-        let inst_lo = trace_cols[COL_INST_LO][i] as u64;
-        let inst_hi = trace_cols[COL_INST_HI][i] as u64;
-        let instruction = inst_lo | (inst_hi << 31);
-
-        let off0 = (instruction & 0xFFFF) as u32;
-        let off1 = ((instruction >> 16) & 0xFFFF) as u32;
-        let off2 = ((instruction >> 32) & 0xFFFF) as u32;
+        // Read offsets directly from dedicated trace columns (off0/off1/off2 are
+        // stored as raw 16-bit values; do NOT reconstruct from inst_lo/inst_hi,
+        // because inst_hi is stored mod P and reconstruction would corrupt bit 31).
+        let off0 = trace_cols[COL_OFF0][i];
+        let off1 = trace_cols[COL_OFF1][i];
+        let off2 = trace_cols[COL_OFF2][i];
 
         offsets_per_row.push([M31(off0), M31(off1), M31(off2)]);
 

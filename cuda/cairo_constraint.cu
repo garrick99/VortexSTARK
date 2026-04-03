@@ -167,14 +167,16 @@ __global__ void cairo_quotient_kernel(
     uint32_t* __restrict__ out2, uint32_t* __restrict__ out3,
     const uint32_t* __restrict__ alpha_coeffs,  // [N_CONSTRAINTS * 4] QM31 coefficients
     const uint32_t* __restrict__ vh_inv,        // [n] 1/Z_H at each eval point (NTT order)
+    const uint32_t* __restrict__ trans_factor,  // [n] (y_eval_i - y_trace_last), zero at last trace row
     // QM31 challenges: [z_mem(4), alpha_mem(4), alpha_mem_sq(4), z_rc(4), z_dict_link(4), alpha_dict_link(4)]
     const uint32_t* __restrict__ challenges,
-    uint32_t n  // eval domain size
+    uint32_t n,            // eval domain size
+    uint32_t blowup_step  // = 1 << BLOWUP_BITS (eval positions per trace step)
 ) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
-    uint32_t next_i = (i + 4) % n;  // advance by 2^BLOWUP_BITS eval positions = 1 trace step
+    uint32_t next_i = (i + blowup_step) % n;  // advance by blowup_step eval positions = 1 trace step
 
     // Unpack QM31 challenges
     QM31 z_mem          = {{challenges[0],  challenges[1],  challenges[2],  challenges[3]}};
@@ -270,7 +272,7 @@ __global__ void cairo_quotient_kernel(
             f_pc_jnz,
             m31_mul(dst, m31_sub(next_pc, m31_add(pc, op1)))
         );
-        uint32_t c = m31_add(non_jnz, jnz_part);
+        uint32_t c = m31_mul(m31_add(non_jnz, jnz_part), trans_factor[i]);
         QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1],
                        alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
         quotient = qm31_add(quotient, qm31_mul_m31(alpha, c));
@@ -287,7 +289,7 @@ __global__ void cairo_quotient_kernel(
             ),
             m31_mul(f_call, 2)
         );
-        uint32_t c = m31_sub(next_ap, expected_ap);
+        uint32_t c = m31_mul(m31_sub(next_ap, expected_ap), trans_factor[i]);
         QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1],
                        alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
         quotient = qm31_add(quotient, qm31_mul_m31(alpha, c));
@@ -306,7 +308,7 @@ __global__ void cairo_quotient_kernel(
             ),
             m31_mul(f_ret, dst)
         );
-        uint32_t c = m31_sub(next_fp, expected_fp);
+        uint32_t c = m31_mul(m31_sub(next_fp, expected_fp), trans_factor[i]);
         QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1],
                        alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
         quotient = qm31_add(quotient, qm31_mul_m31(alpha, c));
@@ -372,7 +374,7 @@ __global__ void cairo_quotient_kernel(
     {
         uint32_t inst_size_c = m31_add(1, f_op1_imm);
         uint32_t dst_x_inv = m31_mul(dst, dst_inv);
-        uint32_t c = m31_mul(f_pc_jnz, m31_mul(m31_sub(1, dst_x_inv), m31_sub(next_pc, m31_add(pc, inst_size_c))));
+        uint32_t c = m31_mul(m31_mul(f_pc_jnz, m31_mul(m31_sub(1, dst_x_inv), m31_sub(next_pc, m31_add(pc, inst_size_c)))), trans_factor[i]);
         QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
         quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
     }
@@ -476,8 +478,8 @@ __global__ void cairo_quotient_kernel(
         QM31 c31c = qm31_sub(qm31_mul(qm31_sub(t3, t2), d2), one);
         QM31 a31c = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
         quotient = qm31_add(quotient, qm31_mul(a31c, c31c)); ci++;
-        // C31d: (S_next - T3) * d3 - 1 = 0
-        QM31 c31d = qm31_sub(qm31_mul(qm31_sub(s_next, t3), d3), one);
+        // C31d: (S_next - T3) * d3 - 1 = 0  [step-transition: multiply by trans_factor]
+        QM31 c31d = qm31_mul_m31(qm31_sub(qm31_mul(qm31_sub(s_next, t3), d3), one), trans_factor[i]);
         QM31 a31d = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
         quotient = qm31_add(quotient, qm31_mul(a31d, c31d)); ci++;
     }
@@ -498,7 +500,7 @@ __global__ void cairo_quotient_kernel(
         QM31 c32b = qm31_sub(qm31_mul(qm31_sub(u2, u1), r1), one);
         QM31 a32b = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
         quotient = qm31_add(quotient, qm31_mul(a32b, c32b)); ci++;
-        QM31 c32c = qm31_sub(qm31_mul(qm31_sub(s_next_rc, u2), r2), one);
+        QM31 c32c = qm31_mul_m31(qm31_sub(qm31_mul(qm31_sub(s_next_rc, u2), r2), one), trans_factor[i]);
         QM31 a32c = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
         quotient = qm31_add(quotient, qm31_mul(a32c, c32c)); ci++;
     }
@@ -524,7 +526,7 @@ __global__ void cairo_quotient_kernel(
                      qm31_mul(alpha_dict_link, qm31_from_m31(dict_new_v)));
         QM31 denom = qm31_sub(z_dict_link, entry);
         QM31 diff = qm31_sub(s_next_d, s_curr_d);
-        QM31 c34 = qm31_sub(qm31_mul(diff, denom), qm31_from_m31(dict_active_v));
+        QM31 c34 = qm31_mul_m31(qm31_sub(qm31_mul(diff, denom), qm31_from_m31(dict_active_v)), trans_factor[i]);
         QM31 alpha34 = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
         quotient = qm31_add(quotient, qm31_mul(alpha34, c34));
         ci++;
@@ -552,14 +554,16 @@ __global__ void cairo_quotient_chunk_kernel(
     uint32_t* __restrict__ out2, uint32_t* __restrict__ out3,
     const uint32_t* __restrict__ alpha_coeffs,
     const uint32_t* __restrict__ vh_inv,
+    const uint32_t* __restrict__ trans_factor,  // [global_n] (y_eval_i - y_trace_last), zero at last trace row
     const uint32_t* __restrict__ challenges,
-    uint32_t offset, uint32_t chunk_n, uint32_t global_n
+    uint32_t offset, uint32_t chunk_n, uint32_t global_n,
+    uint32_t blowup_step  // = 1 << BLOWUP_BITS (eval positions per trace step)
 ) {
     uint32_t local_i = blockIdx.x * blockDim.x + threadIdx.x;
     if (local_i >= chunk_n) return;
 
     uint32_t i = offset + local_i;
-    uint32_t next_i = (i + 4) % global_n;  // advance by 2^BLOWUP_BITS=4 eval positions = 1 trace step
+    uint32_t next_i = (i + blowup_step) % global_n;  // advance by blowup_step eval positions = 1 trace step
 
     QM31 z_mem           = {{challenges[0],  challenges[1],  challenges[2],  challenges[3]}};
     QM31 alpha_mem       = {{challenges[4],  challenges[5],  challenges[6],  challenges[7]}};
@@ -615,20 +619,20 @@ __global__ void cairo_quotient_chunk_kernel(
         uint32_t expected_pc = m31_add(m31_add(regular, m31_mul(f_pc_jump_abs, res)), m31_mul(f_pc_jump_rel, m31_add(pc, res)));
         uint32_t non_jnz = m31_mul(m31_sub(1, f_pc_jnz), m31_sub(next_pc, expected_pc));
         uint32_t jnz = m31_mul(f_pc_jnz, m31_mul(dst, m31_sub(next_pc, m31_add(pc, op1))));
-        uint32_t c = m31_add(non_jnz, jnz);
+        uint32_t c = m31_mul(m31_add(non_jnz, jnz), trans_factor[i]);
         QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
         quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
     }
     {
         uint32_t expected_ap = m31_add(m31_add(m31_add(ap, m31_mul(f_ap_add, res)), f_ap_add1), m31_mul(f_call, 2));
-        uint32_t c = m31_sub(next_ap, expected_ap);
+        uint32_t c = m31_mul(m31_sub(next_ap, expected_ap), trans_factor[i]);
         QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
         quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
     }
     {
         uint32_t keep = m31_sub(m31_sub(1, f_call), f_ret);
         uint32_t expected_fp = m31_add(m31_add(m31_mul(keep, fp), m31_mul(f_call, m31_add(ap, 2))), m31_mul(f_ret, dst));
-        uint32_t c = m31_sub(next_fp, expected_fp);
+        uint32_t c = m31_mul(m31_sub(next_fp, expected_fp), trans_factor[i]);
         QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
         quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
     }
@@ -684,7 +688,7 @@ __global__ void cairo_quotient_chunk_kernel(
         {
             uint32_t inst_size_c = m31_add(1, f_op1_imm);
             uint32_t dst_x_inv = m31_mul(dst, dst_inv_v);
-            uint32_t c = m31_mul(f_pc_jnz, m31_mul(m31_sub(1, dst_x_inv), m31_sub(next_pc, m31_add(pc, inst_size_c))));
+            uint32_t c = m31_mul(m31_mul(f_pc_jnz, m31_mul(m31_sub(1, dst_x_inv), m31_sub(next_pc, m31_add(pc, inst_size_c)))), trans_factor[i]);
             QM31 alpha = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
             quotient = qm31_add(quotient, qm31_mul_m31(alpha, c)); ci++;
         }
@@ -756,7 +760,7 @@ __global__ void cairo_quotient_chunk_kernel(
             QM31 delta = logup_step_delta(pc, inst_lo_v, inst_hi_v,
                                            dst_addr_v, dst, op0_addr_v, op0, op1_addr_v, op1,
                                            z_mem, alpha_mem, alpha_mem_sq);
-            QM31 c31 = qm31_sub(qm31_sub(s_next, s_curr), delta);
+            QM31 c31 = qm31_mul_m31(qm31_sub(qm31_sub(s_next, s_curr), delta), trans_factor[i]);
             QM31 alpha31 = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
             quotient = qm31_add(quotient, qm31_mul(alpha31, c31)); ci++;
         }
@@ -766,7 +770,7 @@ __global__ void cairo_quotient_chunk_kernel(
             QM31 s_curr_rc = {{s_rc0[i],      s_rc1[i],      s_rc2[i],      s_rc3[i]}};
             QM31 s_next_rc = {{s_rc0[next_i], s_rc1[next_i], s_rc2[next_i], s_rc3[next_i]}};
             QM31 delta_rc = rc_step_delta(off0_v, off1_v, off2_v, z_rc);
-            QM31 c32 = qm31_sub(qm31_sub(s_next_rc, s_curr_rc), delta_rc);
+            QM31 c32 = qm31_mul_m31(qm31_sub(qm31_sub(s_next_rc, s_curr_rc), delta_rc), trans_factor[i]);
             QM31 alpha32 = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
             quotient = qm31_add(quotient, qm31_mul(alpha32, c32)); ci++;
         }
@@ -791,7 +795,7 @@ __global__ void cairo_quotient_chunk_kernel(
                          qm31_mul(alpha_dict_link, qm31_from_m31(dict_new_v)));
             QM31 denom = qm31_sub(z_dict_link, entry);
             QM31 diff = qm31_sub(s_next_d, s_curr_d);
-            QM31 c34 = qm31_sub(qm31_mul(diff, denom), qm31_from_m31(dict_active_v));
+            QM31 c34 = qm31_mul_m31(qm31_sub(qm31_mul(diff, denom), qm31_from_m31(dict_active_v)), trans_factor[i]);
             QM31 alpha34 = {{alpha_coeffs[ci*4], alpha_coeffs[ci*4+1], alpha_coeffs[ci*4+2], alpha_coeffs[ci*4+3]}};
             quotient = qm31_add(quotient, qm31_mul(alpha34, c34)); ci++;
         }
@@ -840,8 +844,10 @@ void cuda_cairo_quotient(
     uint32_t* out0, uint32_t* out1, uint32_t* out2, uint32_t* out3,
     const uint32_t* alpha_coeffs,
     const uint32_t* vh_inv,
+    const uint32_t* trans_factor,
     const uint32_t* challenges,
-    uint32_t n
+    uint32_t n,
+    uint32_t blowup_step
 ) {
     uint32_t threads = 256;
     uint32_t blocks = (n + threads - 1) / threads;
@@ -853,7 +859,7 @@ void cuda_cairo_quotient(
         u1r0, u1r1, u1r2, u1r3, u2r0, u2r1, u2r2, u2r3,
         s_dict0, s_dict1, s_dict2, s_dict3,
         out0, out1, out2, out3,
-        alpha_coeffs, vh_inv, challenges, n
+        alpha_coeffs, vh_inv, trans_factor, challenges, n, blowup_step
     );
 }
 
@@ -868,8 +874,10 @@ void cuda_cairo_quotient_chunk(
     uint32_t* out0, uint32_t* out1, uint32_t* out2, uint32_t* out3,
     const uint32_t* alpha_coeffs,
     const uint32_t* vh_inv,
+    const uint32_t* trans_factor,
     const uint32_t* challenges,
-    uint32_t offset, uint32_t chunk_n, uint32_t global_n
+    uint32_t offset, uint32_t chunk_n, uint32_t global_n,
+    uint32_t blowup_step
 ) {
     uint32_t threads = 256;
     uint32_t blocks = (chunk_n + threads - 1) / threads;
@@ -879,8 +887,8 @@ void cuda_cairo_quotient_chunk(
         s_rc0, s_rc1, s_rc2, s_rc3,
         s_dict0, s_dict1, s_dict2, s_dict3,
         out0, out1, out2, out3,
-        alpha_coeffs, vh_inv, challenges,
-        offset, chunk_n, global_n
+        alpha_coeffs, vh_inv, trans_factor, challenges,
+        offset, chunk_n, global_n, blowup_step
     );
 }
 

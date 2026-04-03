@@ -98,7 +98,16 @@ pub fn trace_to_columns(trace: &[TraceRow], log_n: u32) -> Vec<Vec<u32>> {
         cols[COL_FP][i] = to_m31(row.fp);
 
         cols[COL_INST_LO][i] = (row.instruction & 0x7FFF_FFFF) as u32;
-        cols[COL_INST_HI][i] = ((row.instruction >> 31) & 0x7FFF_FFFF) as u32;
+        // inst_hi = (instruction >> 31) mod P.  Since 2^31 ≡ 1 mod P, the M31 value
+        // is (bits 31-61) + (bit 62), where bit 62 carries 2^31 ≡ 1.  The naive mask
+        // `& 0x7FFF_FFFF` silently drops bit 62 (flag 14 = opcode_assert), breaking
+        // constraint 30 by exactly 1 whenever that flag is set.
+        {
+            let hi_raw = row.instruction >> 31; // bits 31..63
+            let lo31   = (hi_raw & 0x7FFF_FFFF) as u32; // bits 31..61
+            let bit62  = ((hi_raw >> 31) as u32) & 1;   // bit 62 (2^62 ≡ 1 mod P)
+            cols[COL_INST_HI][i] = (crate::field::m31::M31(lo31) + crate::field::m31::M31(bit62)).0;
+        }
 
         for (j, &flag) in row.flags.iter().enumerate() {
             cols[COL_FLAGS_START + j][i] = flag;

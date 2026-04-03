@@ -171,8 +171,10 @@ fn main() {
                 q0.as_mut_ptr(), q1.as_mut_ptr(), q2.as_mut_ptr(), q3.as_mut_ptr(),
                 d_alpha.as_ptr(),
                 d_vh_inv.as_ptr(),
+                dp,  // trans_factor: dummy (step transitions not tested here)
                 d_dummy_challenges.as_ptr(),
                 eval_size as u32,
+                (1u32 << vortexstark::prover::BLOWUP_BITS),
             );
         }
         drop(d_vh_inv);

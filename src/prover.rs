@@ -58,10 +58,11 @@ fn ensure_pool_init() {
 }
 
 /// Blowup factor: evaluation domain is 2^BLOWUP_BITS times the trace domain.
-/// 4x blowup (BLOWUP_BITS=2) gives 2 bits of security per FRI query, matching
-/// STWO and other production circle STARK deployments. At 80 queries this yields
-/// ~160-bit conjectured security — comfortably above the 128-bit target.
-pub const BLOWUP_BITS: u32 = 2; // blowup factor = 4
+/// 2x blowup (BLOWUP_BITS=1) matches stwo's LOG_BLOWUP_FACTOR=1 standard.
+/// With 4x (BLOWUP_BITS=2) the 4n eval domain causes ODD×ODD circle CFFT
+/// interactions to produce CFFT components outside the V_H divisibility range,
+/// inflating the quotient degree and breaking stwo FriVerifier compatibility.
+pub const BLOWUP_BITS: u32 = 1; // blowup factor = 2 (matches stwo standard)
 
 /// Number of queries for ~160-bit security (blowup=4, 2 bits/query).
 /// Reduced from 100 to 80 to partially offset the 2x eval-domain cost.

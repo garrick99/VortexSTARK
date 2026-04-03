@@ -335,6 +335,36 @@ pub fn last_layer_poly_coeffs(mut eval: Vec<QM31>) -> Vec<QM31> {
     eval
 }
 
+/// Same as `last_layer_poly_coeffs` but without truncation — for degree diagnostics.
+#[cfg(test)]
+pub fn last_layer_poly_coeffs_full(mut eval: Vec<QM31>) -> Vec<QM31> {
+    let n = eval.len();
+    assert!(n.is_power_of_two() && n >= 2);
+    let log_n = n.ilog2();
+    bit_reverse_qm31(&mut eval, log_n);
+    let mut chunk_size = n;
+    let mut dom_log = log_n;
+    while chunk_size > 1 {
+        let domain = Coset::half_odds(dom_log);
+        let half = chunk_size / 2;
+        for chunk in eval.chunks_exact_mut(chunk_size) {
+            let (l, r) = chunk.split_at_mut(half);
+            for i in 0..half {
+                let x_inv = domain.at(i).x.inverse();
+                let tmp = l[i];
+                l[i] = tmp + r[i];
+                r[i] = (tmp - r[i]) * x_inv;
+            }
+        }
+        dom_log -= 1;
+        chunk_size = half;
+    }
+    let n_inv = M31(n as u32).inverse();
+    for v in eval.iter_mut() { *v = *v * n_inv; }
+    bit_reverse_qm31(&mut eval, log_n);
+    eval // no truncation
+}
+
 
 /// Evaluate the last-layer line polynomial at a queried index.
 ///

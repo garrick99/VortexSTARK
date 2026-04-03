@@ -277,15 +277,17 @@ impl OodsSampledValues {
 /// Evaluate the trace domain vanishing polynomial Z_H at an OODS point.
 ///
 /// For the half_coset(log_n) trace domain:
-///   Z_H(p) = double_x^{log_n}(p.x) + 1   (vanishes on all trace domain points)
+///   Z_H(p) = coset_vanishing(half_coset(log_n), p) = T_{n/2}(p.x)
+///            = double_x^{log_n - 1}(p.x)
 ///
-/// Generalises `Coset::circle_vanishing_poly_at` to QM31 inputs.
+/// This matches `Coset::coset_vanishing_at(&Coset::half_coset(log_n), p)` for M31 points.
+/// Note: circle_vanishing_poly_at = T_n(x)+1 only vanishes at n/2 trace points — wrong V_H.
 pub fn oods_vanishing(z: OodsPoint, log_n: u32) -> QM31 {
     let mut v = z.x;
-    for _ in 0..log_n {
+    for _ in 1..log_n {
         v = double_x_qm31(v);
     }
-    v + QM31::ONE
+    v
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

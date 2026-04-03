@@ -264,7 +264,7 @@ pub fn execute_to_columns(memory: &mut Memory, n_steps: usize, log_n: u32) -> Ve
             cols[COL_AP][i] = to_m31(state.ap);
             // FP is constant for simple-add, skip: cols[COL_FP][i] = to_m31(state.fp);
             cols[COL_INST_LO][i] = (encoded & 0x7FFF_FFFF) as u32;
-            cols[COL_INST_HI][i] = ((encoded >> 31) & 0x7FFF_FFFF) as u32;
+            cols[COL_INST_HI][i] = { let h = encoded >> 31; (crate::field::m31::M31((h & 0x7FFF_FFFF) as u32) + crate::field::m31::M31(((h >> 31) as u32) & 1)).0 };
             // Flags pre-filled — skip 15 writes
             cols[COL_DST_ADDR][i] = to_m31(dst_addr);
             cols[COL_DST][i] = to_m31(res);
@@ -344,7 +344,7 @@ pub fn execute_to_columns(memory: &mut Memory, n_steps: usize, log_n: u32) -> Ve
         cols[COL_AP][i] = to_m31(state.ap);
         cols[COL_FP][i] = to_m31(state.fp);
         cols[COL_INST_LO][i] = (encoded & 0x7FFF_FFFF) as u32;
-        cols[COL_INST_HI][i] = ((encoded >> 31) & 0x7FFF_FFFF) as u32;
+        cols[COL_INST_HI][i] = { let h = encoded >> 31; (crate::field::m31::M31((h & 0x7FFF_FFFF) as u32) + crate::field::m31::M31(((h >> 31) as u32) & 1)).0 };
 
         cols[COL_FLAGS_START + 0][i] = instr.dst_reg;
         cols[COL_FLAGS_START + 1][i] = instr.op0_reg;
@@ -492,7 +492,7 @@ pub fn execute_to_columns_with_hints(
         cols[COL_AP][i] = to_m31(state.ap);
         cols[COL_FP][i] = to_m31(state.fp);
         cols[COL_INST_LO][i] = (encoded & 0x7FFF_FFFF) as u32;
-        cols[COL_INST_HI][i] = ((encoded >> 31) & 0x7FFF_FFFF) as u32;
+        cols[COL_INST_HI][i] = { let h = encoded >> 31; (crate::field::m31::M31((h & 0x7FFF_FFFF) as u32) + crate::field::m31::M31(((h >> 31) as u32) & 1)).0 };
 
         cols[COL_FLAGS_START + 0][i] = instr.dst_reg;
         cols[COL_FLAGS_START + 1][i] = instr.op0_reg;
@@ -622,7 +622,7 @@ pub fn execute_to_columns_into(
         cols[COL_AP][i] = to_m31(state.ap);
         cols[COL_FP][i] = to_m31(state.fp);
         cols[COL_INST_LO][i] = (encoded & 0x7FFF_FFFF) as u32;
-        cols[COL_INST_HI][i] = ((encoded >> 31) & 0x7FFF_FFFF) as u32;
+        cols[COL_INST_HI][i] = { let h = encoded >> 31; (crate::field::m31::M31((h & 0x7FFF_FFFF) as u32) + crate::field::m31::M31(((h >> 31) as u32) & 1)).0 };
 
         cols[COL_FLAGS_START + 0][i] = instr.dst_reg;
         cols[COL_FLAGS_START + 1][i] = instr.op0_reg;

@@ -2001,19 +2001,23 @@ mod tests {
 
         let fri_config = FriConfig::new(
             crate::fri::LOG_LAST_LAYER_DEGREE_BOUND, // log_last_layer_degree_bound = 3
-            BLOWUP_BITS,                              // log_blowup_factor
+            0,                                        // log_blowup_factor=0 (blowup is folded into eval domain size via BLOWUP_BITS)
             N_QUERIES,                                // n_queries = 80
             1,                                        // line_fold_step = 1
         );
 
-        let column_bound = CirclePolyDegreeBound::new(log_n);
+        // The OODS quotient is evaluated on CanonicCoset(log_eval_size) = CanonicCoset(log_n+1).
+        // With BLOWUP_BITS=1, log_eval_size = log_n+1, so column_bound = log_n+1.
+        // CanonicCoset::new(log_n+1).circle_domain().log_size() = log_n+1 = log_eval_size ✓
+        // n_inner_layers = (log_n+1-1) - LOG_LAST_LAYER_DEGREE_BOUND = log_n-3 (=3 for log_n=6).
+        let column_bound = CirclePolyDegreeBound::new(log_n + 1);
 
-        eprintln!("FRI config: log_last_layer_degree_bound={}, BLOWUP_BITS={}, log_n={}, n_inner_layers={}",
-            crate::fri::LOG_LAST_LAYER_DEGREE_BOUND, BLOWUP_BITS, log_n,
+        eprintln!("FRI config: log_last_layer_degree_bound={}, BLOWUP_BITS={}, log_n={}, column_bound=log_n+1={}, n_inner_layers={}",
+            crate::fri::LOG_LAST_LAYER_DEGREE_BOUND, BLOWUP_BITS, log_n, log_n + 1,
             proof.fri_commitments.len());
-        eprintln!("Expected inner layers = log_n - 1 - log_last_layer_degree_bound = {} - 1 - {} = {}",
+        eprintln!("Expected inner layers = (log_n+1-1) - log_last_layer_degree_bound = {} - {} = {}",
             log_n, crate::fri::LOG_LAST_LAYER_DEGREE_BOUND,
-            log_n as i32 - 1 - crate::fri::LOG_LAST_LAYER_DEGREE_BOUND as i32);
+            log_n as i32 - crate::fri::LOG_LAST_LAYER_DEGREE_BOUND as i32);
 
         let mut fri_verifier = FriVerifier::<Blake2sMerkleChannel>::commit(
             &mut ch,
