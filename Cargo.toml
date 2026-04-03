@@ -60,4 +60,4 @@ blake2 = "0.10"
 cc = "1.2"
 
 [dev-dependencies]
-stwo = { path = "C:\\Users\\kraken\\stwo-fork\\crates\\stwo" }
+stwo = { git = "https://github.com/garrick99/stwo-fork.git", branch = "cuda-backend" }

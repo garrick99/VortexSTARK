@@ -1609,32 +1609,6 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "stwo"
 version = "2.1.0"
-dependencies = [
- "blake2",
- "blake3",
- "bytemuck",
- "cfg-if",
- "dashmap",
- "educe",
- "fnv",
- "hashbrown 0.16.1",
- "hex",
- "indexmap",
- "itertools 0.12.1",
- "num-traits",
- "rand 0.8.5",
- "serde",
- "starknet-crypto",
- "starknet-ff",
- "stwo-std-shims",
- "thiserror",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "stwo"
-version = "2.1.0"
 source = "git+https://github.com/garrick99/stwo-fork.git?branch=cuda-backend#dc0813592f34eabf490b34980a2cf8e7ca29dd62"
 dependencies = [
  "blake2",
@@ -1668,7 +1642,7 @@ dependencies = [
  "itertools 0.12.1",
  "num-traits",
  "rand 0.8.5",
- "stwo 2.1.0 (git+https://github.com/garrick99/stwo-fork.git?branch=cuda-backend)",
+ "stwo",
  "stwo-std-shims",
  "tracing",
 ]
@@ -1996,7 +1970,7 @@ dependencies = [
  "rand 0.8.5",
  "serde",
  "starknet-ff",
- "stwo 2.1.0 (git+https://github.com/garrick99/stwo-fork.git?branch=cuda-backend)",
+ "stwo",
  "stwo-constraint-framework",
  "tracing",
  "vortexstark",
@@ -2015,7 +1989,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "stwo 2.1.0",
+ "stwo",
  "tokio",
 ]
 

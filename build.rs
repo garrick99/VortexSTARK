@@ -22,8 +22,8 @@ fn main() {
                         if name.starts_with("v13.") { Some((name, e.path())) } else { None }
                     })
                     .collect();
-                versions.sort_by(|a, b| a.0.cmp(&b.0)); // lowest version first (prefer older, more compatible nvcc)
-                versions.into_iter().next().map(|(_, p)| p)
+                versions.sort_by(|a, b| a.0.cmp(&b.0)); // sort ascending, take highest
+                versions.into_iter().last().map(|(_, p)| p)
             });
         candidate.unwrap_or_else(|| cuda_base.join("v13.0"))
     } else {

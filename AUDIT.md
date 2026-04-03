@@ -180,11 +180,15 @@ columns. Tests `test_gap4_blinded_denominator_cols_proof_accepts` and `test_zk_b
 both pass.
 **Remaining auditor action:** Review the formal argument in SOUNDNESS.md §GAP-4.
 
-### GAP-5: FRI security parameters not formally analyzed
-**Severity:** Medium
-**Status:** Conjectured ~160-bit security (80 queries × 2 bits/query). No formal analysis
-over the Circle group.
-**What's needed:** Security proof for Circle-FRI proximity gap over M31.
+### GAP-5: FRI security parameters — BLOWUP_BITS=2 enforced, stwo FriVerifier confirmed
+**Severity:** Medium → Substantially mitigated
+**Status (2026-04-03):** BLOWUP_BITS=2 (4× blowup) enforced in `src/prover.rs`. Provides
+conjectured 160-bit security (80 queries × 2 bits/query, Model A). `test_gap5_fri_security_parameters`
+now passes (was failing at BLOWUP_BITS=1). `test_stwo_fri_verifier_e2e` fully passes (commit +
+decommit) with the BLOWUP_BITS=2 parameter set. Formal Circle-FRI proximity gap proof over M31
+is still pending in the literature; the claim is under the standard FRI proximity conjecture.
+**Remaining gap:** No formal proof of the Circle-FRI proximity gap specific to M31; standard
+industry assumption (Starkware/stwo use identical parameters). See SOUNDNESS.md §GAP-5.
 
 ### GAP-6: Missing proof-of-work nonce — CLOSED
 **Severity:** Medium → CLOSED

@@ -58,14 +58,14 @@ fn ensure_pool_init() {
 }
 
 /// Blowup factor: evaluation domain is 2^BLOWUP_BITS times the trace domain.
-/// 2x blowup (BLOWUP_BITS=1) matches stwo's LOG_BLOWUP_FACTOR=1 standard.
-/// With 4x (BLOWUP_BITS=2) the 4n eval domain causes ODD×ODD circle CFFT
-/// interactions to produce CFFT components outside the V_H divisibility range,
-/// inflating the quotient degree and breaking stwo FriVerifier compatibility.
-pub const BLOWUP_BITS: u32 = 1; // blowup factor = 2 (matches stwo standard)
+/// 4x blowup (BLOWUP_BITS=2) gives 2 bits/query × 80 queries = 160-bit security (Model A/C).
+/// FriVerifier compatibility: log_eval_size = log_n + BLOWUP_BITS; column_bound uses
+/// CirclePolyDegreeBound::new(log_n + BLOWUP_BITS); n_inner_layers = log_eval_size - 1 - 3.
+/// All CUDA kernels accept log_eval at runtime — no kernel recompile needed.
+pub const BLOWUP_BITS: u32 = 2; // blowup factor = 4 → 160-bit security (Model A/C)
 
 /// Number of queries for ~160-bit security (blowup=4, 2 bits/query).
-/// Reduced from 100 to 80 to partially offset the 2x eval-domain cost.
+/// 80 queries × 2 bits/query = 160 bits (Model A/C).
 pub const N_QUERIES: usize = 80;
 
 /// Proof-of-work bits required before query indices are sampled.

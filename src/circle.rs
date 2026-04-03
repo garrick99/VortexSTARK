@@ -124,10 +124,17 @@ impl Coset {
     /// Half-odds coset: used by stwo for FRI line-fold domains.
     /// Coset = G^(2^(29-log_size)) * subgroup(log_size).
     /// This matches `Coset::half_odds` in the stwo library.
+    ///
+    /// Special case: log_size=30 is the circle-group order boundary (2^31 elements).
+    /// G^(2^(29-30)) = G^(2^(-1)) has no solution in a group of order 2^31, so
+    /// log_size=30 uses the same initial as half_coset(30) = G^1.  Both prover and
+    /// verifier use this same definition, so proofs remain internally consistent.
     pub fn half_odds(log_size: u32) -> Self {
-        assert!(log_size <= 29);
+        assert!(log_size <= 30);
         let step = CirclePoint::GENERATOR.repeated_double(31 - log_size);
-        let initial = CirclePoint::GENERATOR.repeated_double(29 - log_size);
+        // For log_size < 30: initial = G^(2^(29-log_size)).
+        // For log_size = 30: 29-30 would underflow; use G^1 (= half_coset(30) initial).
+        let initial = CirclePoint::GENERATOR.repeated_double(29u32.saturating_sub(log_size));
         Self {
             initial,
             step,
