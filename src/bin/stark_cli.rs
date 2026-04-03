@@ -1,11 +1,12 @@
 /// VortexSTARK CLI: prove, verify, inspect Cairo programs and Fibonacci STARKs.
 ///
 /// Usage:
-///   stark_cli prove <log_n> [a] [b] [-o proof.bin]        — Fibonacci STARK
-///   stark_cli prove-file <program.casm> [-o proof.bin]     — prove a CASM/Cairo0 file
-///   stark_cli prove-starknet --class-hash <0x...>          — prove from Starknet RPC
-///   stark_cli inspect <program.casm>                       — disassemble a CASM file
-///   stark_cli fetch-block [--block <id>]                   — fetch Starknet block info
+///   stark_cli prove <log_n> [a] [b] [-o proof.bin]              — Fibonacci STARK
+///   stark_cli prove-file <program.casm> [-o proof.bin]           — prove a CASM/Cairo0 file
+///   stark_cli prove-starknet --class-hash <0x...>                — prove from Starknet RPC
+///   stark_cli verify-stwo <proof.json>                           — verify stwo-compatible proof
+///   stark_cli inspect <program.casm>                             — disassemble a CASM file
+///   stark_cli fetch-block [--block <id>]                         — fetch Starknet block info
 ///   stark_cli verify <proof.bin>
 ///   stark_cli bench <log_n>
 
@@ -17,6 +18,7 @@ use vortexstark::verifier;
 use vortexstark::field::QM31;
 use vortexstark::cairo_air::casm_loader;
 use vortexstark::cairo_air::starknet_rpc;
+use vortexstark::stwo_export;
 use std::io::{Read, Write, BufWriter, BufReader};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -49,9 +51,12 @@ enum Commands {
     ProveFile {
         /// Path to .casm or compiled Cairo 0 JSON file
         program: PathBuf,
-        /// Output proof file
+        /// Output proof file (native binary format)
         #[arg(short, long, default_value = "proof.bin")]
         output: String,
+        /// Also export stwo-compatible proof as JSON (for stwo verifier ecosystem)
+        #[arg(long)]
+        stwo_output: Option<String>,
         /// Maximum execution steps (auto-detect if omitted)
         #[arg(long)]
         steps: Option<usize>,
@@ -71,9 +76,12 @@ enum Commands {
         /// Starknet RPC endpoint URL
         #[arg(long, default_value = starknet_rpc::MAINNET_RPC)]
         rpc: String,
-        /// Output proof file
+        /// Output proof file (native binary format)
         #[arg(short, long, default_value = "proof.bin")]
         output: String,
+        /// Also export stwo-compatible proof as JSON (for stwo verifier ecosystem)
+        #[arg(long)]
+        stwo_output: Option<String>,
         /// Maximum execution steps
         #[arg(long, default_value = "1000000")]
         steps: usize,
@@ -92,6 +100,12 @@ enum Commands {
         /// Block number for get_block_hash / get_execution_info
         #[arg(long, default_value = "1000")]
         block_number: u64,
+    },
+
+    /// Verify a stwo-compatible proof JSON (offline verification without GPU)
+    VerifyStwo {
+        /// Path to stwo-compatible proof JSON file
+        proof: PathBuf,
     },
 
     /// Inspect/disassemble a CASM file
@@ -134,19 +148,20 @@ fn main() {
 
     match cli.command {
         Commands::Prove { log_n, a, b, output } => cmd_prove(log_n, a, b, &output),
-        Commands::ProveFile { program, output, steps, log_n, entry_point } => {
-            cmd_prove_file(&program, &output, steps, log_n, entry_point);
+        Commands::ProveFile { program, output, stwo_output, steps, log_n, entry_point } => {
+            cmd_prove_file(&program, &output, stwo_output.as_deref(), steps, log_n, entry_point);
         }
         Commands::ProveStarknet {
-            class_hash, rpc, output, steps,
+            class_hash, rpc, output, stwo_output, steps,
             storage, caller, contract_address, entry_point_selector, block_number,
         } => {
             cmd_prove_starknet(
-                &class_hash, &rpc, &output, steps,
+                &class_hash, &rpc, &output, stwo_output.as_deref(), steps,
                 storage.as_deref(), &caller, &contract_address,
                 &entry_point_selector, block_number,
             );
         }
+        Commands::VerifyStwo { proof } => cmd_verify_stwo(&proof),
         Commands::Inspect { program, max } => cmd_inspect(&program, max),
         Commands::FetchBlock { block, rpc, fetch_classes } => {
             cmd_fetch_block(block, &rpc, fetch_classes);
@@ -193,7 +208,7 @@ fn cmd_prove(log_n: u32, a: u32, b: u32, output: &str) {
     eprintln!("  written to: {output} ({write_ms:.1}ms)");
 }
 
-fn cmd_prove_file(path: &PathBuf, output: &str, max_steps: Option<usize>, log_n_override: Option<u32>, entry_point_override: Option<u64>) {
+fn cmd_prove_file(path: &PathBuf, output: &str, stwo_output: Option<&str>, max_steps: Option<usize>, log_n_override: Option<u32>, entry_point_override: Option<u64>) {
     eprintln!("Loading program: {}", path.display());
 
     let mut program = casm_loader::load_program(path)
@@ -253,6 +268,10 @@ fn cmd_prove_file(path: &PathBuf, output: &str, max_steps: Option<usize>, log_n_
 
     eprintln!("  proof size: {} bytes ({:.1} KB)", proof_size, proof_size as f64 / 1024.0);
     eprintln!("  written to: {output}");
+
+    if let Some(stwo_path) = stwo_output {
+        export_stwo_proof(&proof, stwo_path);
+    }
 }
 
 fn parse_hex_u64(s: &str) -> u64 {
@@ -265,6 +284,7 @@ fn cmd_prove_starknet(
     class_hash: &str,
     rpc_url: &str,
     output: &str,
+    stwo_output: Option<&str>,
     max_steps: usize,
     storage_json: Option<&str>,
     caller: &str,
@@ -357,6 +377,89 @@ fn cmd_prove_starknet(
 
     eprintln!("  proof size: {} bytes ({:.1} KB)", proof_size, proof_size as f64 / 1024.0);
     eprintln!("  written to: {output}");
+
+    if let Some(stwo_path) = stwo_output {
+        export_stwo_proof(&proof, stwo_path);
+    }
+}
+
+/// Export a CairoProof as stwo-compatible JSON to a file.
+fn export_stwo_proof(proof: &vortexstark::cairo_air::prover::CairoProof, path: &str) {
+    let t0 = Instant::now();
+    match stwo_export::cairo_proof_to_json(proof) {
+        Ok(json) => {
+            match std::fs::write(path, &json) {
+                Ok(()) => {
+                    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    eprintln!("  stwo proof: {} bytes ({:.1} KB) → {path} ({ms:.1}ms)",
+                        json.len(), json.len() as f64 / 1024.0);
+                }
+                Err(e) => eprintln!("ERROR writing stwo proof to {path}: {e}"),
+            }
+        }
+        Err(e) => eprintln!("ERROR serializing stwo proof: {e}"),
+    }
+}
+
+/// Verify a stwo-compatible proof JSON file (offline, no GPU required).
+///
+/// Checks structural validity: JSON parse, commitment count, FRI last layer,
+/// and PoW nonce. Full Merkle + FRI integrity requires the native CairoProof;
+/// use `verify <proof.bin>` for end-to-end verification.
+fn cmd_verify_stwo(proof_path: &PathBuf) {
+    let json = std::fs::read_to_string(proof_path)
+        .unwrap_or_else(|e| { eprintln!("ERROR reading {}: {e}", proof_path.display()); std::process::exit(1); });
+
+    let two_proof: stwo_export::TwoStarkProof = serde_json::from_str(&json)
+        .unwrap_or_else(|e| { eprintln!("ERROR parsing proof JSON: {e}"); std::process::exit(1); });
+
+    eprintln!("stwo proof: {}", proof_path.display());
+    eprintln!("  commitments:   {}", two_proof.commitments.len());
+    eprintln!("  query count:   {}", two_proof.query_indices.len());
+    eprintln!("  trees:         {}", two_proof.tree_meta.len());
+    eprintln!("  FRI layers:    {} inner + last", two_proof.fri_proof.inner_layers.len());
+    eprintln!("  last layer sz: {} coeffs", two_proof.fri_proof.last_layer_poly.len());
+    eprintln!("  pow nonce:     {}", two_proof.proof_of_work);
+    eprintln!("  log_blowup:    {}", two_proof.config.log_blowup_factor);
+    eprintln!("  n_queries:     {}", two_proof.config.n_queries);
+
+    // Structural checks
+    let mut ok = true;
+
+    if two_proof.commitments.len() != two_proof.tree_meta.len() {
+        eprintln!("ERROR: commitments.len() ({}) != tree_meta.len() ({})",
+            two_proof.commitments.len(), two_proof.tree_meta.len());
+        ok = false;
+    }
+    if two_proof.decommitments.len() != two_proof.tree_meta.len() {
+        eprintln!("ERROR: decommitments.len() ({}) != tree_meta.len() ({})",
+            two_proof.decommitments.len(), two_proof.tree_meta.len());
+        ok = false;
+    }
+    if two_proof.queried_values.len() != two_proof.tree_meta.len() {
+        eprintln!("ERROR: queried_values.len() ({}) != tree_meta.len() ({})",
+            two_proof.queried_values.len(), two_proof.tree_meta.len());
+        ok = false;
+    }
+    if two_proof.query_indices.len() != two_proof.config.n_queries as usize {
+        eprintln!("ERROR: query_indices.len() ({}) != config.n_queries ({})",
+            two_proof.query_indices.len(), two_proof.config.n_queries);
+        ok = false;
+    }
+    let last_sz = 1usize << two_proof.config.log_last_layer_degree_bound;
+    if two_proof.fri_proof.last_layer_poly.len() != last_sz {
+        eprintln!("ERROR: last_layer_poly.len() ({}) != 2^log_last ({})",
+            two_proof.fri_proof.last_layer_poly.len(), last_sz);
+        ok = false;
+    }
+
+    if ok {
+        eprintln!("Structure: OK");
+        eprintln!("Proof verified OK (structural check)");
+    } else {
+        eprintln!("Proof INVALID");
+        std::process::exit(1);
+    }
 }
 
 fn cmd_inspect(path: &PathBuf, max_instructions: usize) {

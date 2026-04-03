@@ -534,7 +534,13 @@ fn get_constraint_quotients_inputs_cuda<'a>(
             component_polys.map_cols(|c| Cow::Borrowed(&c.evals))
         }
         EvaluationMode::SubDomain { log_expansion: _ } => {
-            unimplemented!("SubDomain with log_expansion > 0 not yet supported")
+            // Extend polynomial evaluations to the larger sub-domain via GPU NTT.
+            // Same path as ExtendToEvalDomain: interpolate → evaluate at eval_domain.
+            let _span = span!(Level::INFO, "CUDA SubDomain Extension").entered();
+            let twiddles = CudaBackend::precompute_twiddles(eval_domain.half_coset);
+            component_polys.as_cols_ref().map_cols(|col| {
+                Cow::Owned(col.get_evaluation_on_domain(eval_domain, &twiddles))
+            })
         }
         EvaluationMode::ExtendToEvalDomain => {
             let _span = span!(Level::INFO, "CUDA Constraint Extension").entered();

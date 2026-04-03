@@ -15,6 +15,38 @@ use stwo::prover::lookups::utils::UnivariatePoly;
 
 use super::CudaBackend;
 
+/// Convert a `Layer<CpuBackend>` to `Layer<CudaBackend>` by uploading MLE data to GPU.
+fn layer_to_cuda(layer: Layer<CpuBackend>) -> Layer<CudaBackend> {
+    match layer {
+        Layer::GrandProduct(mle) => {
+            let data: Vec<SecureField> = mle.to_cpu();
+            Layer::GrandProduct(Mle::new(data.into_iter().collect()))
+        }
+        Layer::LogUpGeneric { numerators, denominators } => {
+            let num: Vec<SecureField> = numerators.to_cpu();
+            let den: Vec<SecureField> = denominators.to_cpu();
+            Layer::LogUpGeneric {
+                numerators:   Mle::new(num.into_iter().collect()),
+                denominators: Mle::new(den.into_iter().collect()),
+            }
+        }
+        Layer::LogUpMultiplicities { numerators, denominators } => {
+            let num: Vec<BaseField>   = numerators.to_cpu();
+            let den: Vec<SecureField> = denominators.to_cpu();
+            Layer::LogUpMultiplicities {
+                numerators:   Mle::new(num.into_iter().collect()),
+                denominators: Mle::new(den.into_iter().collect()),
+            }
+        }
+        Layer::LogUpSingles { denominators } => {
+            let den: Vec<SecureField> = denominators.to_cpu();
+            Layer::LogUpSingles {
+                denominators: Mle::new(den.into_iter().collect()),
+            }
+        }
+    }
+}
+
 impl MleOps<BaseField> for CudaBackend {
     fn fix_first_variable(
         mle: Mle<Self, BaseField>,
@@ -50,19 +82,22 @@ impl GkrOps for CudaBackend {
         Mle::new(data.into_iter().collect())
     }
 
-    fn next_layer(_layer: &Layer<Self>) -> Layer<Self> {
-        // Convert GPU layer → CPU layer, compute, convert back
-        // This requires downloading MLE data and re-uploading.
-        // For now, use todo!() — this needs per-variant conversion logic.
-        todo!("GkrOps::next_layer — needs Layer<CudaBackend> → Layer<CpuBackend> conversion")
+    fn next_layer(layer: &Layer<Self>) -> Layer<Self> {
+        // CPU fallback: download MLE data, run CPU GKR logic, upload result.
+        // GKR is called once per layer reduction (O(log n) times), so the
+        // download/upload overhead is acceptable compared to NTT/FRI cost.
+        let cpu_layer = layer.to_cpu();
+        let next_cpu = CpuBackend::next_layer(&cpu_layer);
+        layer_to_cuda(next_cpu)
     }
 
     fn sum_as_poly_in_first_variable(
-        _h: &GkrMultivariatePolyOracle<'_, Self>,
-        _claim: SecureField,
+        h: &GkrMultivariatePolyOracle<'_, Self>,
+        claim: SecureField,
     ) -> UnivariatePoly<SecureField> {
-        // This operates on GkrMultivariatePolyOracle which references Layer<CudaBackend>.
-        // Converting the oracle to CPU form requires deep access to its internals.
-        todo!("GkrOps::sum_as_poly_in_first_variable — needs oracle conversion")
+        // CPU fallback: GkrMultivariatePolyOracle::to_cpu() downloads eq_evals
+        // and input_layer, then CpuBackend evaluates the sum polynomial.
+        let cpu_oracle = h.to_cpu();
+        CpuBackend::sum_as_poly_in_first_variable(&cpu_oracle, claim)
     }
 }
