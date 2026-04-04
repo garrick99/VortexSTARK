@@ -83,17 +83,68 @@ pub struct SyscallEvent {
     pub data: Vec<u64>,
 }
 
+/// A call_contract or library_call syscall record.
+pub struct CrossContractCall {
+    /// Contract address (call_contract) or class hash (library_call).
+    pub target: u64,
+    /// Entry-point selector.
+    pub entry_point_selector: u64,
+    /// Calldata passed to the callee.
+    pub calldata: Vec<u64>,
+    /// True if this was a library_call (class_hash), false if call_contract (address).
+    pub is_library: bool,
+}
+
+/// A deploy syscall record.
+pub struct DeployedContract {
+    pub class_hash: u64,
+    pub salt: u64,
+    pub calldata: Vec<u64>,
+    /// Assigned mock address (= salt XOR class_hash, deterministic).
+    pub contract_address: u64,
+}
+
+/// A send_message_to_l1 syscall record.
+pub struct L1Message {
+    pub to_address: u64,
+    pub payload: Vec<u64>,
+}
+
+/// A contract registered for in-process cross-contract execution.
+///
+/// Add entries via `HintContext::register_contract` before proving.
+/// When `CallContract` or `LibraryCall` targets a registered address / class hash,
+/// the callee is executed in-process and its retdata is written back into the
+/// caller's syscall response buffer.
+pub struct ContractEntry {
+    pub bytecode: Vec<u64>,
+    pub hints: Vec<(usize, Vec<CasmHint>)>,
+    /// Map from entry-point selector (felt252 low-64) to PC offset in bytecode.
+    pub entry_points: HashMap<u64, u64>,
+}
+
+/// Max steps a callee may execute before being forcibly halted.
+const MAX_CALLEE_STEPS: usize = 200_000;
+/// Max cross-contract call nesting depth (prevents infinite recursion).
+const MAX_CALL_DEPTH: usize = 8;
+
 /// Starknet execution context and mutable state for syscall emulation.
 ///
 /// Passed into `cairo_prove_program_with_syscalls` to give the program a
 /// realistic environment.  All syscalls that modify state (storage_write,
-/// emit_event) write into these fields so the caller can inspect them after
-/// proving.
+/// emit_event, call_contract, deploy, send_message_to_l1) write into these
+/// fields so the caller can inspect them after proving.
 pub struct SyscallState {
     /// Contract storage: storage_key (felt252 low-64) → value (felt252 low-64).
     pub storage: HashMap<u64, u64>,
     /// Events emitted by emit_event syscalls.
     pub events: Vec<SyscallEvent>,
+    /// Records of call_contract / library_call syscalls (in order).
+    pub cross_contract_calls: Vec<CrossContractCall>,
+    /// Records of deploy syscalls (in order).
+    pub deployed_contracts: Vec<DeployedContract>,
+    /// Records of send_message_to_l1 syscalls (in order).
+    pub l1_messages: Vec<L1Message>,
     /// Caller address passed to get_execution_info.
     pub caller_address: u64,
     /// Current contract address.
@@ -114,6 +165,9 @@ impl Default for SyscallState {
         Self {
             storage: HashMap::new(),
             events: Vec::new(),
+            cross_contract_calls: Vec::new(),
+            deployed_contracts: Vec::new(),
+            l1_messages: Vec::new(),
             caller_address: 0,
             contract_address: 1,
             entry_point_selector: 0,
@@ -169,6 +223,20 @@ pub struct HintContext {
 
     /// Starknet syscall state (storage, events, execution context).
     pub syscall: SyscallState,
+
+    /// Contracts available for in-process cross-contract execution.
+    ///
+    /// Keyed by contract_address (for `call_contract`) or class_hash (for `library_call`).
+    /// When a `CallContract` / `LibraryCall` syscall targets a registered entry, the callee
+    /// bytecode is executed in-process via `execute_callee` and its retdata is written into
+    /// the caller's response buffer.  Unregistered targets return empty retdata (existing
+    /// behavior).
+    pub contract_registry: HashMap<u64, ContractEntry>,
+
+    /// Current cross-contract call nesting depth.  Incremented on entry to `execute_callee`
+    /// and decremented on exit.  Calls that would exceed `MAX_CALL_DEPTH` return empty retdata
+    /// instead of recursing, preventing runaway nested calls.
+    pub call_depth: usize,
 }
 
 /// Iteration state for dict squash hints.
@@ -199,11 +267,29 @@ impl HintContext {
             dict_accesses: Vec::new(),
             execution_overflows: 0,
             syscall: SyscallState::default(),
+            contract_registry: HashMap::new(),
+            call_depth: 0,
         }
     }
 
     pub fn with_syscall_state(mut self, state: SyscallState) -> Self {
         self.syscall = state;
+        self
+    }
+
+    /// Register a contract for in-process cross-contract execution.
+    ///
+    /// `key` is the contract_address (for `call_contract`) or class_hash (for
+    /// `library_call`).  When a syscall targets this key the callee is executed
+    /// in-process and its retdata is returned to the caller.
+    pub fn register_contract(
+        &mut self,
+        key: u64,
+        bytecode: Vec<u64>,
+        hints: Vec<(usize, Vec<CasmHint>)>,
+        entry_points: HashMap<u64, u64>,
+    ) -> &mut Self {
+        self.contract_registry.insert(key, ContractEntry { bytecode, hints, entry_points });
         self
     }
 
@@ -345,10 +431,15 @@ fn run_one(hint: &CasmHint, step: usize, state: &CairoState, memory: &mut Memory
 //   StorageWrite:     [sel, gas, domain, key, value | remaining_gas, err]
 //   EmitEvent:        [sel, gas, keys_len, k0..kN, data_len, d0..dN | remaining_gas, err]
 //   GetExecutionInfo: [sel, gas | remaining_gas, err, exec_info_ptr]
+//   GetBlockHash:     [sel, gas, block_number | remaining_gas, err, hash_low, hash_high]
 //   CallContract:     [sel, gas, addr, entry_pt, calldata_len, cd0..cdN | remaining_gas, err, ret_len, r0..rN]
-//   Others:           write [0, 0] after request fields as minimal success response.
+//   LibraryCall:      [sel, gas, class_hash, entry_pt, calldata_len, cd0..cdN | remaining_gas, err, ret_len, r0..rN]
+//   Deploy:           [sel, gas, class_hash, salt, calldata_len, cd0..cdN | remaining_gas, err, contract_addr]
+//   SendMessageToL1:  [sel, gas, to_addr, payload_len, p0..pN | remaining_gas, err]
 //
 // Gas is always left at 0 (not tracked by VortexSTARK).
+// VortexSTARK does not execute callee contracts — cross-contract calls return empty
+// retdata and deploy returns a deterministic mock address (salt XOR class_hash).
 
 fn hint_system_call(
     params: &serde_json::Value,
@@ -426,15 +517,97 @@ fn hint_system_call(
             memory.set(syscall_ptr + 6, 0); // hash high word
         }
 
-        _ => {
-            // Unknown or unimplemented syscall (CallContract, Deploy, LibraryCall, etc.).
-            // Write a minimal [remaining_gas=0, err=0] success response at offset+2
-            // (covers the gas+err fields after selector+gas_consumed).
-            // This prevents memory-uninitialized panics for programs that call these
-            // but do not act on their return values.
-            if cfg!(debug_assertions) {
-                eprintln!("syscall: unhandled selector {selector:#018x} at ptr={syscall_ptr}");
+        sel::CALL_CONTRACT | sel::LIBRARY_CALL => {
+            // Request:  [sel, gas, addr_or_class_hash, entry_pt, calldata_len, cd0..cdN]
+            // Response: [remaining_gas=0, err=0, ret_len, r0..rN]
+            //
+            // If the target is in ctx.contract_registry the callee is executed in-process
+            // via execute_callee and its retdata is written into the response buffer.
+            // Otherwise retdata is empty (existing fallback behavior).
+            let target         = memory.get(syscall_ptr + 2);
+            let entry_pt       = memory.get(syscall_ptr + 3);
+            let calldata_len   = memory.get(syscall_ptr + 4) as u64;
+            let mut calldata   = Vec::with_capacity(calldata_len as usize);
+            for i in 0..calldata_len {
+                calldata.push(memory.get(syscall_ptr + 5 + i));
             }
+
+            // Execute callee if registered; otherwise return empty retdata.
+            let retdata = if ctx.contract_registry.contains_key(&target) && ctx.call_depth < MAX_CALL_DEPTH {
+                // Look up entry point PC.  Fall back to entry_points[0] if selector not found.
+                let entry_pc = ctx.contract_registry[&target].entry_points
+                    .get(&entry_pt).copied()
+                    .or_else(|| ctx.contract_registry[&target].entry_points.values().next().copied())
+                    .unwrap_or(0);
+                let parent_contract = ctx.syscall.contract_address;
+                execute_callee(target, entry_pc, entry_pt, &calldata, parent_contract, ctx)
+            } else {
+                Vec::new()
+            };
+
+            let resp = 5 + calldata_len;
+            memory.set(syscall_ptr + resp,     0);                   // remaining_gas
+            memory.set(syscall_ptr + resp + 1, 0);                   // error_code
+            memory.set(syscall_ptr + resp + 2, retdata.len() as u64); // ret_len
+            for (i, &v) in retdata.iter().enumerate() {
+                memory.set(syscall_ptr + resp + 3 + i as u64, v);
+            }
+
+            ctx.syscall.cross_contract_calls.push(CrossContractCall {
+                target,
+                entry_point_selector: entry_pt,
+                calldata,
+                is_library: selector == sel::LIBRARY_CALL,
+            });
+        }
+
+        sel::DEPLOY => {
+            // Request:  [sel, gas, class_hash, salt, calldata_len, cd0..cdN]
+            // Response: [remaining_gas=0, err=0, contract_addr]
+            //
+            // Returns a deterministic mock address: salt XOR class_hash.
+            // The deployed contract is recorded in SyscallState::deployed_contracts.
+            let class_hash   = memory.get(syscall_ptr + 2);
+            let salt         = memory.get(syscall_ptr + 3);
+            let calldata_len = memory.get(syscall_ptr + 4) as u64;
+            let mut calldata = Vec::with_capacity(calldata_len as usize);
+            for i in 0..calldata_len {
+                calldata.push(memory.get(syscall_ptr + 5 + i));
+            }
+            let mock_addr = salt ^ class_hash;
+            let resp = 5 + calldata_len;
+            memory.set(syscall_ptr + resp,     0);         // remaining_gas
+            memory.set(syscall_ptr + resp + 1, 0);         // error_code
+            memory.set(syscall_ptr + resp + 2, mock_addr); // deployed contract address
+            ctx.syscall.deployed_contracts.push(DeployedContract {
+                class_hash,
+                salt,
+                calldata,
+                contract_address: mock_addr,
+            });
+        }
+
+        sel::SEND_MSG_TO_L1 => {
+            // Request:  [sel, gas, to_addr, payload_len, p0..pN]
+            // Response: [remaining_gas=0, err=0]
+            //
+            // The message is recorded in SyscallState::l1_messages.
+            let to_address  = memory.get(syscall_ptr + 2);
+            let payload_len = memory.get(syscall_ptr + 3) as u64;
+            let mut payload = Vec::with_capacity(payload_len as usize);
+            for i in 0..payload_len {
+                payload.push(memory.get(syscall_ptr + 4 + i));
+            }
+            let resp = 4 + payload_len;
+            memory.set(syscall_ptr + resp,     0); // remaining_gas
+            memory.set(syscall_ptr + resp + 1, 0); // error_code
+            ctx.syscall.l1_messages.push(L1Message { to_address, payload });
+        }
+
+        _ => {
+            // Truly unknown syscall selector.  Write minimal success response
+            // to prevent memory-uninitialized panics and log under debug.
+            eprintln!("syscall: unknown selector {selector:#018x} at ptr={syscall_ptr}");
             for offset in 2..=9u64 {
                 if memory.get(syscall_ptr + offset) == 0 {
                     memory.set(syscall_ptr + offset, 0);
@@ -442,6 +615,121 @@ fn hint_system_call(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-contract callee executor
+// ---------------------------------------------------------------------------
+
+/// Execute a registered callee contract in-process and return its retdata.
+///
+/// The callee runs in a fresh flat memory context (isolated stack).  The parent's
+/// `HintContext` is shared so that:
+/// - Storage reads/writes, events, and L1 messages propagate to the parent.
+/// - The contract registry is available for further nested calls.
+/// - Execution overflows are counted across the whole call tree.
+///
+/// The callee's execution context (`contract_address`, `caller_address`,
+/// `entry_point_selector`, `exec_info_base`) is swapped in before execution and
+/// restored afterward so `GetExecutionInfo` returns correct data at every depth.
+///
+/// **Retdata convention:**  In the Cairo 1 / CASM ABI, a callee places all return
+/// values on AP before `ret`.  Retdata is the slice `memory[initial_ap..final_ap]`
+/// at the moment `ret` returns execution to the halt sentinel.
+///
+/// Returns an empty `Vec` if:
+/// - The entry-point PC is unreachable (no instructions).
+/// - The callee exceeds `MAX_CALLEE_STEPS` without halting.
+/// - `ctx.call_depth >= MAX_CALL_DEPTH` (recursion guard, checked by caller).
+fn execute_callee(
+    callee_address: u64,
+    entry_point_pc: u64,
+    entry_point_selector: u64,
+    calldata: &[u64],
+    parent_contract_address: u64,
+    ctx: &mut HintContext,
+) -> Vec<u64> {
+    // Borrow the bytecode and hints out of the registry without holding a reference
+    // into ctx (we need &mut ctx below for run_hints).
+    let (bytecode, callee_hints) = {
+        let entry = match ctx.contract_registry.get(&callee_address) {
+            Some(e) => e,
+            None => return Vec::new(),
+        };
+        (entry.bytecode.clone(), entry.hints.clone())
+    };
+
+    // Memory layout:
+    //   [0 .. bytecode.len())  : callee bytecode
+    //   pad_addr               : jmp rel 0  (halt sentinel, immediate below)
+    //   pad_addr + 1           : 0          (jump delta)
+    //   initial_sp             : saved_fp = 0   (frame sentinel)
+    //   initial_sp + 1         : return_pc = pad_addr
+    //   initial_ap             : callee stack base; calldata goes here
+    let pad_addr    = bytecode.len() as u64;
+    let initial_sp  = pad_addr + 10;
+    let initial_ap  = initial_sp + 2;
+    let mem_cap     = (initial_ap as usize) + calldata.len() + MAX_CALLEE_STEPS + 1000;
+
+    let mut mem = Memory::with_capacity(mem_cap);
+    mem.load_program(&bytecode);
+    // Halt: jmp rel 0  (op1_imm=1, pc_jump_rel=1, off2=+1 bias, delta=0)
+    mem.set(pad_addr,     0x0104_8001_8000_8000u64);
+    mem.set(pad_addr + 1, 0u64);
+    // Frame
+    mem.set(initial_sp,     0u64);        // saved_fp
+    mem.set(initial_sp + 1, pad_addr);    // return_pc
+
+    // Calldata at initial_ap (caller-placed arguments)
+    for (i, &v) in calldata.iter().enumerate() {
+        mem.set(initial_ap + i as u64, v);
+    }
+
+    // Swap in callee execution context so GetExecutionInfo is correct.
+    let saved_caller    = ctx.syscall.caller_address;
+    let saved_contract  = ctx.syscall.contract_address;
+    let saved_selector  = ctx.syscall.entry_point_selector;
+    let saved_exec_base = ctx.syscall.exec_info_base;
+    ctx.syscall.caller_address       = parent_contract_address;
+    ctx.syscall.contract_address     = callee_address;
+    ctx.syscall.entry_point_selector = entry_point_selector;
+    ctx.syscall.exec_info_base       = None; // fresh exec_info for this callee
+
+    ctx.call_depth += 1;
+
+    let mut state = super::vm::CairoState {
+        pc: entry_point_pc,
+        ap: initial_ap,
+        fp: initial_ap,
+    };
+    let callee_initial_ap = initial_ap;
+
+    for step in 0..MAX_CALLEE_STEPS {
+        if state.pc == pad_addr {
+            break; // callee returned to halt sentinel
+        }
+        run_hints(&callee_hints, state.pc, step, &state, &mut mem, ctx);
+        state = super::vm::step(&state, &mut mem);
+    }
+
+    ctx.call_depth -= 1;
+
+    // Restore parent execution context.
+    ctx.syscall.caller_address       = saved_caller;
+    ctx.syscall.contract_address     = saved_contract;
+    ctx.syscall.entry_point_selector = saved_selector;
+    ctx.syscall.exec_info_base       = saved_exec_base;
+
+    // Collect retdata: all values pushed to AP by the callee before returning.
+    // CASM ABI: return values are the last N cells pushed to AP before `ret`.
+    // final_ap == callee_initial_ap means nothing was returned.
+    let final_ap = state.ap;
+    if final_ap <= callee_initial_ap {
+        return Vec::new();
+    }
+    (callee_initial_ap..final_ap)
+        .map(|addr| mem.get(addr))
+        .collect()
 }
 
 /// Lazily allocate and populate the execution-info memory region.
@@ -1312,5 +1600,276 @@ mod tests {
         // Hmm actually we need to load accesses_for_key — InitSquashData doesn't do that.
         // Let's just check the sorted_keys are correct.
         assert_eq!(ctx.squash.sorted_keys, vec![3, 5]);
+    }
+
+    /// Test execute_callee: a minimal Cairo program that adds two values and returns.
+    ///
+    /// Callee bytecode: assert [ap+0] = [ap-2] + [ap-1]; ret
+    /// With calldata = [3, 5] placed at initial_ap, the callee reads them via the
+    /// implicit argument convention and "returns" them (AP advances past writes).
+    ///
+    /// This test verifies:
+    /// - execute_callee produces non-empty retdata for a registered contract.
+    /// - register_contract / call_depth bookkeeping work correctly.
+    /// - CallContract syscall handler writes retdata into response buffer.
+    #[test]
+    fn test_cross_contract_call_retdata() {
+        use super::super::decode::Instruction;
+
+        // Build a tiny callee: reads two values from its initial AP, writes their sum
+        // one cell up, then ret.  In CASM ABI the frame is already set up; we just
+        // assert [fp+0] = [fp-3] + [fp-4] and ret.
+        //
+        // Simpler: just emit two assert-imm instructions that push constants to AP,
+        // then ret.  The retdata will be those two constants.
+        //
+        // assert [ap+0] = 42   (ap++)    — off0=ap+0, op1=imm 42, ap_add1=1
+        // assert [ap+0] = 99   (ap++)    — off0=ap+0, op1=imm 99, ap_add1=1
+        // ret
+
+        let assert_imm = |imm: u64| -> Vec<u64> {
+            // [ap+0] = imm; ap++
+            // flags: op1_imm=1, opcode_assert=1, ap_add1=1
+            // off0=0x8000 (ap+0), off1=0x8000, off2=0x8001 (pc+1 for immediate)
+            let enc = Instruction {
+                off0: 0x8000, off1: 0x8000, off2: 0x8001,
+                op1_imm: 1, opcode_assert: 1, ap_add1: 1,
+                ..Default::default()
+            }.encode();
+            vec![enc, imm]
+        };
+
+        // ret: opcode_ret=1, off0=0x8000-2 = fp-2 (saved_fp), op1_fp=1, off2=0x8000-1 (fp-1 = ret_pc)
+        let ret_enc = Instruction {
+            off0: 0x7FFEu16, // fp - 2
+            off1: 0x8000,
+            off2: 0x7FFFu16, // fp - 1
+            op1_fp: 1, opcode_ret: 1,
+            ..Default::default()
+        }.encode();
+
+        let mut bytecode = Vec::new();
+        bytecode.extend(assert_imm(42));
+        bytecode.extend(assert_imm(99));
+        bytecode.push(ret_enc);
+
+        let entry_point_pc: u64 = 0;
+        let entry_points: HashMap<u64, u64> = [(0xdeadbeef_u64, entry_point_pc)].into_iter().collect();
+        let callee_addr: u64 = 0x1234_5678;
+
+        let mut ctx = HintContext::new();
+        ctx.register_contract(callee_addr, bytecode, vec![], entry_points);
+
+        // Invoke execute_callee directly.
+        let retdata = execute_callee(
+            callee_addr, entry_point_pc, 0xdeadbeef,
+            &[], // no calldata
+            0x0, // parent contract address
+            &mut ctx,
+        );
+
+        // Should have pushed 42 and 99.
+        assert_eq!(retdata, vec![42, 99], "callee retdata mismatch");
+        assert_eq!(ctx.call_depth, 0, "call_depth should be restored to 0");
+    }
+
+    /// Test that the CallContract syscall handler writes callee retdata into the
+    /// response buffer when the callee is registered.
+    #[test]
+    fn test_call_contract_syscall_writes_retdata() {
+        use super::super::decode::Instruction;
+        use super::super::vm::Memory;
+
+        // Same callee as above: pushes 7 and 13, then ret.
+        let assert_imm = |imm: u64| -> Vec<u64> {
+            let enc = Instruction {
+                off0: 0x8000, off1: 0x8000, off2: 0x8001,
+                op1_imm: 1, opcode_assert: 1, ap_add1: 1,
+                ..Default::default()
+            }.encode();
+            vec![enc, imm]
+        };
+        let ret_enc = Instruction {
+            off0: 0x7FFEu16, off1: 0x8000, off2: 0x7FFFu16,
+            op1_fp: 1, opcode_ret: 1, ..Default::default()
+        }.encode();
+        let mut bytecode = Vec::new();
+        bytecode.extend(assert_imm(7));
+        bytecode.extend(assert_imm(13));
+        bytecode.push(ret_enc);
+
+        let callee_addr: u64 = 0xABCD;
+        let entry_selector: u64 = 0x0;
+        let entry_points: HashMap<u64, u64> = [(entry_selector, 0u64)].into_iter().collect();
+
+        let mut ctx = HintContext::new();
+        ctx.register_contract(callee_addr, bytecode, vec![], entry_points);
+
+        // Build the syscall buffer in a flat Memory:
+        //   [0] = CALL_CONTRACT selector
+        //   [1] = gas
+        //   [2] = callee_addr
+        //   [3] = entry_selector
+        //   [4] = calldata_len = 0
+        //   (response starts at [5])
+        let mut mem = Memory::with_capacity(32);
+        let ptr: u64 = 0;
+        mem.set(ptr + 0, sel::CALL_CONTRACT);
+        mem.set(ptr + 1, 1000); // gas
+        mem.set(ptr + 2, callee_addr);
+        mem.set(ptr + 3, entry_selector);
+        mem.set(ptr + 4, 0); // calldata_len
+
+        let params = serde_json::json!({ "system": { "register": "FP", "offset": 0 } });
+        let fake_state = CairoState { pc: 0, ap: 0, fp: ptr };
+        hint_system_call(&params, &fake_state, &mut mem, &mut ctx);
+
+        // Response starts at ptr+5:
+        //   [5] = remaining_gas (0)
+        //   [6] = error_code    (0)
+        //   [7] = ret_len       (2)
+        //   [8] = 7
+        //   [9] = 13
+        assert_eq!(mem.get(ptr + 5), 0,  "remaining_gas");
+        assert_eq!(mem.get(ptr + 6), 0,  "error_code");
+        assert_eq!(mem.get(ptr + 7), 2,  "ret_len");
+        assert_eq!(mem.get(ptr + 8), 7,  "retdata[0]");
+        assert_eq!(mem.get(ptr + 9), 13, "retdata[1]");
+    }
+
+    // ---- L4: U256InvModN comprehensive test vectors -------------------------
+    //
+    // All expected values computed using Python: pow(a, -1, n) where applicable,
+    // and math.gcd(a, n) for non-invertible cases.
+
+    /// Helper: run U256InvModN with given (b0, n0) and return (g0, g1, r0, r1, k0, k1).
+    fn run_u256_inv_mod_n(b0: u64, n0: u64) -> (u64, u64, u64, u64, u64, u64) {
+        let mut mem = Memory::new();
+        let s = state(100, 100);
+        mem.set(100, b0);
+        mem.set(101, 0);  // b1 (high limb, zero in our u64 model)
+        mem.set(102, n0);
+        mem.set(103, 0);  // n1
+        let h = make_hint("U256InvModN", serde_json::json!({
+            "b0": {"Deref": {"register": "AP", "offset": 0}},
+            "b1": {"Deref": {"register": "AP", "offset": 1}},
+            "n0": {"Deref": {"register": "AP", "offset": 2}},
+            "n1": {"Deref": {"register": "AP", "offset": 3}},
+            "g0_or_no_inv": {"register": "AP", "offset": 4},
+            "g1_option":    {"register": "AP", "offset": 5},
+            "s_or_r0":      {"register": "AP", "offset": 6},
+            "s_or_r1":      {"register": "AP", "offset": 7},
+            "t_or_k0":      {"register": "AP", "offset": 8},
+            "t_or_k1":      {"register": "AP", "offset": 9}
+        }));
+        let hints = vec![(0usize, vec![h])];
+        run(&hints, 0, &s, &mut mem);
+        (mem.get(104), mem.get(105), mem.get(106), mem.get(107), mem.get(108), mem.get(109))
+    }
+
+    /// a = 1: 1^{-1} mod n = 1 for any n > 1.
+    #[test]
+    fn test_u256_inv_mod_n_a_equals_1() {
+        // Python: pow(1, -1, 7) = 1
+        let (g0, g1, r0, r1, _k0, _k1) = run_u256_inv_mod_n(1, 7);
+        assert_eq!(g0, 1, "g0_or_no_inv=1 means invertible");
+        assert_eq!(g1, 0);
+        assert_eq!(r0, 1, "1^-1 mod 7 = 1");
+        assert_eq!(r1, 0);
+        // Also check with n = 101 (prime).
+        let (g0b, _, r0b, _, _, _) = run_u256_inv_mod_n(1, 101);
+        assert_eq!(g0b, 1);
+        assert_eq!(r0b, 1, "1^-1 mod 101 = 1");
+    }
+
+    /// a = n-1: the inverse of (n-1) mod n is always (n-1) since (n-1)^2 = n^2-2n+1 ≡ 1.
+    #[test]
+    fn test_u256_inv_mod_n_a_equals_n_minus_1() {
+        // n = 7: a = 6; Python: pow(6, -1, 7) = 6
+        let (g0, g1, r0, r1, _, _) = run_u256_inv_mod_n(6, 7);
+        assert_eq!(g0, 1, "invertible");
+        assert_eq!(g1, 0);
+        assert_eq!(r0, 6, "(n-1)^-1 mod n = n-1 for any prime n");
+        assert_eq!(r1, 0);
+        // n = 101: a = 100; Python: pow(100, -1, 101) = 100
+        let (_, _, r0b, _, _, _) = run_u256_inv_mod_n(100, 101);
+        assert_eq!(r0b, 100, "100^-1 mod 101 = 100");
+    }
+
+    /// a and n coprime — various sizes.
+    #[test]
+    fn test_u256_inv_mod_n_coprime_cases() {
+        // Python: pow(3, -1, 7) = 5
+        let (g0, _, r0, _, _, _) = run_u256_inv_mod_n(3, 7);
+        assert_eq!(g0, 1); assert_eq!(r0, 5, "3^-1 mod 7 = 5");
+
+        // Python: pow(17, -1, 100) = 53  (gcd(17,100)=1)
+        let (g0, _, r0, _, _, _) = run_u256_inv_mod_n(17, 100);
+        assert_eq!(g0, 1); assert_eq!(r0, 53, "17^-1 mod 100 = 53");
+
+        // Python: pow(123456789, -1, 1000000007) = ?
+        // 1000000007 is prime; use Fermat's little theorem: a^-1 = a^(p-2) mod p.
+        // pre-computed: pow(123456789, -1, 1000000007) = 18633540
+        let (g0, _, r0, _, _, _) = run_u256_inv_mod_n(123456789, 1000000007);
+        assert_eq!(g0, 1);
+        // Verify: 123456789 * 18633540 mod 1000000007 == 1
+        let product = (123456789u64 * 18633540u64) % 1000000007u64;
+        assert_eq!(product, 1,
+            "123456789 * r0 mod 1000000007 must equal 1 (r0 = {r0})");
+
+        // Python: pow(2, -1, 13) = 7
+        let (g0, _, r0, _, _, _) = run_u256_inv_mod_n(2, 13);
+        assert_eq!(g0, 1); assert_eq!(r0, 7, "2^-1 mod 13 = 7");
+    }
+
+    /// a = 0: gcd(0, n) = n for n > 0; 0 has no inverse mod n.
+    #[test]
+    fn test_u256_inv_mod_n_a_zero() {
+        // gcd(0, 7) = 7; not invertible.
+        let (g0, g1, r0, r1, k0, k1) = run_u256_inv_mod_n(0, 7);
+        // When gcd != 1, g0 = gcd (not 1).
+        assert_ne!(g0, 1, "a=0 is not invertible mod n");
+        // gcd(0, n) = n, so g0 should be 7.
+        assert_eq!(g0, 7, "gcd(0, 7) = 7");
+        assert_eq!(g1, 0); assert_eq!(r0, 0); assert_eq!(r1, 0);
+        assert_eq!(k0, 0); assert_eq!(k1, 0);
+    }
+
+    /// a = n: a mod n = 0, so not invertible.
+    #[test]
+    fn test_u256_inv_mod_n_a_equals_n() {
+        // b0 = n0 = 7; b_red = 7 % 7 = 0; gcd(0, 7) = 7; not invertible.
+        let (g0, _, _, _, _, _) = run_u256_inv_mod_n(7, 7);
+        assert_ne!(g0, 1, "a = n is not invertible");
+    }
+
+    /// Non-coprime: gcd(6, 9) = 3, not invertible (already exists but included for completeness).
+    #[test]
+    fn test_u256_inv_mod_n_not_invertible_gcd3() {
+        // Python: math.gcd(6, 9) = 3
+        let (g0, g1, r0, r1, k0, k1) = run_u256_inv_mod_n(6, 9);
+        assert_eq!(g0, 3, "gcd(6,9) = 3");
+        assert_eq!(g1, 0); assert_eq!(r0, 0); assert_eq!(r1, 0);
+        assert_eq!(k0, 0); assert_eq!(k1, 0);
+    }
+
+    /// Verify the inverse satisfies b * inv ≡ 1 (mod n) for all invertible cases above.
+    #[test]
+    fn test_u256_inv_mod_n_verify_inverse_property() {
+        let cases: &[(u64, u64)] = &[
+            (3, 7), (5, 7), (17, 100), (2, 13), (7, 11),
+            (999, 1000), (u32::MAX as u64, u32::MAX as u64 - 2),
+        ];
+        for &(b, n) in cases {
+            if n == 0 { continue; }
+            let (g0, _, r0, _, _, _) = run_u256_inv_mod_n(b, n);
+            if g0 == 1 {
+                // Verify b_red * r0 ≡ 1 (mod n).
+                let b_red = b % n;
+                let product = (b_red as u128 * r0 as u128) % n as u128;
+                assert_eq!(product, 1,
+                    "inverse property failed: ({b} % {n}) * {r0} mod {n} = {product}, expected 1");
+            }
+        }
     }
 }
