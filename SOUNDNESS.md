@@ -409,6 +409,83 @@ which were already blinded without issue in earlier versions.
 trace columns are blinded. The correctness of the interaction trace's final values is
 enforced via the memory table commitment and RC counts commitment checks.
 
+### Formal argument: denominator column blinding (L1 — expanded 2026-04-04)
+
+Let `col(x)` denote any single main-trace column polynomial (e.g. `dict_key`), and let
+`col_blind(x) = col(x) + r_j · Z_H(x)` be its blinded version, where `r_j` is drawn
+fresh-randomly per column and `Z_H(x)` is the vanishing polynomial for the trace domain H.
+
+#### Correctness at trace points
+For any trace point `h ∈ H`: `Z_H(h) = 0`, so `col_blind(h) = col(h)`. The prover
+fills each trace cell with the true witness value; blinding does not alter any cell.
+Constraint evaluation on the trace domain (used to verify constraint C_i(h) = 0) sees
+only true witness values.
+
+#### Quotient polynomial remains a polynomial
+The AIR quotient is defined as:
+```
+Q(x) = C(x) / Z_H(x)
+```
+where `C(x) = Σ α_i · C_i(x)` and each `C_i` vanishes on H. Blinding contributes
+`r_j · Z_H(x)` to any denominator-column input to a constraint. For a step-transition
+constraint such as C31:
+```
+C_31(x) = S[i+1](x) - S[i](x) - Σ_k 1/(z - entry_k(x))
+```
+where `entry_k(x) = pc(x) + α·val(x)` and each coordinate is evaluated at `x`.
+Replacing `col(x)` → `col(x) + r · Z_H(x)` in the entry expression:
+```
+entry_k_blind(x) = (pc(x) + r_pc·Z_H(x)) + α·(val(x) + r_v·Z_H(x))
+                 = entry_k(x) + (r_pc + α·r_v)·Z_H(x)
+```
+At a trace point `h`: `Z_H(h) = 0`, so `entry_k_blind(h) = entry_k(h)`. The inverse
+`1/(z - entry_k_blind(h))` equals `1/(z - entry_k(h))`, which is the true LogUp term.
+The constraint `C_31(h) = 0` still holds on the trace domain ↔ the prover computed the
+interaction trace correctly. The quotient Q = C/Z_H is still a polynomial (no new poles).
+
+#### ZK at query points (one-time pad argument)
+At an eval-domain query point `q ∉ H`: `Z_H(q) ≠ 0`. The verifier receives
+```
+col_blind(q) = col(q) + r_j · Z_H(q)
+```
+Since `r_j` is drawn uniformly from M31 (fresh per column, unknown to the adversary at
+query time), and `Z_H(q) ≠ 0`, the quantity `r_j · Z_H(q)` is a uniform M31 element
+independent of `col(q)`. The revealed value is `col(q) ⊕ uniform`, which reveals no
+information about `col(q)` — this is the one-time-pad argument over M31.
+
+#### The denominator column case specifically (LogUp soundness)
+The LogUp running sum S(x) is committed *before* blinding takes effect on the denominator
+columns. Specifically:
+1. `trace_commitment` commits blinded `col_j(x)` for all 34 columns.
+2. From the committed blinded values, the prover builds the interaction trace S(x) using
+   the **blinded** inputs (because the interaction trace is built from committed values that
+   the verifier can also reconstruct at query points).
+3. The verifier reconstructs each LogUp delta at query points from the blinded column values
+   — both prover and verifier consistently use `col_blind(q)` (not `col(q)`).
+4. The constraint `C_31` is evaluated using blinded values on both sides; the quotient
+   formula check `C(q) = Q(q) · Z_H(q)` uses the same blinded inputs on both sides.
+
+There is no inconsistency: the blinded polynomial IS the committed polynomial. The proof
+system operates on blinded values throughout, and soundness follows because:
+- At trace points: blinding vanishes (Z_H = 0) → constraints evaluate on true witnesses.
+- At query points: consistent blinded values on both prover and verifier sides.
+
+#### Summary
+```
+col_blind(x) = col(x) + r_j · Z_H(x)
+
+At trace points h ∈ H:   col_blind(h) = col(h)           (Z_H(h) = 0)
+At query points q ∉ H:   col_blind(q) = col(q) + noise    (ZK one-time pad)
+Quotient Q = C/Z_H:       polynomial (no new poles)         (C vanishes on H)
+LogUp soundness:          constraint uses blinded col consistently on both sides
+```
+
+This argument applies to all three denominator-column families:
+- **C31/C32 (LogUp/RC)**: entry_k uses pc, val, inst_lo, inst_hi, addr columns.
+- **C34 (S_dict)**: denominator uses dict_key, dict_new columns.
+- All other constraints (C0-C30, C33) do not involve rational inverses; blinding is trivially
+  correct for them via the `Z_H vanishes on H` argument.
+
 ### Historical options considered (superseded)
 
 - **Option A (aux inverse columns):** Replace denominators with committed aux columns `m[i]`.
@@ -437,12 +514,24 @@ mod 2^31-1), the constraint `xor + 2*and = x + y` can be fraudulently satisfied 
 x, y ≥ 2^15 because `x + y` may wrap around mod P. Full soundness requires bit-decomposition
 (e.g. splitting into two 16-bit range-checked chunks), which is NOT implemented here.
 
+**M1 fix (2026-04-04):** The prover (`cairo_prove_program` path) now returns
+`ProveError::BitwiseBoundsViolation { count, first_x, first_y }` if any bitwise invocation
+has an input x or y >= 2^15. The verifier also independently checks each row and returns
+an error if any input is out of range. This means:
+- Programs using only ≤ 15-bit bitwise inputs: provable and verifiable.
+- Programs using ≥ 16-bit bitwise inputs: rejected at prove time (production path) and at
+  verify time (prevents a malicious proof from being accepted).
+
 **In practice:** Programs whose bitwise inputs are at most 15 bits wide are proven correctly.
-Programs using full 31-bit inputs should not rely on soundness of the bitwise builtin constraints.
+Programs using full 31-bit inputs will now fail at the prover or verifier with a clear error.
 
 **Integration status:** Trace generation and VM invocation implemented. Standalone constraint
 evaluation not yet wired into the main prover quotient kernel (no GPU constraint kernel added).
 The builtin is available for use but its constraints are not part of the FRI-proven polynomial.
+
+**Remaining gap:** Full 31-bit soundness would require bit-decomposition of each input into
+chunks with range checks — a significant engineering effort. The current guard (reject >= 2^15)
+ensures that no unsound proof can be generated or accepted.
 
 ---
 

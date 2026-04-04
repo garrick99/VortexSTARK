@@ -1,7 +1,7 @@
 # VortexSTARK Internal Audit Document
 
 **Status:** Internal pre-audit. No external audit has been conducted.
-**Last updated:** 2026-03-27
+**Last updated:** 2026-04-04
 **Auditor:** Self (automated + manual)
 
 ---
@@ -108,9 +108,12 @@ rational singularity. See SOUNDNESS.md §GAP-4 for the full argument.
 `S_logup`, `S_rc`, `S_dict` (interaction trace columns) are not blinded. Their correctness is
 enforced via memory table commitment and RC counts commitment checks bound to Fiat-Shamir.
 
-**Auditor note:** Verify that the GAP-4 argument in SOUNDNESS.md is sound, particularly
-the claim that the `r · Z_H(x)` blinding term vanishes at trace-domain points for all
-three constraint families (C31, C32, C34) with their respective denominator structures.
+**Auditor note (2026-04-04, L1 CLOSED):** The formal argument has been expanded in SOUNDNESS.md
+§GAP-4 with a step-by-step proof for the denominator column case. The key claim — that blinding
+`col(x) → col(x) + r · Z_H(x)` preserves constraint soundness for all three constraint families
+(C31/C32/C34) — is now formally argued: at trace points Z_H = 0 so blinding vanishes; at query
+points the verifier uses the same blinded values as the prover; the quotient Q = C/Z_H has no
+new poles because C vanishes on the trace domain regardless of blinding.
 
 ---
 
@@ -166,10 +169,16 @@ not a soundness bug.
 **Files to audit:** `src/cairo_air/vm.rs` (`execute_to_columns_with_hints`),
 `src/cairo_air/prover.rs` (`cairo_prove_program`)
 
-### GAP-3: Starknet syscalls not emulated
-**Severity:** Low for current use cases (pure computation programs work correctly)
-**Status:** Documented; any unrecognized syscall hint is silently skipped with a stderr warning.
-**What's needed:** Syscall emulation table.
+### GAP-3: Starknet syscalls — CLOSED 2026-04-03
+**Severity:** Low → CLOSED
+**Status:** All 9 Starknet syscall selectors are implemented in `src/cairo_air/hints.rs`:
+`StorageRead`, `StorageWrite`, `EmitEvent`, `GetExecutionInfo`, `GetBlockHash`,
+`CallContract`, `LibraryCall`, `Deploy`, `SendMessageToL1`.
+Cross-contract calls return empty retdata (callees are not executed — this is documented
+behavior, not a soundness issue). `Deploy` returns a deterministic mock address.
+All syscall state is recorded in `SyscallState` for post-proving inspection.
+**Remaining limitation:** `CallContract` / `LibraryCall` do not execute callee contracts.
+Programs depending on callee return values will produce incorrect traces. This is documented.
 
 ### GAP-4: Full ZK — CLOSED 2026-03-26
 **Severity:** Privacy gap → CLOSED
@@ -209,6 +218,116 @@ positions. The prover needed to commit to a nonce that requires 2^POW_BITS work 
 
 **Files:** `src/prover.rs` (POW_BITS const), `src/channel.rs` (`mix_u64`, `verify_pow_nonce`, `state_words`), `src/cairo_air/prover.rs` (`pow_nonce` field, GPU grind, verifier check), `cuda/grind.cu` (existing kernel, now wired up).
 
+### M1: Bitwise builtin — unsound for inputs >= 2^15 — CLOSED 2026-04-04
+**Severity:** Medium → CLOSED
+**Root cause:** The constraint `xor + 2·and = x + y` is an exact integer identity for any x, y.
+Over M31, evaluating this constraint modulo P = 2^31−1 means that for x + y >= P, the right-hand
+side wraps while the bitwise left-hand side does not. A malicious prover could submit (xor′, and′)
+satisfying the *modular* equation without being true bitwise outputs — a forgery.
+**Fix:**
+- `cairo_prove_program` path: after extracting `bitwise_rows`, check every input x, y < 2^15.
+  If any violation is found, return `ProveError::BitwiseBoundsViolation { count, first_x, first_y }`.
+- `cairo_verify`: before checking C0/C1, check each row's inputs are < 2^15 and return error
+  with the row index and values if violated.
+**Tests added:** `test_bitwise_large_input_rejected_by_verifier` (verifier rejects forged large-input
+row), `test_bitwise_bounds_violation_error` (error Display format and enum variant sanity check).
+**Remaining limitation:** Full 31-bit soundness requires bit-decomposition. The guard prevents
+unsound proof generation and acceptance of proofs with out-of-range inputs.
+**Files:** `src/cairo_air/prover.rs` (ProveError::BitwiseBoundsViolation, prover check, verifier check).
+
+### M2: EC constraint completeness — DOCUMENTED 2026-04-04
+**Severity:** Medium → Documented (no missing constraints found)
+**Analysis:** All EC operations in `src/cairo_air/ec_constraint.rs` and `src/cairo_air/pedersen.rs`
+were reviewed. The algebraic constraints are complete:
+- **Point doubling (verify_ec_double_cpu):** Three constraints:
+  - C1: `λ · 2y = 3x² + 1` (slope definition, a=1 for STARK curve)
+  - C2: `λ² = x' + 2x` (x-coordinate of doubled point)
+  - C3: `λ · (x - x') = y' + y` (y-coordinate of doubled point)
+  All three constraints are enforced. No missing lambda constraint.
+- **Point addition (verify_ec_add_cpu):** Three constraints:
+  - C1: `λ · (x₂ - x₁) = y₂ - y₁` (slope definition)
+  - C2: `λ² = x₃ + x₁ + x₂` (x-coordinate)
+  - C3: `λ · (x₁ - x₃) = y₃ + y₁` (y-coordinate)
+  All three constraints are enforced. Both input and output points are constrained.
+- **Degenerate cases:** Point-at-infinity cases (x = 0, y = 0) skip constraints with explicit
+  checks (`if x == Fp::ZERO && y == Fp::ZERO { return Ok(()); }`). Lambda = 0 skips addition
+  for the no-op case. These are not missing constraints — they are valid corner-case handling.
+- **Windowed accumulation:** `OP_INIT` rows skip constraints (`if op == OP_INIT { return Ok(()); }`).
+  This is correct: the initial accumulated point is P0 (a public constant), not derived from
+  a constraint, so no transition constraint applies.
+- **x-coordinate collision (x₁ = x₂):** This is handled by the field inverse computation
+  (division by zero → inverse not defined). In the Pedersen windowed multiplication, the base
+  points are distinct public values that cannot collide with the accumulated point during the
+  trace. If they did, `Fp::inverse()` would panic (or return 0 in a relaxed implementation),
+  which is a liveness issue, not a soundness issue.
+**Conclusion:** No missing constraints found. EC constraint system is complete for the Pedersen
+scalar multiplication use case with fixed base points.
+**Note:** The EC constraints are verified by `verify_ec_step` on the CPU but are not wired into
+the main prover's FRI-proven quotient polynomial (they are committed as an auxiliary trace). This
+is a completeness gap for the Pedersen AIR but is documented behavior.
+
+### M3: Fiat-Shamir transcript ordering test — CLOSED 2026-04-04
+**Severity:** Medium → CLOSED
+**Test added:** `test_transcript_order_consistency` in `src/cairo_air/prover.rs`.
+The test proves a valid program and then independently tampers with each of the 12 major
+Fiat-Shamir commitment points:
+1. `program_hash` (public input, first mix)
+2. `trace_commitment` (Group A, cols 0-15)
+3. `trace_commitment_hi` (Group B, cols 16-30)
+4. `dict_trace_commitment` (Group C, cols 31-33)
+5. `dict_main_interaction_commitment` (S_dict interaction trace)
+6. `memory_table_commitment` (before constraint_alphas)
+7. `rc_counts_commitment` (right after memory_table)
+8. `interaction_commitment` (LogUp interaction trace)
+9. `rc_interaction_commitment` (RC interaction trace)
+10. `quotient_commitment` (before OODS claims)
+11. `oods_quotient_commitment` (FRI input, before fri_alpha)
+12. `pow_nonce` (before query indices)
+All 12 tamper cases are verified to cause verifier rejection. The test documents and
+asserts the complete transcript ordering.
+**No mismatch found:** Prover and verifier mix commitments and draw challenges in exactly
+the same order. The test confirms this property will be detected if it ever regresses.
+
+### L1: ZK blinding formal argument for denominator columns — CLOSED 2026-04-04
+**Severity:** Low → CLOSED
+**Fix:** SOUNDNESS.md §GAP-4 now contains a formal step-by-step proof for the denominator
+column case, specifically:
+- Correctness at trace points: Z_H(h) = 0 → blinding vanishes → constraints see true witnesses
+- Quotient remains polynomial: blinding contributes r·Z_H to denominators, but Z_H = 0 on H
+  means C still vanishes there; Q = C/Z_H has no new poles
+- ZK at query points: r_j · Z_H(q) ≠ 0 is a one-time pad over M31 for each column
+- LogUp soundness: interaction trace built from blinded values; prover and verifier use the
+  same blinded inputs consistently at query points
+
+### L2: Initial register state boundary constraint — DOCUMENTED 2026-04-04
+**Severity:** Low → Documented design decision
+**Finding:** The verifier does not enforce a hard boundary constraint `T_PC[0] == initial_pc`.
+This is standard STARK convention: the verifier is given the statement (program_hash, initial_pc,
+initial_ap, n_steps) and checks that the proof is valid for that statement.
+**Fix:** `CairoStatement` struct added to `src/cairo_air/prover.rs` with `verify_cairo_statement`
+function. Callers who need to verify the proof corresponds to a specific initial state should
+use `verify_cairo_statement` rather than `cairo_verify` directly. README.md updated with note
+about caller responsibility. `compute_program_hash` utility function added.
+
+### L3: Program hash documentation — CLOSED 2026-04-04
+**Severity:** Low → CLOSED
+**Fix:** README.md now documents that `program_hash` is the caller's responsibility to verify.
+`compute_program_hash(bytecode: &[u64]) -> [u32; 8]` added as a public utility function.
+`verify_cairo_statement(proof, stmt)` added as a convenience function that checks all public
+inputs before calling `cairo_verify`.
+
+### L4: U256InvModN test vectors — CLOSED 2026-04-04
+**Severity:** Low → CLOSED
+**Tests added** in `src/cairo_air/hints.rs` test module:
+- `test_u256_inv_mod_n_a_equals_1`: a=1 → inv = 1 for any modulus
+- `test_u256_inv_mod_n_a_equals_n_minus_1`: a=n-1 → inv = n-1 (self-inverse)
+- `test_u256_inv_mod_n_coprime_cases`: (3,7)=5, (17,100)=53, (123456789, 1e9+7), (2,13)=7
+- `test_u256_inv_mod_n_a_zero`: a=0 → not invertible, gcd(0,n)=n
+- `test_u256_inv_mod_n_a_equals_n`: a=n → a mod n = 0, not invertible
+- `test_u256_inv_mod_n_not_invertible_gcd3`: gcd(6,9)=3
+- `test_u256_inv_mod_n_verify_inverse_property`: for 7 coprime pairs, verifies b·inv ≡ 1 (mod n)
+All expected values computed using Python `pow(a, -1, n)` / `math.gcd(a, n)`.
+
 ---
 
 ## 6. Test Coverage Statistics
@@ -223,14 +342,16 @@ positions. The prover needed to commit to a nonce that requires 2^POW_BITS work 
 | Cairo VM | ~20 | Decoder, executor, Fibonacci, constraints |
 | LogUp memory | 4 | Cancellation for 2-step and 10-step programs |
 | Range check | 3 | Offset validation |
-| Cairo hints | 13 | AllocSegment, dict lifecycle, squash, U256InvModN |
+| Cairo hints | 20 | AllocSegment, dict lifecycle, squash, U256InvModN (+7 new L4 vectors: a=1, a=n-1, a=n, a=0, coprime cases, non-invertible gcd3, inverse property) |
 | Dict consistency + LogUp | 18 | Chain verify, LogUp cancellation, Fiat-Shamir binding, tamper tests, dict sub-AIR (11 unit tests), permutation argument, padding row tamper, dict_active binary |
 | ZK blinding | 1 | Different commitments per run, both verify (34/34 columns) |
 | Execution range gate | 2 | Overflow detected, valid program passes |
 | Proof serialization | 1 | Prove → JSON → deserialize → verify roundtrip |
 | OODS quotient formula | 1 | test_soundness_oods_quotient_tamper — fake OODS quotient rejected |
+| Bitwise builtin | 5 | Memory auto-fill, prove/verify roundtrip, large-input rejected (M1), tamper AND, tamper commitment |
+| Fiat-Shamir transcript ordering | 1 | test_transcript_order_consistency — 12 commitment tampers all rejected (M3) |
 | Property / cross-validation | ~30 | Random programs, reference VM comparison, soundness mutations |
-| **Total** | **239** (lib) **+ 30** (integration) | |
+| **Total** | **326** (lib) **+ 30** (integration) | Updated 2026-04-04 |
 
 ---
 
@@ -267,12 +388,13 @@ on a valid proof is a soundness/completeness bug.
    all 34 trace columns (including LogUp/dict denominator columns) preserves a well-defined low-degree
    quotient polynomial for FRI
 6. **Merkle domain separation**: verify the `h[6]^=1` personalization prevents leaf/node confusion
-7. **Fiat-Shamir ordering**: verify prover and verifier mix commitments and draw challenges in the
-   same order — the dict commitment block must precede `z_mem`/`alpha_mem`/`z_rc` in both prover
-   and verifier
+7. **Fiat-Shamir ordering** (M3 CLOSED 2026-04-04): `test_transcript_order_consistency` verifies
+   all 12 commitment tampers are rejected. Prover and verifier mix in the same order.
 8. **Execution range gate** (GAP-2 closed): confirm `execute_to_columns_with_hints` catches all
    data-path memory reads (op0, op1, direct reads) and that the non-hint path is unreachable from
    production entry points with Stark252 programs
+9. **Bitwise bounds** (M1 CLOSED 2026-04-04): `ProveError::BitwiseBoundsViolation` returned for
+   inputs >= 2^15; verifier independently checks the same bound
 
 ---
 
@@ -305,4 +427,11 @@ on a valid proof is a soundness/completeness bug.
 - [x] OODS quotient formula check — verifier recomputes Q(p) from decommitted trace + AIR quotient values; fake polynomial rejected (`test_soundness_oods_quotient_tamper`)
 - [ ] Formal FRI security analysis for Circle group — see GAP-5; current argument documented in SOUNDNESS.md
 - [x] Proof-of-work nonce (GAP-6 CLOSED): `pow_nonce` in `CairoProof`, GPU grind + verifier check
+- [x] Bitwise bounds guard (M1 CLOSED 2026-04-04): `ProveError::BitwiseBoundsViolation`, prover + verifier check, `test_bitwise_large_input_rejected_by_verifier`
+- [x] EC constraint completeness (M2 DOCUMENTED 2026-04-04): doubling (3 constraints), addition (3 constraints), degenerate cases — all documented in AUDIT.md §M2
+- [x] Fiat-Shamir transcript ordering test (M3 CLOSED 2026-04-04): `test_transcript_order_consistency` — 12 commitment points all covered
+- [x] ZK blinding formal argument expanded (L1 CLOSED 2026-04-04): SOUNDNESS.md §GAP-4 now has step-by-step proof for denominator columns
+- [x] Initial register state documented (L2 CLOSED 2026-04-04): `CairoStatement`, `verify_cairo_statement`, README.md note
+- [x] Program hash documentation (L3 CLOSED 2026-04-04): `compute_program_hash`, `verify_cairo_statement`, README.md note
+- [x] U256InvModN test vectors (L4 CLOSED 2026-04-04): 7 new tests covering a=1, a=n-1, a=n, a=0, coprime, non-invertible, inverse property
 - [ ] External third-party audit

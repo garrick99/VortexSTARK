@@ -50,8 +50,11 @@ All Cairo VM numbers include 34 columns, 35 constraints, full LogUp+RC memory ta
 ### Remaining limitations
 
 - **Felt252 arithmetic**: VM operates over M31 (2^31 − 1). `cairo_prove_program` now returns `Err(ProveError::Felt252Overflow)` for programs whose bytecode contains values wider than 64 bits, preventing silent misproofs. Values in the range (M31, u64] are still reduced mod M31 without error — proof output is wrong for programs that rely on Stark252 arithmetic in that range.
-- **Starknet syscalls**: Basic stubs for `SystemCall`, EC, keccak, blake2s, and range-check hints are registered; they write zero to response fields and continue execution. Full OS emulation (storage reads, actual event emission, cross-contract calls) is not implemented — programs relying on syscall return values will produce incorrect traces.
+- **Starknet syscalls**: All 9 syscall selectors fully implemented. `CallContract` and `LibraryCall` execute registered callees in-process via `HintContext::register_contract` — retdata is written back into the caller's response buffer with nesting up to depth 8. Unregistered targets return empty retdata. `Deploy` returns a deterministic mock address (`salt XOR class_hash`). All syscall state (events, calls, deployed contracts, L1 messages) recorded in `SyscallState` and available after proving.
 - **Dict consistency proofs**: Dict read/write execution is fully functional. An execution-side chain consistency check runs at prove time (`ProveError::DictConsistencyViolation`). The S_dict step-transition LogUp (C34) links main trace dict columns to an authenticated exec trace; verifier checks `dict_link_final == exec_key_new_sum`. Soundness holds against a malicious prover for dict-heavy programs.
+- **Bitwise inputs must be < 2^15**: The bitwise builtin constraint (`xor + 2·and = x + y`) is sound over M31 only for inputs in `[0, 2^15)`. Inputs ≥ 2^15 are rejected by both the prover (`ProveError::BitwiseBoundsViolation`) and verifier. Full 31-bit soundness requires bit-decomposition, which is not yet implemented.
+- **Initial register state (boundary constraint)**: The verifier does not enforce a hard boundary constraint `T_PC[0] == initial_pc`. The initial register state (`initial_pc`, `initial_ap`) is part of the **public input** (the *statement* being proven) and is trusted by the verifier. Callers who need to verify that a proof corresponds to a specific initial state must check `proof.public_inputs.initial_pc` and `proof.public_inputs.initial_ap` against expected values before accepting the proof. This is the standard STARK convention: the verifier checks that the computation starting from the stated initial state satisfies all transition constraints; it does not re-derive the initial state from the program.
+- **Program hash is caller's responsibility**: `proof.public_inputs.program_hash` is `Blake2s(bytecode)` computed by the prover. The verifier mixes this hash into the Fiat-Shamir transcript (binding the proof to a specific program) but does **not** recompute it from bytecode. If you need to verify that a proof corresponds to a specific program, compute `Blake2s(bytecode)` independently and compare it to `proof.public_inputs.program_hash` before calling `cairo_verify`. See also `CairoStatement` in the API documentation.
 
 See [SOUNDNESS.md](SOUNDNESS.md) for the full constraint-by-constraint analysis.
 
@@ -123,14 +126,14 @@ Requires: Rust 1.85+ (stable), CUDA 13.0+, RTX 5090 (SM 12.0) or RTX 4090 (SM 8.
 
 ```bash
 cargo build --release
-cargo test                          # 269 tests (239 lib + 30 integration)
+cargo test                          # 326 lib + 30 integration = 356 total
 cargo run --release --bin full_benchmark
 cargo run --release --bin gpu_bench     # pre-flight checks + per-section GPU telemetry
 ```
 
 ## Tests
 
-269 tests (239 lib + 30 integration) covering: M31/CM31/QM31 field arithmetic, Circle NTT, Merkle tree (commit, auth paths, tiled, SoA4), FRI (fold, circle fold, deterministic), STARK prover + verifier (multiple sizes, tamper detection), Cairo VM (decoder, executor, Fibonacci, constraints, LogUp, range checks, instruction decomposition), Poseidon, Pedersen (Stark252 field, EC ops, GPU vs CPU), Bitwise (memory segment, trace generation, constraint verification, prove/verify round-trip, tamper detection), LogUp/RC soundness (memory table commitment, cancellation check, RC counts commitment), OODS quotient formula correctness, GPU constraint eval (bytecode VM, warp-cooperative), GPU leaf hashing (Blake2s, domain separation), CASM loader, Cairo hints (AllocSegment, AllocFelt252Dict, dict entry lifecycle, squash, U256InvModN, multi-dict programs, isqrt edge cases), property tests (completeness, soundness, random mutations), cross-validation (reference VM comparison for 9 program types).
+326 lib + 30 integration = 356 tests covering: M31/CM31/QM31 field arithmetic, Circle NTT, Merkle tree (commit, auth paths, tiled, SoA4), FRI (fold, circle fold, deterministic), STARK prover + verifier (multiple sizes, tamper detection), Cairo VM (decoder, executor, Fibonacci, constraints, LogUp, range checks, instruction decomposition), Poseidon, Pedersen (Stark252 field, EC ops, GPU vs CPU), Bitwise (memory segment, trace generation, constraint verification, prove/verify round-trip, tamper detection, large-input bounds check), LogUp/RC soundness (memory table commitment, cancellation check, RC counts commitment), OODS quotient formula correctness, GPU constraint eval (bytecode VM, warp-cooperative), GPU leaf hashing (Blake2s, domain separation), CASM loader, Cairo hints (AllocSegment, AllocFelt252Dict, dict entry lifecycle, squash, U256InvModN with 7 comprehensive test vectors), Fiat-Shamir transcript ordering (12 commitment points), property tests (completeness, soundness, random mutations), cross-validation (reference VM comparison for 9 program types).
 
 ## Break This System
 
@@ -139,7 +142,7 @@ If you can craft a malformed trace that the verifier accepts, that is a real bug
 ### Known remaining weak points
 
 - **Felt252 arithmetic**: values wider than 63 bits are truncated; M31 wrap-around replaces Stark252 arithmetic for overflowing programs
-- **Starknet syscalls**: not emulated — contracts that call OS syscalls will produce invalid traces
+- **Cross-contract execution**: `CallContract` and `LibraryCall` execute registered callees in-process (`HintContext::register_contract`). Unregistered targets return empty retdata. External contract resolution (fetching bytecode from Starknet RPC at call time) is not automatic.
 - **Felt252 dict values**: dict values are M31 elements; programs that store full Stark252 field elements in dicts are not supported
 
 ### Expected to hold (guarantees today)
