@@ -138,7 +138,7 @@ pub fn compute_memory_table_sum(
         .map(|&(addr, value, mult)| {
             let entry = qm31_from_m31(addr) + alpha * qm31_from_m31(value);
             let denom = z - entry;
-            debug_assert!(denom != QM31::ZERO, "LogUp table denominator is zero — Fiat-Shamir collision");
+            assert!(denom != QM31::ZERO, "LogUp table denominator is zero — Fiat-Shamir collision");
             -(qm31_from_m31(M31(mult)) * denom.inverse())
         })
         .reduce(|| QM31::ZERO, |a, b| a + b);
@@ -149,7 +149,7 @@ pub fn compute_memory_table_sum(
                 + alpha * qm31_from_m31(inst_lo)
                 + alpha_sq * qm31_from_m31(inst_hi);
             let denom = z - entry;
-            debug_assert!(denom != QM31::ZERO, "LogUp instr denominator is zero — Fiat-Shamir collision");
+            assert!(denom != QM31::ZERO, "LogUp instr denominator is zero — Fiat-Shamir collision");
             -(qm31_from_m31(M31(mult)) * denom.inverse())
         })
         .reduce(|| QM31::ZERO, |a, b| a + b);

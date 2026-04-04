@@ -331,9 +331,9 @@ fn try_gpu_bytecode_eval<E: FrameworkEval>(
     let mut interaction_offsets = Vec::with_capacity(n_interactions + 1);
     interaction_offsets.push(0usize);
     for interaction_cols in gpu_trace_evals.iter() {
-        interaction_offsets.push(interaction_offsets.last().unwrap() + interaction_cols.len());
+        interaction_offsets.push(interaction_offsets.last().expect("invariant: interaction_offsets always has at least the sentinel 0") + interaction_cols.len());
     }
-    let total_cols = *interaction_offsets.last().unwrap();
+    let total_cols = *interaction_offsets.last().expect("invariant: interaction_offsets always has at least the sentinel 0");
 
     // Collect device pointers for all columns.
     let mut col_ptrs: Vec<*const u32> = Vec::with_capacity(total_cols);

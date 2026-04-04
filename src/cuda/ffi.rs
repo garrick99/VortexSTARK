@@ -33,11 +33,19 @@ pub struct CudaStream {
 }
 
 impl CudaStream {
+    /// Create a new CUDA stream, panicking on failure.
     pub fn new() -> Self {
+        Self::try_new().unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Create a new CUDA stream, returning an error if CUDA fails (e.g. OOM or no device).
+    pub fn try_new() -> Result<Self, String> {
         let mut ptr: *mut c_void = std::ptr::null_mut();
         let err = unsafe { cudaStreamCreate(&mut ptr) };
-        assert!(err == 0, "cudaStreamCreate failed: {err}");
-        Self { ptr }
+        if err != 0 {
+            return Err(format!("cudaStreamCreate failed: cuda error {err}"));
+        }
+        Ok(Self { ptr })
     }
 
     pub fn sync(&self) {

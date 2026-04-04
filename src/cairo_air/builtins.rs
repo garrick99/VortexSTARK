@@ -114,11 +114,15 @@ impl PoseidonBuiltin {
             let base = builtin_base_addr + inv_idx as u64 * stride;
             // Input cells
             for j in 0..STATE_WIDTH {
-                entries.push((M31((base + j as u64) as u32), input[j]));
+                let addr = base + j as u64;
+                assert!(addr <= 0x7FFF_FFFF, "builtin address 0x{addr:x} overflows M31 (inv_idx={inv_idx})");
+                entries.push((M31(addr as u32), input[j]));
             }
             // Output cells
             for j in 0..STATE_WIDTH {
-                entries.push((M31((base + STATE_WIDTH as u64 + j as u64) as u32), output[j]));
+                let addr = base + STATE_WIDTH as u64 + j as u64;
+                assert!(addr <= 0x7FFF_FFFF, "builtin address 0x{addr:x} overflows M31 (inv_idx={inv_idx})");
+                entries.push((M31(addr as u32), output[j]));
             }
         }
         entries

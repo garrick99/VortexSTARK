@@ -99,7 +99,7 @@ pub fn double_x_qm31(x: QM31) -> QM31 {
 }
 
 /// Batch inverse of QM31 values using Montgomery's trick.
-/// Returns vec of inverses; panics if any input is zero.
+/// Zero inputs produce a zero output (not a panic). All non-zero inputs are correctly inverted.
 pub fn qm31_batch_inverse(values: &[QM31]) -> Vec<QM31> {
     let n = values.len();
     if n == 0 { return vec![]; }

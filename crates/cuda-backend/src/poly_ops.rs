@@ -383,6 +383,8 @@ impl PolyOps for CudaBackend {
         // alphas[log_size-1] = point.y  →  used for circle fold first
         // alphas[k] = (double_x applied) point.x  →  line folds
         let mut folding_alphas: Vec<SecureField> = get_folding_alphas(point, log_size as usize);
+        assert_eq!(folding_alphas.len(), log_size as usize,
+            "folding_alphas count ({}) must equal log_size ({})", folding_alphas.len(), log_size);
 
         let qm31_to_arr = |v: SecureField| -> [u32; 4] {
             let m = v.to_m31_array();

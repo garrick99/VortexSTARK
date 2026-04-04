@@ -674,7 +674,7 @@ impl MerkleTree {
 
             if needed_tiles.contains(&tile_idx) {
                 let layers = Self::build_cpu_tree_layers(leaf_hashes);
-                let root = layers.last().unwrap()[0];
+                let root = layers.last().expect("build_cpu_tree_layers always returns non-empty layers")[0];
                 tile_roots.push(root);
                 tile_subtrees.insert(tile_idx, layers);
             } else {
@@ -756,7 +756,7 @@ impl MerkleTree {
                             (tile_idx, Self::build_cpu_tree_layers(leaf_hashes))
                         })
                     }).collect();
-                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                    handles.into_iter().map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e))).collect()
                 });
             results.into_iter().collect()
         } else {
@@ -803,8 +803,8 @@ impl MerkleTree {
     /// Build CPU Merkle tree layers from leaf hashes. Returns [leaves, parents, ..., root].
     pub fn build_cpu_tree_layers(leaf_hashes: Vec<[u32; HASH_WORDS]>) -> Vec<Vec<[u32; HASH_WORDS]>> {
         let mut layers = vec![leaf_hashes];
-        while layers.last().unwrap().len() > 1 {
-            let prev = layers.last().unwrap();
+        while layers.last().expect("invariant: layers is non-empty").len() > 1 {
+            let prev = layers.last().expect("invariant: layers is non-empty");
             let parents: Vec<[u32; HASH_WORDS]> = (0..prev.len() / 2)
                 .map(|i| Self::hash_pair(&prev[2 * i], &prev[2 * i + 1]))
                 .collect();
@@ -907,7 +907,7 @@ impl MerkleTree {
             let mut parents = DeviceBuffer::<u32>::alloc((parent_size as usize) * HASH_WORDS);
             unsafe {
                 ffi::cuda_merkle_hash_nodes(
-                    all_layers.last().unwrap().as_ptr(),
+                    all_layers.last().expect("invariant: all_layers is non-empty during GPU tree build").as_ptr(),
                     parents.as_mut_ptr(),
                     parent_size,
                 );
@@ -917,7 +917,7 @@ impl MerkleTree {
         }
 
         // Arrange as [root, ..., n/2 nodes, leaves]
-        let root = all_layers.pop().unwrap();
+        let root = all_layers.pop().expect("invariant: all_layers is non-empty after GPU tree build");
         let mut layers = vec![root];
         for layer in all_layers.into_iter().rev() {
             layers.push(layer);

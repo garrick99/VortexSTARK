@@ -144,7 +144,7 @@ pub fn build_dict_interaction_trace(
             + alpha    * qm31_from_m31(p)
             + alpha_sq * qm31_from_m31(nv);
         let denom = z - entry;
-        debug_assert!(denom != QM31::ZERO,
+        assert!(denom != QM31::ZERO,
             "dict interact: LogUp denominator is zero at row {i} — Fiat-Shamir collision");
         s = s + denom.inverse();
     }

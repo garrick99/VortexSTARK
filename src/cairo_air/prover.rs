@@ -4941,15 +4941,21 @@ mod tests {
         let log_eval_size = 6u32 + BLOWUP_BITS;
         let eval_size = 1usize << log_eval_size;
 
-        // Check all next-query indices are in-bounds and boundary wraps correctly
+        // Check all next-query indices are in-bounds.
+        // Note: canonic_next uses modular arithmetic in circle-group natural order
+        // (not BRT-canonic linear order), so qi=eval_size-1 does NOT necessarily map
+        // to next=0 — the circle permutation is non-sequential.
         for &qi in &proof.query_indices {
             let next_qi = canonic_next(qi, log_eval_size);
             assert!(next_qi < eval_size,
-                "next_qi={next_qi} out of bounds for eval_size={eval_size}");
-            if qi == eval_size - 1 {
-                assert_eq!(next_qi, 0,
-                    "boundary wrap: qi=eval_size-1={qi} must map to next=0");
-            }
+                "next_qi={next_qi} out of bounds for eval_size={eval_size} (qi={qi})");
+        }
+        // Exhaustively verify that canonic_next is in-bounds for ALL possible qi,
+        // including the boundary position.
+        for qi in 0..eval_size {
+            let next_qi = canonic_next(qi, log_eval_size);
+            assert!(next_qi < eval_size,
+                "canonic_next({qi}, {log_eval_size}) = {next_qi} out of bounds (eval_size={eval_size})");
         }
 
         // Valid proof must verify across all query positions (including any boundary)
