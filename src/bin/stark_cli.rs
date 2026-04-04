@@ -118,7 +118,7 @@ enum Commands {
     /// directly to the stwo_cairo_verifier contract on Starknet.
     ///
     /// Requires the stwo-cairo `run_and_prove` binary to be built first:
-    ///   cd C:/Users/kraken/stwo-cairo/stwo_cairo_prover
+    ///   cd /path/to/stwo-cairo/stwo_cairo_prover
     ///   wsl -- cargo build --release --bin run_and_prove
     ProveCairo {
         /// Path to compiled Cairo JSON program (output of `cairo-compile` or `starknet-compile`)
@@ -145,7 +145,7 @@ enum Commands {
         #[arg(long)]
         params: Option<PathBuf>,
         /// Path to stwo-cairo `run_and_prove` binary (WSL Linux path)
-        /// Default: /mnt/c/Users/kraken/stwo-cairo/stwo_cairo_prover/target/release/run_and_prove
+        /// Default: /mnt/c/<username>/stwo-cairo/stwo_cairo_prover/target/release/run_and_prove
         #[arg(long)]
         prover_bin: Option<String>,
     },
@@ -624,7 +624,7 @@ fn cmd_prove_cairo(
     prover_bin: Option<&str>,
 ) {
     let default_bin =
-        "/mnt/c/Users/kraken/stwo-cairo/stwo_cairo_prover/target/release/run_and_prove";
+        "/mnt/c/Users/user/stwo-cairo/stwo_cairo_prover/target/release/run_and_prove";
     let bin = prover_bin.unwrap_or(default_bin);
 
     // Build params JSON into a temp file (accessible from both Windows and WSL)
@@ -737,7 +737,7 @@ fn cmd_prove_cairo(
                 };
                 eprintln!("\n  Proof is in cairo-serde format (Starknet-submittable).");
                 eprintln!("  Verify locally with scarb (requires scarb + stwo_cairo_verifier):");
-                eprintln!("    cd C:/Users/kraken/stwo-cairo/stwo_cairo_verifier");
+                eprintln!("    cd /path/to/stwo-cairo/stwo_cairo_verifier");
                 eprintln!("    scarb execute --package stwo_cairo_verifier \\");
                 eprintln!("      --arguments-file {} \\", output_abs.display());
                 eprintln!("      --output standard --target standalone \\");
@@ -747,7 +747,7 @@ fn cmd_prove_cairo(
         Ok(s) => {
             eprintln!("ERROR: run_and_prove exited with status {s}");
             eprintln!("Ensure the binary is built:");
-            eprintln!("  wsl -- bash -lc 'cd /mnt/c/Users/kraken/stwo-cairo/stwo_cairo_prover && cargo build --release --bin run_and_prove'");
+            eprintln!("  wsl -- bash -lc 'cd /path/to/stwo-cairo/stwo_cairo_prover && cargo build --release --bin run_and_prove'");
             std::process::exit(1);
         }
         Err(e) => {

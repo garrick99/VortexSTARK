@@ -109,6 +109,6 @@ SoA4 layout: 4 trees striped for cache efficiency. Domain separation between lea
 
 ## Notes
 
-- GreenDragon (192.168.50.239, RTX 5090) runs driver 591.86 — update to 595.79 to fix OOM at log_n=30.
+- Secondary dev machine (RTX 5090) may need driver update to 595.79+ to fix OOM at log_n=30.
 - Poseidon2-Full (`src/poseidon2f.rs`, `cuda/poseidon2f_trace.cu`) has no formal security analysis — research only.
 - Cairo hint execution is implemented: AllocSegment, AllocFelt252Dict, Felt252DictEntryInit/Update, all squash hints, U256InvModN, GetSegmentArenaIndex (multi-dict), and DebugPrint. Starknet syscalls are not emulated.
