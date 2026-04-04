@@ -257,14 +257,17 @@ pub struct CairoStatement {
 /// Returns `Err(String)` if the statement check fails or if `cairo_verify` rejects.
 ///
 /// ## Example
-/// ```rust
+/// ```rust,no_run
+/// # use vortexstark::cairo_air::prover::{CairoStatement, compute_program_hash, verify_cairo_statement};
+/// # let proof = todo!();
+/// # let bytecode: Vec<u64> = vec![];
 /// let stmt = CairoStatement {
 ///     program_hash: compute_program_hash(&bytecode),
 ///     initial_pc: 0,
 ///     initial_ap: 100,
 ///     n_steps: 32,
 /// };
-/// verify_cairo_statement(&proof, &stmt)?;
+/// verify_cairo_statement(&proof, &stmt).expect("proof should be valid");
 /// ```
 pub fn verify_cairo_statement(proof: &CairoProof, stmt: &CairoStatement) -> Result<(), String> {
     let pi = &proof.public_inputs;
