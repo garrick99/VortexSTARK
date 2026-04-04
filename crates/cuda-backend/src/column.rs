@@ -213,20 +213,23 @@ impl ColumnOps<SecureField> for CudaBackend {
     type Column = CudaColumn<SecureField>;
 
     fn bit_reverse_column(column: &mut Self::Column) {
-        // Bit-reverse each of the 4 M31 components independently
         let n = column.len;
         assert!(n.is_power_of_two());
         let log_n = n.trailing_zeros();
-        // The buffer is interleaved (4 u32s per element), so we need a
-        // stride-aware bit-reverse. For now, download, bit-reverse on CPU,
-        // re-upload. TODO: GPU kernel for strided bit-reverse.
-        let host = column.buf.to_host();
-        let mut tmp = vec![0u32; n * 4];
-        for i in 0..n {
-            let j = bit_reverse(i, log_n as usize);
-            tmp[j * 4..j * 4 + 4].copy_from_slice(&host[i * 4..i * 4 + 4]);
+
+        // Out-of-place GPU bit-reverse: element i → position bit_reverse(i, log_n).
+        // Each QM31 element occupies 4 consecutive u32s in the buffer.
+        let mut d_tmp = DeviceBuffer::<u32>::alloc(n * 4);
+        unsafe {
+            ffi::cuda_bit_reverse_qm31(
+                column.buf.as_ptr(),
+                d_tmp.as_mut_ptr(),
+                n as u32,
+                log_n,
+            );
+            ffi::cuda_device_sync();
         }
-        column.buf = DeviceBuffer::from_host(&tmp);
+        column.buf = d_tmp;
     }
 }
 

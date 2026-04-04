@@ -1,12 +1,8 @@
 //! GrindOps: proof-of-work nonce search on GPU.
 //!
-//! Precomputes the Blake2s prefix digest on CPU, then launches millions of
-//! GPU threads to search in parallel. The 5090's 21,504 CUDA cores make
-//! this near-instant even at high pow_bits.
-//!
-//! For IS_M31_OUTPUT=true channels, falls back to parallel CPU grinding since
-//! the M31 reduction on hash output changes bit patterns and would require a
-//! separate GPU kernel. This case is rare in practice.
+//! Precomputes the Blake2s/Poseidon prefix digest on CPU, then launches millions
+//! of GPU threads to search in parallel. All three channel types (Blake2s standard,
+//! Blake2s M31-output, Poseidon252) are fully GPU-accelerated.
 
 use std::ffi::c_void;
 
@@ -20,37 +16,6 @@ use super::CudaBackend;
 /// On an RTX 5090 this completes in ~1ms per batch, so even pow_bits=30
 /// (expected ~1B nonces) finishes in ~60 batches = ~60ms.
 const BATCH_SIZE: u32 = 1 << 24;
-
-/// CPU parallel grind fallback (used for Poseidon252 and IS_M31_OUTPUT=true).
-fn grind_cpu_parallel<C: Channel + Clone + Send>(channel: &C, pow_bits: u32) -> u64 {
-    let n_threads = std::thread::available_parallelism()
-        .map_or(8, |n| n.get());
-
-    let found = std::sync::atomic::AtomicU64::new(u64::MAX);
-
-    std::thread::scope(|s| {
-        for t in 0..n_threads {
-            let found = &found;
-            let channel = channel.clone();
-            s.spawn(move || {
-                let mut nonce = t as u64;
-                let stride = n_threads as u64;
-                loop {
-                    if found.load(std::sync::atomic::Ordering::Relaxed) != u64::MAX {
-                        return;
-                    }
-                    if channel.verify_pow_nonce(pow_bits, nonce) {
-                        found.store(nonce, std::sync::atomic::Ordering::Relaxed);
-                        return;
-                    }
-                    nonce += stride;
-                }
-            });
-        }
-    });
-
-    found.load(std::sync::atomic::Ordering::Relaxed)
-}
 
 /// GPU grind for standard Blake2s (IS_M31_OUTPUT=false).
 fn grind_gpu_blake2s(channel_digest: &[u8; 32], pow_bits: u32) -> u64 {
@@ -176,23 +141,188 @@ impl GrindOps<Blake2sChannelGeneric<false>> for CudaBackend {
 
 impl GrindOps<Blake2sChannelGeneric<true>> for CudaBackend {
     fn grind(channel: &Blake2sChannelGeneric<true>, pow_bits: u32) -> u64 {
-        // M31-output channels require reducing hash output mod P before checking
-        // trailing zeros. Fall back to CPU parallel grinding for this rare case.
-        // TODO: GPU kernel variant that applies M31 reduction to hash output.
         if pow_bits == 0 {
             return 0;
         }
-        grind_cpu_parallel(channel, pow_bits)
+
+        // Precompute prefixed_digest on CPU (same as IS_M31_OUTPUT=false, but using
+        // Blake2sHasherGeneric::<true> which applies M31 reduction in finalize).
+        // The prefix hash IS_M31_OUTPUT=true applies reduction to the prefix too.
+        let pow_prefix: u32 = 0x12345678;
+        let mut hasher = blake2::Blake2s256::new();
+        blake2::Digest::update(&mut hasher, &pow_prefix.to_le_bytes());
+        blake2::Digest::update(&mut hasher, &[0u8; 12]);
+        blake2::Digest::update(&mut hasher, &channel.digest().0[..]);
+        blake2::Digest::update(&mut hasher, &pow_bits.to_le_bytes());
+        let prefixed_hash_raw: [u8; 32] = hasher.finalize().into();
+
+        // Apply M31 reduction to the prefix hash (IS_M31_OUTPUT=true means the
+        // prefix itself is also reduced — matching Blake2sHasherGeneric::<true>::finalize)
+        let prefixed_hash = stwo::core::vcs::blake2_hash::reduce_to_m31(prefixed_hash_raw);
+
+        // Convert to u32 words (LE)
+        let mut prefixed_words = [0u32; 8];
+        for i in 0..8 {
+            prefixed_words[i] = u32::from_le_bytes(
+                prefixed_hash[i * 4..(i + 1) * 4].try_into().unwrap(),
+            );
+        }
+
+        // Upload and search
+        let mut d_digest: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut d_result: *mut std::ffi::c_void = std::ptr::null_mut();
+
+        unsafe {
+            let err = vortexstark::cuda::ffi::cudaMalloc(&mut d_digest, 32);
+            assert!(err == 0, "cudaMalloc grind_m31 digest: {err}");
+            let err = vortexstark::cuda::ffi::cudaMalloc(&mut d_result, 8);
+            assert!(err == 0, "cudaMalloc grind_m31 result: {err}");
+
+            let init_val: u64 = u64::MAX;
+            vortexstark::cuda::ffi::cudaMemcpy(
+                d_result,
+                &init_val as *const u64 as *const std::ffi::c_void,
+                8, vortexstark::cuda::ffi::MEMCPY_H2D,
+            );
+            vortexstark::cuda::ffi::cudaMemcpy(
+                d_digest,
+                prefixed_words.as_ptr() as *const std::ffi::c_void,
+                32, vortexstark::cuda::ffi::MEMCPY_H2D,
+            );
+        }
+
+        let mut batch_offset: u64 = 0;
+        let found_nonce: u64;
+
+        loop {
+            unsafe {
+                vortexstark::cuda::ffi::cuda_grind_pow_m31_output(
+                    d_digest as *const u32,
+                    d_result as *mut u64,
+                    pow_bits,
+                    batch_offset,
+                    BATCH_SIZE,
+                );
+                vortexstark::cuda::ffi::cudaDeviceSynchronize();
+            }
+
+            let mut result: u64 = u64::MAX;
+            unsafe {
+                vortexstark::cuda::ffi::cudaMemcpy(
+                    &mut result as *mut u64 as *mut std::ffi::c_void,
+                    d_result,
+                    8, vortexstark::cuda::ffi::MEMCPY_D2H,
+                );
+            }
+
+            if result != u64::MAX {
+                found_nonce = result;
+                break;
+            }
+
+            batch_offset += BATCH_SIZE as u64;
+            assert!(batch_offset < (1u64 << 40), "grind_m31 failed after {batch_offset} nonces");
+        }
+
+        unsafe {
+            vortexstark::cuda::ffi::cudaFree(d_digest);
+            vortexstark::cuda::ffi::cudaFree(d_result);
+        }
+
+        debug_assert!(
+            channel.verify_pow_nonce(pow_bits, found_nonce),
+            "GPU grind_m31 returned invalid nonce {found_nonce}"
+        );
+
+        found_nonce
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl GrindOps<stwo::core::channel::Poseidon252Channel> for CudaBackend {
     fn grind(channel: &stwo::core::channel::Poseidon252Channel, pow_bits: u32) -> u64 {
-        // Poseidon252 grinding stays on CPU -- no GPU kernel for Poseidon hash.
         if pow_bits == 0 {
             return 0;
         }
-        grind_cpu_parallel(channel, pow_bits)
+
+        use starknet_crypto::poseidon_hash_many;
+        use starknet_ff::FieldElement as FieldElement252;
+
+        // Compute prefixed_digest = poseidon_hash_many([POW_PREFIX, digest, n_bits]) on CPU.
+        let pow_prefix = FieldElement252::from(stwo::core::channel::Poseidon252Channel::POW_PREFIX as u64);
+        let digest = channel.digest();
+        let n_bits_felt = FieldElement252::from(pow_bits as u64);
+        let prefixed = poseidon_hash_many(&[pow_prefix, digest, n_bits_felt]);
+
+        // into_mont() returns [u64; 4] in Montgomery form (LE).
+        let prefixed_mont = prefixed.into_mont();
+
+        // Upload prefixed_digest and result to GPU.
+        let mut d_digest: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut d_result: *mut std::ffi::c_void = std::ptr::null_mut();
+
+        unsafe {
+            let err = vortexstark::cuda::ffi::cudaMalloc(&mut d_digest, 32);
+            assert!(err == 0, "cudaMalloc grind_poseidon digest: {err}");
+            let err = vortexstark::cuda::ffi::cudaMalloc(&mut d_result, 8);
+            assert!(err == 0, "cudaMalloc grind_poseidon result: {err}");
+
+            let init_val: u64 = u64::MAX;
+            vortexstark::cuda::ffi::cudaMemcpy(
+                d_result,
+                &init_val as *const u64 as *const std::ffi::c_void,
+                8, vortexstark::cuda::ffi::MEMCPY_H2D,
+            );
+            vortexstark::cuda::ffi::cudaMemcpy(
+                d_digest,
+                prefixed_mont.as_ptr() as *const std::ffi::c_void,
+                32, vortexstark::cuda::ffi::MEMCPY_H2D,
+            );
+        }
+
+        let mut batch_offset: u64 = 0;
+        let found_nonce: u64;
+
+        loop {
+            unsafe {
+                vortexstark::cuda::ffi::cuda_grind_pow_poseidon(
+                    d_digest as *const u64,
+                    d_result as *mut u64,
+                    pow_bits,
+                    batch_offset,
+                    BATCH_SIZE,
+                );
+                vortexstark::cuda::ffi::cudaDeviceSynchronize();
+            }
+
+            let mut result: u64 = u64::MAX;
+            unsafe {
+                vortexstark::cuda::ffi::cudaMemcpy(
+                    &mut result as *mut u64 as *mut std::ffi::c_void,
+                    d_result,
+                    8, vortexstark::cuda::ffi::MEMCPY_D2H,
+                );
+            }
+
+            if result != u64::MAX {
+                found_nonce = result;
+                break;
+            }
+
+            batch_offset += BATCH_SIZE as u64;
+            assert!(batch_offset < (1u64 << 40), "grind_poseidon failed after {batch_offset} nonces");
+        }
+
+        unsafe {
+            vortexstark::cuda::ffi::cudaFree(d_digest);
+            vortexstark::cuda::ffi::cudaFree(d_result);
+        }
+
+        debug_assert!(
+            channel.verify_pow_nonce(pow_bits, found_nonce),
+            "GPU grind_poseidon returned invalid nonce {found_nonce}"
+        );
+
+        found_nonce
     }
 }

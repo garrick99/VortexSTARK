@@ -173,11 +173,32 @@ impl PackLeavesOps for CudaBackend {
     fn pack_leaves_input(
         values: &[Col<Self, BaseField>; SECURE_EXTENSION_DEGREE],
     ) -> [Col<Self, BaseField>; SECURE_EXTENSION_DEGREE * PACKED_LEAF_SIZE] {
-        // CPU fallback: download, pack, upload.
-        let cpu_values: [Vec<BaseField>; SECURE_EXTENSION_DEGREE] =
-            std::array::from_fn(|i| values[i].to_cpu());
-        let cpu_result = <stwo::prover::backend::CpuBackend as PackLeavesOps>::pack_leaves_input(&cpu_values);
-        std::array::from_fn(|i| cpu_result[i].iter().copied().collect())
+        let n = values[0].len();
+        assert!(n % PACKED_LEAF_SIZE == 0, "N must be a multiple of PACKED_LEAF_SIZE=16");
+
+        // Allocate 64 output columns of size N/16 each.
+        const N_OUT: usize = SECURE_EXTENSION_DEGREE * PACKED_LEAF_SIZE;  // 64
+        let out_n = n / PACKED_LEAF_SIZE;
+        let mut output_cols: [CudaColumn<BaseField>; N_OUT] =
+            std::array::from_fn(|_| CudaColumn::zeros(out_n));
+
+        // Build device pointer arrays for input (4 ptrs) and output (64 ptrs).
+        let in_ptrs: Vec<*const u32> = values.iter().map(|c| c.buf.as_ptr()).collect();
+        let out_ptrs: Vec<*mut u32>  = output_cols.iter_mut().map(|c| c.buf.as_mut_ptr()).collect();
+
+        let d_in_ptrs  = DeviceBuffer::from_host(&in_ptrs);
+        let d_out_ptrs = DeviceBuffer::from_host(&out_ptrs);
+
+        unsafe {
+            ffi::cuda_pack_leaves(
+                d_in_ptrs.as_ptr()  as *const *const u32,
+                d_out_ptrs.as_ptr() as *const *mut u32,
+                n as u32,
+            );
+            ffi::cuda_device_sync();
+        }
+
+        output_cols
     }
 }
 

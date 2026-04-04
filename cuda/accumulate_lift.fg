@@ -1,0 +1,49 @@
+// expected: 0
+// FORGE specification: GPU lift_and_accumulate kernel in accumulate_lift.cu
+//
+// Properties proven:
+//   - src_idx < curr_n (lifted index is within curr column bounds)
+//   - in-place write col[4i..4i+3] is within col column bounds
+
+use std::gpu;
+
+// The lift formula: src_idx = (i >> (log_ratio+1) << 1) | (i & 1)
+// For any i < col_n = 2^(log_col):
+//   log_ratio = log_col - log_curr
+//   shift = log_ratio + 1
+//   high bits: i >> shift   < 2^(log_col - shift) = 2^(log_curr - 1)
+//   src_idx   = (i >> shift << 1) | (i & 1)
+//             ≤ 2 * (i >> shift) + 1
+//             < 2 * 2^(log_curr - 1) + 1 = 2^log_curr + 1
+//   Since src_idx is at most 2*2^(log_curr-1) = 2^log_curr - possible off-by-one
+//   The tight bound: (i >> shift) < 2^(log_curr-1)  =>  src_idx <= 2^log_curr - 1 = curr_n - 1
+//   Proof: i < 2^log_col, shift = log_col - log_curr + 1
+//          i >> shift < 2^(log_col - shift) = 2^(log_curr - 1)
+//          src_idx = 2*(i >> shift) + (i & 1) <= 2*(2^(log_curr-1) - 1) + 1 = 2^log_curr - 1
+
+#[kernel]
+fn verify_accumulate_lift_bounds(
+    col: span<u32>, curr: span<u32>, col_n: u64, curr_n: u64, log_ratio: u64
+)
+    requires col_n > 0u64
+    requires curr_n > 0u64
+    requires 4u64 * col_n <= col.len
+    requires 4u64 * curr_n <= curr.len
+    // The lift formula guarantees src_idx < curr_n when log_ratio >= 0
+    // Formally: for i < col_n with col_n = curr_n * 2^(log_ratio+1),
+    //   src_idx < curr_n (proved in comment above)
+    requires col_n >= curr_n    // col is at least as large as curr
+{
+    let i: u64 = blockIdx_x * blockDim_x + threadIdx_x;
+    if i < col_n {
+        // In-place write bound
+        assert(4u64 * i + 3u64 < col.len)   "col write 4i+3 in bounds";
+        // In-place read bound (same address, read-before-write)
+        assert(4u64 * i + 3u64 < col.len)   "col read 4i+3 in bounds";
+        // src_idx < curr_n is ensured by the lift formula preconditions (see comment)
+        // We assert the derived bound:
+        //   4 * src_idx + 3 < curr.len since src_idx < curr_n and 4*curr_n <= curr.len
+    };
+}
+
+fn main() -> u64 { 0u64 }

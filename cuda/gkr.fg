@@ -1,0 +1,172 @@
+// expected: 0
+// FORGE specification: GPU GKR sum-check kernels for VortexSTARK
+//
+// Formally proves structural safety properties for the GKR kernels in gkr.cu.
+//
+// Key invariants:
+//   fix_first_variable_base:   output writes at 4i..4i+3, input reads at i and i+half_n
+//   fix_first_variable_secure: same but reads are at 4i..4i+3 and 4*(i+half_n)..
+//   gen_eq_evals_pass:         writes at 4j and 4*(cur_size+j), reads at 4j
+//   next_layer_grand_product:  reads at 8i..8i+7, writes at 4i..4i+3
+//   next_layer_logup_*:        reads at 8i..8i+7 for num and den, writes at 4i..4i+3
+//   sum_as_poly reductions:    reads eq[i] at 4i..4i+3, layer at computed offsets
+
+use std::gpu;
+
+// ─── fix_first_variable (Base → Secure) ─────────────────────────────────────
+// Preconditions:
+//   in.len  == n   (n M31 elements)
+//   out.len == 2 * n/2 * 4  (n/2 QM31 elements = 2n u32s)
+//   n is even
+#[kernel]
+fn verify_fix_first_variable_base_bounds(
+    in_buf: span<u32>, out_buf: span<u32>, half_n: u64
+)
+    requires half_n > 0u64
+    requires half_n * 2u64 <= in_buf.len
+    requires half_n * 8u64 <= out_buf.len
+{
+    let i: u64 = blockIdx_x * blockDim_x + threadIdx_x;
+    if i < half_n {
+        assert(i < in_buf.len)              "base read i in bounds";
+        assert(i + half_n < in_buf.len)     "base read i+half_n in bounds";
+        assert(4u64 * i + 3u64 < out_buf.len) "base write out[4i+3] in bounds";
+    };
+}
+
+// ─── fix_first_variable (Secure → Secure) ────────────────────────────────────
+#[kernel]
+fn verify_fix_first_variable_secure_bounds(
+    in_buf: span<u32>, out_buf: span<u32>, half_n: u64
+)
+    requires half_n > 0u64
+    requires 4u64 * half_n * 2u64 <= in_buf.len
+    requires 4u64 * half_n * 2u64 <= out_buf.len
+{
+    let i: u64 = blockIdx_x * blockDim_x + threadIdx_x;
+    if i < half_n {
+        assert(4u64 * i + 3u64 < in_buf.len)              "secure read in[4i+3] in bounds";
+        assert(4u64 * (i + half_n) + 3u64 < in_buf.len)   "secure read in[4*(i+half_n)+3] in bounds";
+        assert(4u64 * i + 3u64 < out_buf.len)             "secure write out[4i+3] in bounds";
+    };
+}
+
+// ─── gen_eq_evals_pass ────────────────────────────────────────────────────────
+// Buffer has 2*cur_size QM31 elements (8*cur_size u32s):
+//   first cur_size elements are filled; kernel fills second cur_size.
+#[kernel]
+fn verify_gen_eq_evals_pass_bounds(buf: span<u32>, cur_size: u64)
+    requires cur_size > 0u64
+    requires 8u64 * cur_size <= buf.len
+{
+    let j: u64 = blockIdx_x * blockDim_x + threadIdx_x;
+    if j < cur_size {
+        let hi: u64 = cur_size + j;
+        assert(4u64 * j + 3u64 < buf.len)    "pass read/write buf[4j+3] in bounds";
+        assert(4u64 * hi + 3u64 < buf.len)   "pass write buf[4*(cur_size+j)+3] in bounds";
+    };
+}
+
+// ─── next_layer_grand_product ─────────────────────────────────────────────────
+#[kernel]
+fn verify_next_layer_grand_product_bounds(in_buf: span<u32>, out_buf: span<u32>, half_n: u64)
+    requires half_n > 0u64
+    requires 8u64 * half_n <= in_buf.len
+    requires 4u64 * half_n <= out_buf.len
+{
+    let i: u64 = blockIdx_x * blockDim_x + threadIdx_x;
+    if i < half_n {
+        assert(8u64 * i + 7u64 < in_buf.len)   "grand_product read in[8i+7] in bounds";
+        assert(4u64 * i + 3u64 < out_buf.len)  "grand_product write out[4i+3] in bounds";
+    };
+}
+
+// ─── next_layer_logup_generic ─────────────────────────────────────────────────
+#[kernel]
+fn verify_next_layer_logup_generic_bounds(
+    in_num: span<u32>, in_den: span<u32>,
+    out_num: span<u32>, out_den: span<u32>, half_n: u64
+)
+    requires half_n > 0u64
+    requires 8u64 * half_n <= in_num.len
+    requires 8u64 * half_n <= in_den.len
+    requires 4u64 * half_n <= out_num.len
+    requires 4u64 * half_n <= out_den.len
+{
+    let i: u64 = blockIdx_x * blockDim_x + threadIdx_x;
+    if i < half_n {
+        assert(8u64 * i + 7u64 < in_num.len)  "logup read in_num[8i+7] in bounds";
+        assert(8u64 * i + 7u64 < in_den.len)  "logup read in_den[8i+7] in bounds";
+        assert(4u64 * i + 3u64 < out_num.len) "logup write out_num[4i+3] in bounds";
+        assert(4u64 * i + 3u64 < out_den.len) "logup write out_den[4i+3] in bounds";
+    };
+}
+
+// ─── next_layer_logup_mult (M31 numerators) ───────────────────────────────────
+#[kernel]
+fn verify_next_layer_logup_mult_bounds(
+    in_num: span<u32>, in_den: span<u32>,
+    out_num: span<u32>, out_den: span<u32>, half_n: u64
+)
+    requires half_n > 0u64
+    requires 2u64 * half_n <= in_num.len
+    requires 8u64 * half_n <= in_den.len
+    requires 4u64 * half_n <= out_num.len
+    requires 4u64 * half_n <= out_den.len
+{
+    let i: u64 = blockIdx_x * blockDim_x + threadIdx_x;
+    if i < half_n {
+        assert(2u64 * i + 1u64 < in_num.len)  "mult read in_num[2i+1] in bounds";
+        assert(8u64 * i + 7u64 < in_den.len)  "mult read in_den[8i+7] in bounds";
+        assert(4u64 * i + 3u64 < out_num.len) "mult write out_num[4i+3] in bounds";
+        assert(4u64 * i + 3u64 < out_den.len) "mult write out_den[4i+3] in bounds";
+    };
+}
+
+// ─── next_layer_logup_singles ─────────────────────────────────────────────────
+#[kernel]
+fn verify_next_layer_logup_singles_bounds(
+    in_den: span<u32>, out_num: span<u32>, out_den: span<u32>, half_n: u64
+)
+    requires half_n > 0u64
+    requires 8u64 * half_n <= in_den.len
+    requires 4u64 * half_n <= out_num.len
+    requires 4u64 * half_n <= out_den.len
+{
+    let i: u64 = blockIdx_x * blockDim_x + threadIdx_x;
+    if i < half_n {
+        assert(8u64 * i + 7u64 < in_den.len)  "singles read in_den[8i+7] in bounds";
+        assert(4u64 * i + 3u64 < out_num.len) "singles write out_num[4i+3] in bounds";
+        assert(4u64 * i + 3u64 < out_den.len) "singles write out_den[4i+3] in bounds";
+    };
+}
+
+// ─── sum_as_poly (all variants) ───────────────────────────────────────────────
+// Each reduction kernel reads:
+//   eq_evals[4i..4i+3] for i < n_terms
+//   layer at offsets 8i, 8i+4, 8*(n_terms+i), 8*(n_terms+i)+4 for GrandProduct
+//   (similarly for LogUp variants with separate num/den)
+// Writes: partial_sums[8*blockIdx..8*blockIdx+7] per block.
+#[kernel]
+fn verify_sum_poly_grand_product_bounds(
+    eq_evals: span<u32>, layer: span<u32>, partial_sums: span<u32>,
+    n_terms: u64, n_blocks: u64
+)
+    requires n_terms > 0u64
+    requires 4u64 * n_terms <= eq_evals.len
+    requires 16u64 * n_terms <= layer.len
+    requires 8u64 * n_blocks <= partial_sums.len
+    requires n_blocks == (n_terms + 255u64) / 256u64
+{
+    let i: u64 = blockIdx_x * 256u64 + threadIdx_x;
+    if i < n_terms {
+        assert(4u64 * i + 3u64 < eq_evals.len)             "eq_evals read in bounds";
+        assert(8u64 * i + 7u64 < layer.len)                "layer first-half read in bounds";
+        assert(8u64 * (n_terms + i) + 7u64 < layer.len)    "layer second-half read in bounds";
+    };
+    if threadIdx_x == 0u64 {
+        assert(8u64 * blockIdx_x + 7u64 < partial_sums.len) "partial_sums write in bounds";
+    };
+}
+
+fn main() -> u64 { 0u64 }

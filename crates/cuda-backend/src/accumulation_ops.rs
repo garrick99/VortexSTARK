@@ -48,17 +48,41 @@ impl AccumulationOps for CudaBackend {
         if cols.is_empty() {
             return None;
         }
-        // CPU fallback for now — download, run CPU logic, upload back.
-        let cpu_cols: Vec<SecureColumnByCoords<stwo::prover::backend::CpuBackend>> =
-            cols.iter().map(|c| c.to_cpu()).collect();
-        let cpu_result = stwo::prover::backend::CpuBackend::lift_and_accumulate(cpu_cols);
-        cpu_result.map(|cpu_col| {
-            // Upload back to GPU
-            SecureColumnByCoords {
-                columns: std::array::from_fn(|i| {
-                    cpu_col.columns[i].iter().copied().collect()
-                }),
+
+        // GPU lift_and_accumulate.
+        // Algorithm (matches stwo CPU impl):
+        //   curr = zeros(2)
+        //   for each col (ascending size):
+        //       log_ratio = col.log_size - curr.log_size
+        //       for i in 0..col.len(): col[i] += curr[src_idx(i, log_ratio)]
+        //       curr = col
+
+        const INITIAL_SIZE: usize = 2;
+        // Build initial curr: 4 channels of zeros(2) = SecureColumnByCoords::zeros(2)
+        let mut curr: SecureColumnByCoords<Self> = SecureColumnByCoords::zeros(INITIAL_SIZE);
+
+        for mut col in cols.into_iter() {
+            let col_n = col.columns[0].len;
+            let curr_n = curr.columns[0].len;
+            assert!(col_n >= INITIAL_SIZE);
+            let log_ratio = (col_n.ilog2() - curr_n.ilog2()) as u32;
+
+            // Process each of the 4 coordinate channels independently
+            for c in 0..4 {
+                unsafe {
+                    ffi::cuda_accumulate_lift(
+                        col.columns[c].buf.as_mut_ptr(),
+                        curr.columns[c].buf.as_ptr(),
+                        col_n as u32,
+                        log_ratio,
+                    );
+                }
             }
-        })
+            unsafe { ffi::cuda_device_sync(); }
+
+            curr = col;
+        }
+
+        Some(curr)
     }
 }

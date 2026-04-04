@@ -64,6 +64,28 @@ See [SOUNDNESS.md](SOUNDNESS.md) for the full constraint-by-constraint analysis.
 - **GPU LogUp interaction**: batch QM31 inverse + parallel prefix sum (16ms at 16.7M steps)
 - **Pinned DMA**: async trace download overlapped with FRI folding at PCIe 5.0 bandwidth
 
+### stwo CudaBackend — zero CPU fallbacks
+
+All stwo proof system operations run GPU-native. No host round-trips inside the hot path:
+
+| Operation | Kernel | Notes |
+|-----------|--------|-------|
+| Circle NTT evaluate/interpolate | `circle_ntt_stwo.cu` | Cached twiddle tree per coset |
+| Merkle leaf hashing (Blake2s) | `merkle_leaves_lifted.cu` | Grouped by log_size, chunked ×16 |
+| Merkle leaf hashing (Poseidon252) | `merkle_poseidon252.cu` | Montgomery-form Fp252 throughout |
+| Blake2s PoW grind | `grind.cu` | 16M nonces/launch, ~1ms/batch |
+| Blake2s M31-output grind | `grind_m31_output.cu` | Applies M31 reduction before trailing-zero check |
+| Poseidon252 PoW grind | `grind_poseidon.cu` | GPU Poseidon permute in Montgomery form |
+| GKR fix_first_variable (M31→QM31) | `gkr.cu` | fold_mle_evals per element |
+| GKR fix_first_variable (QM31→QM31) | `gkr.cu` | fold_mle_evals per element |
+| GKR gen_eq_evals | `gkr.cu` | log_k sequential doubling passes |
+| GKR next_layer (all 4 variants) | `gkr.cu` | Grand product + 3 LogUp variants |
+| GKR sum_as_poly (all 4 variants) | `gkr.cu` | Parallel block reduction + CPU accumulate |
+| lift_and_accumulate | `accumulate_lift.cu` | QM31 per-channel, src_idx = (i>>shift<<1)\|(i&1) |
+| QM31 bit-reverse | `bit_reverse_wide.cu` | Out-of-place, thread i → bit_reverse(i) |
+| pack_leaves_input | `pack_leaves.cu` | 4×N → 64×(N/16) gather transpose |
+| eval_at_point_by_folding | `fri.cu` (existing) | GPU circle+line fold, twiddle cache; CPU for n<1024 |
+
 ## Cairo VM AIR
 
 - **Instruction decoder**: 15 flags, 3 biased offsets, full Cairo encoding

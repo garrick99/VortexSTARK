@@ -1,0 +1,44 @@
+// expected: 0
+// FORGE specification: GPU pack_leaves_input kernel in pack_leaves.cu
+//
+// Properties proven:
+//   - input read: input_cols[coord][in_pos] where coord < 4, in_pos < N
+//   - output write: output_cols[out_col][out_pos] where out_col < 64, out_pos < N/16
+//
+// Index derivations for global thread idx in [0, 4*N):
+//   coord  = idx / N          ∈ [0, 4)
+//   in_pos = idx % N          ∈ [0, N)  →  input read in bounds
+//   out_col = coord*16 + (in_pos % 16) ∈ [0, 64)
+//   out_pos = in_pos / 16     ∈ [0, N/16)  →  output write in bounds
+
+use std::gpu;
+
+#[kernel]
+fn verify_pack_leaves_bounds(
+    input_n: u64,   // N = input column length (multiple of 16)
+    output_n: u64   // = N/16 = output column length
+)
+    requires input_n > 0u64
+    requires input_n % 16u64 == 0u64
+    requires output_n == input_n / 16u64
+{
+    let idx: u64 = blockIdx_x * blockDim_x + threadIdx_x;
+    let total: u64 = 4u64 * input_n;
+    if idx < total {
+        let coord:   u64 = idx / input_n;
+        let in_pos:  u64 = idx % input_n;
+        let out_col: u64 = coord * 16u64 + (in_pos % 16u64);
+        let out_pos: u64 = in_pos / 16u64;
+
+        // coord < 4 (by division of idx < 4*input_n by input_n)
+        assert(coord < 4u64)          "coord in [0,4)";
+        // in_pos < N (mod N)
+        assert(in_pos < input_n)      "in_pos < N";
+        // out_col < 64 = 4*16
+        assert(out_col < 64u64)       "out_col in [0,64)";
+        // out_pos < N/16
+        assert(out_pos < output_n)    "out_pos < N/16";
+    };
+}
+
+fn main() -> u64 { 0u64 }

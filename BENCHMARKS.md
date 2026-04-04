@@ -1,5 +1,89 @@
 # VortexSTARK Benchmark Artifact
 
+## CHECKPOINT: CudaBackend Full-GPU (2026-04-03)
+
+### Commit
+```
+session 30 — all stwo CudaBackend CPU fallbacks eliminated
+```
+
+### What changed
+
+All remaining CPU fallbacks in the stwo `CudaBackend` were replaced with GPU kernels:
+
+| Eliminated fallback | New kernel file |
+|---------------------|----------------|
+| GKR fix_first_variable (M31→QM31, QM31→QM31) | `cuda/gkr.cu` |
+| GKR gen_eq_evals | `cuda/gkr.cu` |
+| GKR next_layer (GrandProduct, LogUpGeneric, LogUpMultiplicities, LogUpSingles) | `cuda/gkr.cu` |
+| GKR sum_as_poly (all 4 variants) | `cuda/gkr.cu` |
+| lift_and_accumulate (QM31 channel-wise) | `cuda/accumulate_lift.cu` |
+| QM31 bit-reverse column | `cuda/bit_reverse_wide.cu` |
+| pack_leaves_input (4×N → 64×(N/16)) | `cuda/pack_leaves.cu` |
+| Blake2s M31-output PoW grind | `cuda/grind_m31_output.cu` |
+| Poseidon252 PoW grind | `cuda/grind_poseidon.cu` |
+| eval_at_point_by_folding (OODS, large polys) | existing `cuda/fri.cu` kernels |
+
+Formal bounds proofs for the new kernels: `cuda/gkr.fg`, `cuda/accumulate_lift.fg`,
+`cuda/bit_reverse_wide.fg`, `cuda/pack_leaves.fg`.
+
+### Hardware / Toolkit
+```
+GPU:          NVIDIA GeForce RTX 5090 (32 GB GDDR7, SM 12.0 Blackwell)
+Driver:       595.79
+CUDA:         13.2
+Rust:         1.94 (stable)
+nvcc flags:   -O3 -gencode arch=compute_89,code=sm_89 -gencode arch=compute_120,code=sm_120
+CPU:          Intel Core Ultra 9 285K (24C/24T)
+RAM:          64 GB DDR5
+OS:           Windows 11
+```
+
+### CudaBackend vs CpuBackend (bench-stwo, 2026-04-03)
+
+All GPU results verified correct (match CPU exactly).
+
+```
+--- Circle NTT (evaluate + interpolate roundtrip) ---
+log_n          CPU (ms)     GPU (ms)    Speedup
+------------------------------------------------
+14                  0.3          0.2       1.5x
+16                  1.4          0.4       4.1x
+18                  7.1          0.4      17.9x
+20                 34.4          0.5      71.5x
+22                202.5          0.5     402.0x
+24                861.9         11.3      76.4x
+
+--- Bit Reverse ---
+size           CPU (ms)     GPU (ms)    Speedup
+------------------------------------------------
+2^16                0.1          0.1       2.6x
+2^18                0.8          7.5       0.1x    ← kernel overhead > work for tiny batches
+2^20                4.8          0.0     153.6x
+2^22               35.7          3.1      11.5x
+2^24              277.4          0.5     543.0x
+
+--- Poseidon252 Merkle: build_leaves (1 col per leaf) ---
+n_leaves           CPU (ms)       GPU (ms)    Speedup
+------------------------------------------------------
+2^16                  515.9            3.4     151.7x
+2^18                 2009.0            8.8     229.2x
+2^20                 8053.4           20.0     403.1x
+2^22                32176.1           69.6     462.2x
+2^24               128915.9          274.8     469.2x
+
+--- Poseidon252 Merkle: build_next_layer ---
+n_parents          CPU (ms)       GPU (ms)    Speedup
+------------------------------------------------------
+2^16                  244.2            1.1     224.9x
+2^18                  963.9            8.2     116.9x
+2^20                 3841.0           10.7     358.8x
+2^22                15229.4           34.8     437.6x
+2^24                61798.7          126.2     489.7x
+```
+
+---
+
 ## CHECKPOINT: Pedersen-37M-Async (2026-03-14)
 
 ### Commit

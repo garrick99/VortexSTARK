@@ -887,3 +887,91 @@ unsafe extern "C" {
         out3: *mut u32,
     );
 }
+
+// ── GKR sum-check GPU kernels ───────────────────────────────────���────────────
+unsafe extern "C" {
+    /// fix_first_variable: BaseField (M31) → SecureField (QM31)
+    /// in: n M31 values (n u32s), out: n/2 QM31 (2n u32s), r_ptr: [4] QM31 on device
+    pub fn cuda_gkr_fix_first_variable_base(
+        inp: *const u32, out: *mut u32, r_ptr: *const u32, n: u32,
+    );
+    /// fix_first_variable: SecureField (QM31) → SecureField (QM31)
+    /// in: n QM31 (4n u32s), out: n/2 QM31 (2n u32s), r_ptr: [4] QM31 on device
+    pub fn cuda_gkr_fix_first_variable_secure(
+        inp: *const u32, out: *mut u32, r_ptr: *const u32, n: u32,
+    );
+    /// gen_eq_evals: initialize buf[0..3] = v (single thread)
+    pub fn cuda_gkr_gen_eq_evals_init(buf: *mut u32, v_ptr: *const u32);
+    /// gen_eq_evals: one doubling pass (cur_size threads)
+    pub fn cuda_gkr_gen_eq_evals_pass(buf: *mut u32, y_i_ptr: *const u32, cur_size: u32);
+    /// next_layer for GrandProduct: out[i] = in[2i]*in[2i+1], n elements → n/2
+    pub fn cuda_gkr_next_layer_grand_product(inp: *const u32, out: *mut u32, n: u32);
+    /// next_layer for LogUpGeneric/Multiplicities (QM31 numerators): n → n/2
+    pub fn cuda_gkr_next_layer_logup_generic(
+        in_num: *const u32, in_den: *const u32,
+        out_num: *mut u32, out_den: *mut u32, n: u32,
+    );
+    /// next_layer for LogUpMultiplicities (M31 numerators): n → n/2
+    pub fn cuda_gkr_next_layer_logup_mult(
+        in_num: *const u32, in_den: *const u32,
+        out_num: *mut u32, out_den: *mut u32, n: u32,
+    );
+    /// next_layer for LogUpSingles: n → n/2
+    pub fn cuda_gkr_next_layer_logup_singles(
+        in_den: *const u32, out_num: *mut u32, out_den: *mut u32, n: u32,
+    );
+    /// sum_as_poly for GrandProduct: writes n_blocks*8 u32s, returns n_blocks
+    pub fn cuda_gkr_sum_poly_grand_product(
+        eq_evals: *const u32, layer: *const u32,
+        partial_sums: *mut u32, n_terms: u32,
+    ) -> u32;
+    /// sum_as_poly for LogUpGeneric/Multiplicities (QM31 numerators)
+    pub fn cuda_gkr_sum_poly_logup_generic(
+        eq_evals: *const u32, in_num: *const u32, in_den: *const u32,
+        lambda_ptr: *const u32, partial_sums: *mut u32, n_terms: u32,
+    ) -> u32;
+    /// sum_as_poly for LogUpMultiplicities (M31 numerators)
+    pub fn cuda_gkr_sum_poly_logup_mult(
+        eq_evals: *const u32, in_num: *const u32, in_den: *const u32,
+        lambda_ptr: *const u32, partial_sums: *mut u32, n_terms: u32,
+    ) -> u32;
+    /// sum_as_poly for LogUpSingles
+    pub fn cuda_gkr_sum_poly_logup_singles(
+        eq_evals: *const u32, in_den: *const u32,
+        lambda_ptr: *const u32, partial_sums: *mut u32, n_terms: u32,
+    ) -> u32;
+}
+
+// ── SecureField bit-reverse, lift_and_accumulate, pack_leaves ────────────────
+unsafe extern "C" {
+    /// Bit-reverse n QM31 elements out-of-place (in→out, both 4n u32s)
+    pub fn cuda_bit_reverse_qm31(inp: *const u32, out: *mut u32, n: u32, log_n: u32);
+    /// In-place lift_and_accumulate pass: col[i] += curr[src_idx(i)] for i < col_n
+    pub fn cuda_accumulate_lift(col: *mut u32, curr: *const u32, col_n: u32, log_ratio: u32);
+    /// Pack 4 M31 input columns (size N) into 64 output columns (size N/16)
+    pub fn cuda_pack_leaves(
+        input_col_ptrs: *const *const u32,
+        output_col_ptrs: *const *mut u32,
+        n: u32,
+    );
+}
+
+// ── PoW grinding variants ─────────────────────────────────────────────────────
+unsafe extern "C" {
+    /// Blake2s grind with M31 reduction applied to output words before trailing-zero check.
+    pub fn cuda_grind_pow_m31_output(
+        prefixed_digest: *const u32,
+        result: *mut u64,
+        pow_bits: u32,
+        batch_offset: u64,
+        n_threads: u32,
+    );
+    /// Poseidon252 PoW grinding. prefixed_digest_mont: [4] u64 in Montgomery form.
+    pub fn cuda_grind_pow_poseidon(
+        prefixed_digest_mont: *const u64,
+        result: *mut u64,
+        pow_bits: u32,
+        batch_offset: u64,
+        n_threads: u32,
+    );
+}

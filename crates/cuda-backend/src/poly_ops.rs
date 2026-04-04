@@ -126,6 +126,38 @@ pub(crate) fn cached_cpu_twiddles(coset: &StwoCoset) -> CpuTwiddlePair {
     result
 }
 
+/// Fold twiddle cache: batch-inverted domain coordinates for GPU fold kernels.
+fn fold_twiddle_cache() -> &'static Mutex<HashMap<(CosetKey, bool), Arc<DeviceBuffer<u32>>>> {
+    static CACHE: OnceLock<Mutex<HashMap<(CosetKey, bool), Arc<DeviceBuffer<u32>>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Get GPU fold twiddles for a VortexSTARK coset (cached).
+/// `extract_y=true` for circle fold (y-coords), `false` for line fold (x-coords).
+fn cached_fold_twiddles_vc(coset: &VortexCoset, extract_y: bool) -> Arc<DeviceBuffer<u32>> {
+    let key = (
+        (coset.initial.x.0, coset.initial.y.0, coset.step.x.0, coset.step.y.0, coset.log_size),
+        extract_y,
+    );
+    {
+        let cache = fold_twiddle_cache().lock().unwrap();
+        if let Some(buf) = cache.get(&key) {
+            return buf.clone();
+        }
+    }
+    let buf = Arc::new(vortexstark::fri::compute_fold_twiddles_on_demand(coset, extract_y));
+    {
+        let mut cache = fold_twiddle_cache().lock().unwrap();
+        cache.entry(key).or_insert(buf.clone());
+    }
+    buf
+}
+
+/// Get GPU fold twiddles for a stwo coset (cached), converting via `convert_coset`.
+fn cached_fold_twiddles(coset: &StwoCoset, extract_y: bool) -> Arc<DeviceBuffer<u32>> {
+    cached_fold_twiddles_vc(&convert_coset(coset), extract_y)
+}
+
 /// Reconstruct a `TwiddleTree<CpuBackend>` from cached CPU twiddle data.
 pub(crate) fn cached_cpu_twiddle_tree(coset: &StwoCoset) -> TwiddleTree<CpuBackend> {
     let pair = cached_cpu_twiddles(coset);
@@ -134,6 +166,54 @@ pub(crate) fn cached_cpu_twiddle_tree(coset: &StwoCoset) -> TwiddleTree<CpuBacke
         twiddles: pair.twiddles.iter().map(|&v| BaseField::from_u32_unchecked(v)).collect(),
         itwiddles: pair.itwiddles.iter().map(|&v| BaseField::from_u32_unchecked(v)).collect(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fold workspace cache
+// ---------------------------------------------------------------------------
+//
+// eval_at_point_by_folding allocates large ping/pong buffers per call.
+// For log_n=28 that's ~5GB of cudaMalloc/cudaFree every call. With 32 FRI
+// queries that's 160GB of allocations — the dominant cost.
+//
+// Solution: cache one workspace per element-count n. The workspace holds
+// two ping-pong buffers (each 4×(n/2) u32s) and a permanent zeros buffer
+// (n u32s). Ping is re-zeroed via cudaMemset at the start of each call
+// (~1ms at 1.79 TB/s). Zeros stays zero permanently.
+
+struct FoldWorkspace {
+    /// Accumulation target for circle fold; alternating source for line folds.
+    ping: [DeviceBuffer<u32>; 4],
+    /// Alternating destination for line folds.
+    pong: [DeviceBuffer<u32>; 4],
+    /// Zero-filled buffer of length n (imaginary QM31 channels for M31 input).
+    zeros: DeviceBuffer<u32>,
+}
+
+fn fold_workspace_cache() -> &'static Mutex<HashMap<usize, Arc<Mutex<FoldWorkspace>>>> {
+    static CACHE: OnceLock<Mutex<HashMap<usize, Arc<Mutex<FoldWorkspace>>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn get_fold_workspace(n: usize) -> Arc<Mutex<FoldWorkspace>> {
+    {
+        let cache = fold_workspace_cache().lock().unwrap();
+        if let Some(ws) = cache.get(&n) {
+            return Arc::clone(ws);
+        }
+    }
+    let half_n = n / 2;
+    let ws = FoldWorkspace {
+        ping:  std::array::from_fn(|_| DeviceBuffer::<u32>::alloc(half_n)),
+        pong:  std::array::from_fn(|_| DeviceBuffer::<u32>::alloc(half_n)),
+        zeros: { let mut b = DeviceBuffer::<u32>::alloc(n); b.zero(); b },
+    };
+    let arc = Arc::new(Mutex::new(ws));
+    {
+        let mut cache = fold_workspace_cache().lock().unwrap();
+        cache.entry(n).or_insert(Arc::clone(&arc));
+    }
+    arc
 }
 
 /// Convert stwo Coset → VortexSTARK Coset.
@@ -284,15 +364,124 @@ impl PolyOps for CudaBackend {
         point: CirclePoint<SecureField>,
         _twiddles: &TwiddleTree<Self>,
     ) -> SecureField {
-        // CPU path — the GPU IFFT + fold per-polynomial has too much per-call overhead
-        // for the hundreds of small polynomials in OODS evaluation.
-        // The real fix is batching all OODS evaluations into one kernel launch.
-        // TODO: GPU batch OODS evaluation.
-        let cpu_evals = CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(
-            evals.domain, evals.values.to_cpu(),
+        use vortexstark::cuda::ffi;
+        use stwo::core::poly::utils::get_folding_alphas;
+
+        let log_size = evals.domain.log_size();
+        let n = evals.values.len();
+
+        // For small polys, CPU is faster (kernel launch overhead dominates).
+        if n < (1 << 10) {
+            let cpu_evals = CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(
+                evals.domain, evals.values.to_cpu(),
+            );
+            let cpu_twiddles = cached_cpu_twiddle_tree(&evals.domain.half_coset);
+            return CpuBackend::eval_at_point_by_folding(&cpu_evals, point, &cpu_twiddles);
+        }
+
+        // Compute folding alphas (log_size values, CPU work O(log_n)).
+        // alphas[log_size-1] = point.y  →  used for circle fold first
+        // alphas[k] = (double_x applied) point.x  →  line folds
+        let mut folding_alphas: Vec<SecureField> = get_folding_alphas(point, log_size as usize);
+
+        let qm31_to_arr = |v: SecureField| -> [u32; 4] {
+            let m = v.to_m31_array();
+            [m[0].0, m[1].0, m[2].0, m[3].0]
+        };
+
+        // ── Workspace ────────────────────────────────────────────────────────
+        // Get (or create) cached ping-pong workspace for this n.
+        // Eliminates O(log_n) large cudaMalloc calls per invocation.
+        let half_n = n / 2;
+        let ws_arc = get_fold_workspace(n);
+        let mut ws = ws_arc.lock().unwrap();
+
+        // Zero ping: fold_circle_into_line_soa accumulates into dst.
+        // cudaMemset at ~1.79 TB/s: ~1ms for log_n=28.
+        for ch in 0..4 { ws.ping[ch].zero(); }
+
+        // ── Step 1: fold_circle_into_line ─────────────────────────────────────
+        let alpha     = folding_alphas.pop().unwrap();  // point.y
+        let alpha_sq  = alpha * alpha;
+        let alpha_u32    = qm31_to_arr(alpha);
+        let alpha_sq_u32 = qm31_to_arr(alpha_sq);
+
+        let d_circle_tw = cached_fold_twiddles(&evals.domain.half_coset, true);
+
+        unsafe {
+            ffi::cuda_fold_circle_into_line_soa(
+                ws.ping[0].as_mut_ptr(), ws.ping[1].as_mut_ptr(),
+                ws.ping[2].as_mut_ptr(), ws.ping[3].as_mut_ptr(),
+                evals.values.buf.as_ptr(),
+                ws.zeros.as_ptr(), ws.zeros.as_ptr(), ws.zeros.as_ptr(),
+                d_circle_tw.as_ptr(),
+                alpha_u32.as_ptr(),
+                alpha_sq_u32.as_ptr(),
+                half_n as u32,
+            );
+            ffi::cuda_device_sync();
+        }
+
+        // ── Steps 2+: fold_line (log_size-1 iterations, ping-pong) ───────────
+        // use_ping: true = current result in ping (src), fold ping→pong next.
+        let mut use_ping = true;
+        let mut cur_log = log_size - 1;
+
+        while cur_log > 0 {
+            let new_n = (1usize << cur_log) / 2;
+            let alpha  = folding_alphas.pop().unwrap();
+            let alpha_u32 = qm31_to_arr(alpha);
+
+            let lc = vortexstark::circle::Coset::half_odds(cur_log);
+            let d_line_tw = cached_fold_twiddles_vc(&lc, false);
+
+            unsafe {
+                if use_ping {
+                    ffi::cuda_fold_line_soa(
+                        ws.ping[0].as_ptr(), ws.ping[1].as_ptr(),
+                        ws.ping[2].as_ptr(), ws.ping[3].as_ptr(),
+                        d_line_tw.as_ptr(),
+                        ws.pong[0].as_mut_ptr(), ws.pong[1].as_mut_ptr(),
+                        ws.pong[2].as_mut_ptr(), ws.pong[3].as_mut_ptr(),
+                        alpha_u32.as_ptr(),
+                        new_n as u32,
+                    );
+                } else {
+                    ffi::cuda_fold_line_soa(
+                        ws.pong[0].as_ptr(), ws.pong[1].as_ptr(),
+                        ws.pong[2].as_ptr(), ws.pong[3].as_ptr(),
+                        d_line_tw.as_ptr(),
+                        ws.ping[0].as_mut_ptr(), ws.ping[1].as_mut_ptr(),
+                        ws.ping[2].as_mut_ptr(), ws.ping[3].as_mut_ptr(),
+                        alpha_u32.as_ptr(),
+                        new_n as u32,
+                    );
+                }
+                ffi::cuda_device_sync();
+            }
+
+            use_ping = !use_ping;
+            cur_log -= 1;
+        }
+
+        // Download 1 QM31 result (16 bytes) from the active buffer.
+        // After the circle fold use_ping=true; each line fold toggles it.
+        // use_ping=true → last write was ping→pong → result in pong (use_ping was false going in).
+        // Wait: if use_ping at loop start, we fold ping→pong, then toggle to false.
+        // After toggle: use_ping=false → result is in pong.
+        // Conversely: if use_ping=true after the loop, last fold was pong→ping → result in ping.
+        let result_ch: Vec<u32> = if use_ping {
+            ws.ping.iter_mut().map(|b| b.to_host()[0]).collect()
+        } else {
+            ws.pong.iter_mut().map(|b| b.to_host()[0]).collect()
+        };
+        let result_raw = SecureField::from_m31_array(
+            std::array::from_fn(|i| BaseField::from_u32_unchecked(result_ch[i]))
         );
-        let cpu_twiddles = cached_cpu_twiddle_tree(&evals.domain.half_coset);
-        CpuBackend::eval_at_point_by_folding(&cpu_evals, point, &cpu_twiddles)
+
+        // Divide by 2^log_size (matches CPU: result / 2^log_size).
+        let two_pow = 1u32 << log_size;
+        result_raw / SecureField::from(BaseField::from_u32_unchecked(two_pow))
     }
 
     fn split_at_mid(
