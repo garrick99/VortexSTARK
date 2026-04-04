@@ -337,6 +337,15 @@ impl ColumnOps<Blake2sHash> for CudaBackend {
 }
 
 // ---- Column<FieldElement252> for Poseidon252 Merkle tree ----
+//
+// Storage format: 4 × u64 Montgomery limbs per element, stored as 8 × u32
+// in little-endian order (matching the GPU kernel's Fp252 layout).
+//
+// Layout per element: [l0_lo, l0_hi, l1_lo, l1_hi, l2_lo, l2_hi, l3_lo, l3_hi]
+// where [l0, l1, l2, l3] = element.into_mont() (arkworks Montgomery representation).
+//
+// This lets GPU kernels read/write Fp252 directly as uint64_t* without any
+// byte-swapping or form conversion.
 
 #[cfg(not(target_arch = "wasm32"))]
 mod poseidon_column {
@@ -348,9 +357,28 @@ mod poseidon_column {
 
     use super::{CudaBackend, CudaColumn, bit_reverse};
 
+    /// Pack FieldElement252 Montgomery limbs into 8 × u32 (LE pairs).
+    fn fe_to_mont_words(e: FieldElement252) -> [u32; 8] {
+        let limbs = e.into_mont();
+        [
+            limbs[0] as u32, (limbs[0] >> 32) as u32,
+            limbs[1] as u32, (limbs[1] >> 32) as u32,
+            limbs[2] as u32, (limbs[2] >> 32) as u32,
+            limbs[3] as u32, (limbs[3] >> 32) as u32,
+        ]
+    }
+
+    /// Reconstruct FieldElement252 from 8 × u32 Montgomery-limb words.
+    fn fe_from_mont_words(words: &[u32]) -> FieldElement252 {
+        let limbs: [u64; 4] = std::array::from_fn(|i| {
+            (words[2 * i] as u64) | ((words[2 * i + 1] as u64) << 32)
+        });
+        FieldElement252::from_mont(limbs)
+    }
+
     impl Column<FieldElement252> for CudaColumn<FieldElement252> {
         fn zeros(len: usize) -> Self {
-            // FieldElement252 is 32 bytes = 8 u32s
+            // Zero Montgomery form = 4 × u64 zeros = 8 × u32 zeros
             let mut buf = DeviceBuffer::<u32>::alloc(len * 8);
             buf.zero();
             Self { buf, len, _marker: std::marker::PhantomData }
@@ -363,43 +391,27 @@ mod poseidon_column {
 
         fn to_cpu(&self) -> Vec<FieldElement252> {
             let host = self.buf.to_host();
-            host.chunks_exact(8).map(|c| {
-                let mut bytes = [0u8; 32];
-                for (i, &word) in c.iter().enumerate() {
-                    bytes[i*4..i*4+4].copy_from_slice(&word.to_le_bytes());
-                }
-                FieldElement252::from_bytes_be(&bytes).unwrap()
-            }).collect()
+            host.chunks_exact(8).map(|c| fe_from_mont_words(c)).collect()
         }
 
         fn len(&self) -> usize { self.len }
 
         fn at(&self, index: usize) -> FieldElement252 {
             assert!(index < self.len);
-            let mut val = [0u32; 8];
+            let mut words = [0u32; 8];
             unsafe {
                 ffi::cudaMemcpy(
-                    val.as_mut_ptr() as *mut c_void,
+                    words.as_mut_ptr() as *mut c_void,
                     (self.buf.as_ptr() as *const u8).add(index * 32) as *const c_void,
                     32, ffi::MEMCPY_D2H,
                 );
             }
-            let mut bytes = [0u8; 32];
-            for (i, &w) in val.iter().enumerate() {
-                bytes[i*4..i*4+4].copy_from_slice(&w.to_le_bytes());
-            }
-            FieldElement252::from_bytes_be(&bytes).unwrap()
+            fe_from_mont_words(&words)
         }
 
         fn set(&mut self, index: usize, value: FieldElement252) {
             assert!(index < self.len);
-            let bytes = value.to_bytes_be();
-            let mut words = [0u32; 8];
-            for i in 0..8 {
-                words[i] = u32::from_le_bytes([
-                    bytes[i*4], bytes[i*4+1], bytes[i*4+2], bytes[i*4+3]
-                ]);
-            }
+            let words = fe_to_mont_words(value);
             unsafe {
                 ffi::cudaMemcpy(
                     (self.buf.as_mut_ptr() as *mut u8).add(index * 32) as *mut c_void,
@@ -425,12 +437,9 @@ mod poseidon_column {
         fn from_iter<I: IntoIterator<Item = FieldElement252>>(iter: I) -> Self {
             let elems: Vec<FieldElement252> = iter.into_iter().collect();
             let len = elems.len();
-            let host: Vec<u32> = elems.iter().flat_map(|e| {
-                let bytes = e.to_bytes_be();
-                (0..8).map(move |i| u32::from_le_bytes([
-                    bytes[i*4], bytes[i*4+1], bytes[i*4+2], bytes[i*4+3]
-                ]))
-            }).collect();
+            let host: Vec<u32> = elems.iter()
+                .flat_map(|&e| fe_to_mont_words(e))
+                .collect();
             let buf = DeviceBuffer::from_host(&host);
             Self { buf, len, _marker: std::marker::PhantomData }
         }

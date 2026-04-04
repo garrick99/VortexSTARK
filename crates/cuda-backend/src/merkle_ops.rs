@@ -181,7 +181,7 @@ impl PackLeavesOps for CudaBackend {
     }
 }
 
-// Poseidon252 MerkleOpsLifted: CPU fallback (Poseidon is not GPU-accelerated yet).
+// Poseidon252 MerkleOpsLifted: GPU-accelerated via merkle_poseidon252.cu
 #[cfg(not(target_arch = "wasm32"))]
 mod poseidon_merkle {
     use stwo::prover::backend::{Col, Column};
@@ -190,28 +190,94 @@ mod poseidon_merkle {
     use stwo::prover::vcs_lifted::ops::MerkleOpsLifted;
     use starknet_ff::FieldElement as FieldElement252;
 
+    use vortexstark::cuda::ffi;
+    use vortexstark::device::DeviceBuffer;
+
     use super::CudaBackend;
+    use super::CudaColumn;
 
     impl MerkleOpsLifted<Poseidon252MerkleHasher> for CudaBackend {
         fn build_leaves(
             columns: &[&Col<Self, BaseField>],
             lifting_log_size: u32,
         ) -> Col<Self, FieldElement252> {
-            // CPU fallback: download, compute, upload.
-            let cpu_columns: Vec<Vec<BaseField>> = columns.iter().map(|c| c.to_cpu()).collect();
-            let cpu_col_refs: Vec<&Vec<BaseField>> = cpu_columns.iter().collect();
-            let cpu_result = <stwo::prover::backend::CpuBackend as MerkleOpsLifted<Poseidon252MerkleHasher>>::build_leaves(
-                &cpu_col_refs, lifting_log_size,
-            );
-            cpu_result.into_iter().collect()
+            let n_leaves = 1u32 << lifting_log_size;
+
+            if columns.is_empty() {
+                let cpu_result = <stwo::prover::backend::CpuBackend as MerkleOpsLifted<Poseidon252MerkleHasher>>::build_leaves(
+                    &[], lifting_log_size,
+                );
+                return cpu_result.into_iter().collect();
+            }
+
+            let n_cols = columns.len();
+
+            // Pack col_ptrs (n_cols × 8 bytes) and col_log_sizes (n_cols × 4 bytes)
+            // into a single device allocation to minimise cudaMalloc calls.
+            //
+            // Layout (all on device):
+            //   [0,          n_cols*8)  → *const u32  pointers  (8-byte aligned)
+            //   [n_cols*8,   n_cols*12) → u32 log_sizes          (4-byte aligned)
+            //
+            // n_cols*8 is always 8-byte-aligned so no padding needed between regions.
+            let meta_bytes = n_cols * 8 + n_cols * 4;
+            let mut host_meta = vec![0u8; meta_bytes];
+            unsafe {
+                // Write pointers into first region
+                let ptr_region = host_meta.as_mut_ptr() as *mut *const u32;
+                for (i, col) in columns.iter().enumerate() {
+                    ptr_region.add(i).write(col.buf.as_ptr());
+                }
+                // Write log_sizes into second region
+                let log_region = host_meta.as_mut_ptr().add(n_cols * 8) as *mut u32;
+                for (i, col) in columns.iter().enumerate() {
+                    log_region.add(i).write(col.len().trailing_zeros());
+                }
+            }
+            let d_meta = DeviceBuffer::<u8>::from_host(&host_meta);
+            let d_col_ptrs_ptr  = d_meta.as_ptr() as *const *const u32;
+            let d_col_log_sizes_ptr = unsafe {
+                (d_meta.as_ptr().add(n_cols * 8)) as *const u32
+            };
+
+            // Output: n_leaves × 4 u64s (Fp252 Montgomery limbs stored as 8 × u32)
+            let mut d_hashes = DeviceBuffer::<u32>::alloc(n_leaves as usize * 8);
+
+            unsafe {
+                ffi::build_leaves_poseidon252(
+                    d_col_ptrs_ptr,
+                    d_col_log_sizes_ptr,
+                    n_cols as u32,
+                    lifting_log_size,
+                    d_hashes.as_mut_ptr() as *mut u64,
+                    n_leaves,
+                );
+                ffi::cuda_device_sync();
+            }
+
+            // d_meta must remain alive until the kernel finishes
+            drop(d_meta);
+
+            CudaColumn::from_device_buffer(d_hashes, n_leaves as usize)
         }
 
         fn build_next_layer(prev_layer: &Col<Self, FieldElement252>) -> Col<Self, FieldElement252> {
-            // CPU fallback: download, compute, upload.
-            let cpu_data: Vec<FieldElement252> = prev_layer.to_cpu();
-            let cpu_col: Vec<FieldElement252> = cpu_data;
-            let cpu_result = <stwo::prover::backend::CpuBackend as MerkleOpsLifted<Poseidon252MerkleHasher>>::build_next_layer(&cpu_col);
-            cpu_result.into_iter().collect()
+            let n = prev_layer.len();
+            assert!(n >= 2 && n % 2 == 0);
+            let n_parents = n / 2;
+
+            let mut d_output = DeviceBuffer::<u32>::alloc(n_parents * 8);
+
+            unsafe {
+                ffi::build_next_layer_poseidon252(
+                    prev_layer.buf.as_ptr() as *const u64,
+                    d_output.as_mut_ptr() as *mut u64,
+                    n_parents as u32,
+                );
+                ffi::cuda_device_sync();
+            }
+
+            CudaColumn::from_device_buffer(d_output, n_parents)
         }
     }
 }

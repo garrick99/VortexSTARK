@@ -10,3 +10,5 @@ vendor/
 proof.bin
 *.ps1
 .claude/
+*.cairo-serde.json
+cuda/gen_poseidon_consts*.py

@@ -1969,6 +1969,7 @@ dependencies = [
  "num-traits",
  "rand 0.8.5",
  "serde",
+ "starknet-crypto",
  "starknet-ff",
  "stwo",
  "stwo-constraint-framework",

@@ -93,6 +93,16 @@ impl StarknetClient {
     /// Create a client for Starknet Sepolia testnet.
     pub fn sepolia() -> Self { Self::new(SEPOLIA_RPC) }
 
+    /// Fetch the raw compiled CASM JSON for a Sierra class hash (unparsed).
+    /// Returns the raw `serde_json::Value` from `starknet_getCompiledCasm`.
+    /// Useful for passing directly to stwo-cairo's `run_and_prove` binary.
+    pub async fn get_compiled_casm_raw(&self, class_hash: &str) -> Result<serde_json::Value, String> {
+        let class_hash = normalize_hex(class_hash);
+        #[derive(Serialize)]
+        struct Params { class_hash: String }
+        self.rpc_call("starknet_getCompiledCasm", Params { class_hash }).await
+    }
+
     /// Fetch compiled CASM for a Sierra class hash.
     /// Uses `starknet_getCompiledCasm` (Starknet v0.13.2+).
     pub async fn get_compiled_casm(&self, class_hash: &str) -> Result<CasmProgram, String> {

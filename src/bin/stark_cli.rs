@@ -2,8 +2,9 @@
 ///
 /// Usage:
 ///   stark_cli prove <log_n> [a] [b] [-o proof.bin]              — Fibonacci STARK
-///   stark_cli prove-file <program.casm> [-o proof.bin]           — prove a CASM/Cairo0 file
-///   stark_cli prove-starknet --class-hash <0x...>                — prove from Starknet RPC
+///   stark_cli prove-file <program.casm> [-o proof.bin]           — prove a CASM/Cairo0 file (M31 AIR)
+///   stark_cli prove-starknet --class-hash <0x...>                — prove from Starknet RPC (M31 AIR)
+///   stark_cli prove-cairo <program.json> [-o proof.json]         — stwo-cairo GPU prover (Starknet-ready)
 ///   stark_cli verify-stwo <proof.json>                           — verify stwo-compatible proof
 ///   stark_cli inspect <program.casm>                             — disassemble a CASM file
 ///   stark_cli fetch-block [--block <id>]                         — fetch Starknet block info
@@ -76,7 +77,7 @@ enum Commands {
         /// Starknet RPC endpoint URL
         #[arg(long, default_value = starknet_rpc::MAINNET_RPC)]
         rpc: String,
-        /// Output proof file (native binary format)
+        /// Output proof file (native binary format, or cairo-serde JSON with --stwo-cairo)
         #[arg(short, long, default_value = "proof.bin")]
         output: String,
         /// Also export stwo-compatible proof as JSON (for stwo verifier ecosystem)
@@ -100,6 +101,53 @@ enum Commands {
         /// Block number for get_block_hash / get_execution_info
         #[arg(long, default_value = "1000")]
         block_number: u64,
+        /// Use the stwo-cairo Starknet-compatible pipeline (outputs cairo-serde proof).
+        /// Fetches CASM via RPC and passes to the stwo-cairo `run_and_prove` prover.
+        /// Requires stwo-cairo binaries to be built in WSL.
+        #[arg(long)]
+        stwo_cairo: bool,
+        /// Hash function for stwo-cairo path: blake2s (default) or poseidon252 (mainnet)
+        #[arg(long, default_value = "blake2s")]
+        hash: String,
+    },
+
+    /// Prove a Cairo program with the Starknet-compatible stwo-cairo GPU pipeline.
+    ///
+    /// Uses the stwo-cairo prover (CudaBackend) via WSL. Outputs a proof in
+    /// `cairo_serde` format (array of field elements) that can be submitted
+    /// directly to the stwo_cairo_verifier contract on Starknet.
+    ///
+    /// Requires the stwo-cairo `run_and_prove` binary to be built first:
+    ///   cd C:/Users/kraken/stwo-cairo/stwo_cairo_prover
+    ///   wsl -- cargo build --release --bin run_and_prove
+    ProveCairo {
+        /// Path to compiled Cairo JSON program (output of `cairo-compile` or `starknet-compile`)
+        program: PathBuf,
+        /// Output proof file (cairo-serde JSON by default — submittable to Starknet)
+        #[arg(short, long, default_value = "proof.cairo-serde.json")]
+        output: PathBuf,
+        /// Proof format: cairo-serde (for Starknet), json (debug), binary (compact)
+        #[arg(long, default_value = "cairo-serde")]
+        format: String,
+        /// Hash function: blake2s (fastest), blake2s_m31, poseidon252 (Starknet mainnet)
+        #[arg(long, default_value = "blake2s")]
+        hash: String,
+        /// Proof-of-work bits (security: pow_bits + log_blowup*n_queries ≥ 96)
+        #[arg(long, default_value = "26")]
+        pow_bits: u32,
+        /// Number of FRI queries (with log_blowup=1: 70 queries → 96-bit security)
+        #[arg(long, default_value = "70")]
+        n_queries: u32,
+        /// Verify the proof after generation (runs Rust verifier)
+        #[arg(long)]
+        verify: bool,
+        /// Path to prover params JSON file (overrides --hash/--pow-bits/--n-queries)
+        #[arg(long)]
+        params: Option<PathBuf>,
+        /// Path to stwo-cairo `run_and_prove` binary (WSL Linux path)
+        /// Default: /mnt/c/Users/kraken/stwo-cairo/stwo_cairo_prover/target/release/run_and_prove
+        #[arg(long)]
+        prover_bin: Option<String>,
     },
 
     /// Verify a stwo-compatible proof JSON (offline verification without GPU)
@@ -154,12 +202,23 @@ fn main() {
         Commands::ProveStarknet {
             class_hash, rpc, output, stwo_output, steps,
             storage, caller, contract_address, entry_point_selector, block_number,
+            stwo_cairo, hash,
         } => {
-            cmd_prove_starknet(
-                &class_hash, &rpc, &output, stwo_output.as_deref(), steps,
-                storage.as_deref(), &caller, &contract_address,
-                &entry_point_selector, block_number,
-            );
+            if stwo_cairo {
+                cmd_prove_starknet_stwo_cairo(
+                    &class_hash, &rpc, &output, &hash, steps, storage.as_deref(),
+                    &caller, &contract_address, &entry_point_selector, block_number,
+                );
+            } else {
+                cmd_prove_starknet(
+                    &class_hash, &rpc, &output, stwo_output.as_deref(), steps,
+                    storage.as_deref(), &caller, &contract_address,
+                    &entry_point_selector, block_number,
+                );
+            }
+        }
+        Commands::ProveCairo { program, output, format, hash, pow_bits, n_queries, verify, params, prover_bin } => {
+            cmd_prove_cairo(&program, &output, &format, &hash, pow_bits, n_queries, verify, params.as_deref(), prover_bin.as_deref());
         }
         Commands::VerifyStwo { proof } => cmd_verify_stwo(&proof),
         Commands::Inspect { program, max } => cmd_inspect(&program, max),
@@ -459,6 +518,244 @@ fn cmd_verify_stwo(proof_path: &PathBuf) {
     } else {
         eprintln!("Proof INVALID");
         std::process::exit(1);
+    }
+}
+
+/// Prove a Starknet contract using the stwo-cairo Starknet-compatible pipeline.
+///
+/// Fetches CASM via RPC, writes to a temp file, then delegates to `cmd_prove_cairo`
+/// which calls `run_and_prove` via WSL. The output is a cairo-serde proof ready for
+/// submission to the `stwo_cairo_verifier` contract on Starknet.
+#[allow(clippy::too_many_arguments)]
+fn cmd_prove_starknet_stwo_cairo(
+    class_hash: &str,
+    rpc_url: &str,
+    output: &str,
+    hash: &str,
+    _max_steps: usize,
+    _storage_json: Option<&str>,
+    _caller: &str,
+    _contract_address: &str,
+    _entry_point_selector: &str,
+    _block_number: u64,
+) {
+    eprintln!("Fetching CASM from Starknet RPC (stwo-cairo path)...");
+    eprintln!("  RPC:        {rpc_url}");
+    eprintln!("  Class hash: {class_hash}");
+
+    let rt = tokio::runtime::Runtime::new().expect("cannot create tokio runtime");
+    // Fetch raw compiled CASM JSON — pass directly to run_and_prove without parsing.
+    let raw_json: serde_json::Value = rt.block_on(async {
+        let client = vortexstark::cairo_air::starknet_rpc::StarknetClient::new(rpc_url);
+        client.get_compiled_casm_raw(class_hash).await
+    }).unwrap_or_else(|e| { eprintln!("ERROR fetching CASM: {e}"); std::process::exit(1); });
+
+    // Write to temp file accessible from WSL
+    let tmp_casm = std::env::temp_dir().join("vortex_starknet_casm.json");
+    std::fs::write(&tmp_casm, serde_json::to_string_pretty(&raw_json).unwrap())
+        .expect("failed to write CASM temp file");
+    eprintln!("  CASM size:  {} bytes", serde_json::to_string(&raw_json).unwrap().len());
+
+    let output_path = PathBuf::from(output);
+    cmd_prove_cairo(
+        &tmp_casm,
+        &output_path,
+        "cairo-serde",
+        hash,
+        26,
+        70,
+        true,   // always verify
+        None,
+        None,
+    );
+}
+
+/// Convert a Windows path to a WSL /mnt/… path.
+///
+/// Handles Windows extended-length paths (\\?\C:\…) and regular paths (C:\…).
+fn win_to_wsl(p: &std::path::Path) -> String {
+    // Prefer canonicalized absolute path; fall back to the raw path.
+    let raw = p.canonicalize()
+        .unwrap_or_else(|_| p.to_path_buf())
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    // Strip Windows extended-length prefix: \\?\ or //./
+    let s = if raw.starts_with("//") {
+        // e.g. "//\?/C:/Users/…" or "//?/C:/Users/…"
+        // Find the drive letter after the prefix
+        if let Some(pos) = raw[2..].find('/') {
+            let after_prefix = &raw[2 + pos + 1..]; // skip "//xxxx/"
+            after_prefix
+        } else {
+            raw.as_str()
+        }
+    } else {
+        raw.as_str()
+    };
+
+    // Now s should look like "C:/Users/…"
+    if s.len() >= 2 && s.as_bytes()[1] == b':' {
+        let drive = s[..1].to_lowercase();
+        format!("/mnt/{}{}", drive, &s[2..])
+    } else if s.starts_with('/') {
+        // Already a Unix path (e.g. relative paths that canonicalize weirdly)
+        s.to_owned()
+    } else {
+        // Fallback: just forward-slash the path
+        format!("/{s}")
+    }
+}
+
+/// Invoke the stwo-cairo `run_and_prove` binary through WSL to produce a
+/// Starknet-compatible Cairo STARK proof.
+///
+/// Security: all arguments are passed as individual WSL args (no shell interpolation).
+#[allow(clippy::too_many_arguments)]
+fn cmd_prove_cairo(
+    program: &PathBuf,
+    output: &PathBuf,
+    format: &str,
+    hash: &str,
+    pow_bits: u32,
+    n_queries: u32,
+    verify: bool,
+    params_file: Option<&std::path::Path>,
+    prover_bin: Option<&str>,
+) {
+    let default_bin =
+        "/mnt/c/Users/kraken/stwo-cairo/stwo_cairo_prover/target/release/run_and_prove";
+    let bin = prover_bin.unwrap_or(default_bin);
+
+    // Build params JSON into a temp file (accessible from both Windows and WSL)
+    let params_wsl_path: String;
+    let _tmp_holder;   // keep NamedTempFile alive until after the subprocess exits
+    let params_arg: String;
+
+    if let Some(pf) = params_file {
+        params_arg = win_to_wsl(pf);
+    } else {
+        let params_json = serde_json::json!({
+            "channel_hash": hash,
+            "channel_salt": 0,
+            "pcs_config": {
+                "pow_bits": pow_bits,
+                "fri_config": {
+                    "log_last_layer_degree_bound": 0,
+                    "log_blowup_factor": 1,
+                    "n_queries": n_queries,
+                    "line_fold_step": 1
+                },
+                "lifting_log_size": null
+            },
+            "preprocessed_trace": "canonical_without_pedersen",
+            "store_polynomials_coefficients": true,
+            "include_all_preprocessed_columns": false
+        });
+        // Write to %TEMP% — accessible as /mnt/c/Users/…/AppData/Local/Temp/… in WSL
+        let tmp_path = std::env::temp_dir().join("vortex_prove_cairo_params.json");
+        std::fs::write(&tmp_path, serde_json::to_string_pretty(&params_json).unwrap())
+            .expect("failed to write params JSON");
+        params_wsl_path = win_to_wsl(&tmp_path);
+        params_arg = params_wsl_path.clone();
+        _tmp_holder = tmp_path;
+    }
+
+    let program_wsl = win_to_wsl(program);
+    // For output, use absolute path; create parent dirs if needed
+    let output_abs = if output.is_absolute() {
+        output.clone()
+    } else {
+        std::env::current_dir().unwrap().join(output)
+    };
+    if let Some(parent) = output_abs.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let output_wsl = win_to_wsl(&output_abs);
+
+    eprintln!("stwo-cairo GPU prover (Starknet-compatible)");
+    eprintln!("  program:    {}", program.display());
+    eprintln!("  output:     {}", output_abs.display());
+    eprintln!("  format:     {format}");
+    eprintln!("  hash:       {hash}");
+    eprintln!("  security:   {}+{}×{}={} bits", pow_bits, 1u32, n_queries, pow_bits + n_queries);
+    eprintln!("  binary:     {bin}");
+
+    let mut args: Vec<&str> = vec![
+        "--program",      &program_wsl,
+        "--proof_path",   &output_wsl,
+        "--proof-format", format,
+        "--params_json",  &params_arg,
+    ];
+    let verify_str;
+    if verify {
+        verify_str = "--verify";
+        args.push(verify_str);
+    }
+
+    // Build a shell command that:
+    //  1. Sources the login profile (CUDA paths, cargo paths)
+    //  2. Invokes run_and_prove with properly single-quoted arguments
+    // Single-quoting all user-supplied paths prevents shell injection.
+    fn shell_quote(s: &str) -> String {
+        // Wrap in single quotes, escaping embedded single quotes as '\''
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+
+    let mut shell_cmd = format!(
+        "export PATH=\"$HOME/.cargo/bin:/usr/local/cuda-13.2/bin:$PATH\" && \
+         export LD_LIBRARY_PATH=\"/usr/local/cuda-13.2/lib64:${{LD_LIBRARY_PATH:-}}\" && \
+         {} --program {} --proof_path {} --proof-format {}",
+        shell_quote(bin),
+        shell_quote(&program_wsl),
+        shell_quote(&output_wsl),
+        shell_quote(format),
+    );
+    shell_cmd.push_str(&format!(" --params_json {}", shell_quote(&params_arg)));
+    if verify {
+        shell_cmd.push_str(" --verify");
+    }
+
+    let t0 = Instant::now();
+    let status = std::process::Command::new("wsl")
+        .args(["-d", "Ubuntu", "--", "bash", "-lc", &shell_cmd])
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            // Report proof file size
+            let proof_size = std::fs::metadata(&output_abs).map(|m| m.len()).unwrap_or(0);
+            eprintln!("\n  total time: {elapsed_ms:.0}ms");
+            eprintln!("  proof size: {} bytes ({:.1} KB)", proof_size, proof_size as f64 / 1024.0);
+            eprintln!("  written to: {}", output_abs.display());
+            if format == "cairo-serde" {
+                let verifier_feature = if hash.starts_with("poseidon") {
+                    "poseidon252_verifier"
+                } else {
+                    "blake2s_verifier"
+                };
+                eprintln!("\n  Proof is in cairo-serde format (Starknet-submittable).");
+                eprintln!("  Verify locally with scarb (requires scarb + stwo_cairo_verifier):");
+                eprintln!("    cd C:/Users/kraken/stwo-cairo/stwo_cairo_verifier");
+                eprintln!("    scarb execute --package stwo_cairo_verifier \\");
+                eprintln!("      --arguments-file {} \\", output_abs.display());
+                eprintln!("      --output standard --target standalone \\");
+                eprintln!("      --features {verifier_feature}");
+            }
+        }
+        Ok(s) => {
+            eprintln!("ERROR: run_and_prove exited with status {s}");
+            eprintln!("Ensure the binary is built:");
+            eprintln!("  wsl -- bash -lc 'cd /mnt/c/Users/kraken/stwo-cairo/stwo_cairo_prover && cargo build --release --bin run_and_prove'");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("ERROR launching WSL: {e}");
+            eprintln!("Ensure WSL2 with Ubuntu is installed and the binary exists at:");
+            eprintln!("  {bin}");
+            std::process::exit(1);
+        }
     }
 }
 

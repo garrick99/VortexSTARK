@@ -767,6 +767,36 @@ unsafe extern "C" {
         n_leaves: u32,
     );
 
+    // ── Poseidon252 GPU Merkle ──────────────────────────────────────────
+
+    /// Build Poseidon252 leaf hashes for a lifted Merkle tree.
+    ///
+    /// - `col_ptrs`: device pointer to array of column device pointers (uint32_t**)
+    /// - `col_log_sizes`: device pointer to array of log2(col_length) per column
+    /// - `n_cols`: number of columns
+    /// - `lifting_log_size`: log2 of output leaf count
+    /// - `output_hashes`: device pointer to [n_leaves * 4] u64s (Fp252 = 4×u64)
+    /// - `n_leaves`: 2^lifting_log_size
+    pub fn build_leaves_poseidon252(
+        col_ptrs: *const *const u32,
+        col_log_sizes: *const u32,
+        n_cols: u32,
+        lifting_log_size: u32,
+        output_hashes: *mut u64,
+        n_leaves: u32,
+    );
+
+    /// Build one level of the Poseidon252 Merkle tree (parent hashes from children).
+    ///
+    /// - `prev_layer`: device pointer to [2*n_parents * 4] u64s
+    /// - `output`: device pointer to [n_parents * 4] u64s
+    /// - `n_parents`: number of parent nodes to compute
+    pub fn build_next_layer_poseidon252(
+        prev_layer: *const u64,
+        output: *mut u64,
+        n_parents: u32,
+    );
+
     // ── Batched gather ──────────────────────────────────────────────────
 
     /// Gather u32 elements: dst[i] = src[idx[i]]

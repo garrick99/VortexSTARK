@@ -14,7 +14,8 @@
 //!
 //! # Current status
 //! Fibonacci STARK: fully proven and verified.
-//! Cairo VM STARK over Stark252: TODO (see cairo_air submodule).
+//! Cairo VM STARK over Stark252: complete — see `cairo_air` and `cairo_proof` submodules.
+//! `prove_cairo` / `verify_cairo` cover execution, memory LogUp, and range-check LogUp.
 
 pub mod field;
 pub mod ntt;

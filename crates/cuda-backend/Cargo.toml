@@ -21,3 +21,4 @@ blake2 = "0.10.6"
 
 [dev-dependencies]
 rand = "0.8.5"
+starknet-crypto = "0.6.2"

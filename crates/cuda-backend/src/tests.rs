@@ -1797,4 +1797,87 @@ mod tests {
         // word3: [sign:1 | abs_off:31], sign=1, abs=1
         assert_eq!(words[2], (1u32 << 31) | 1);
     }
+
+    // ---- Poseidon252 GPU Merkle tests ----
+
+    #[test]
+    fn test_poseidon252_leaf_hash_vs_cpu() {
+        use stwo::core::vcs_lifted::poseidon252_merkle::Poseidon252MerkleHasher;
+        use stwo::prover::backend::CpuBackend;
+        use stwo::prover::vcs_lifted::ops::MerkleOpsLifted;
+        use starknet_ff::FieldElement as FieldElement252;
+
+        init_gpu();
+
+        let n = 8usize;
+        let lifting_log = 3u32;
+
+        let col_data: Vec<Vec<BaseField>> = (0..4).map(|c| {
+            (0..n).map(|r| M31::from((c * 100 + r + 1) as u32)).collect()
+        }).collect();
+
+        // CPU reference
+        let cpu_col_refs: Vec<&Vec<BaseField>> = col_data.iter().collect();
+        let cpu_hashes: Vec<FieldElement252> =
+            <CpuBackend as MerkleOpsLifted<Poseidon252MerkleHasher>>::build_leaves(
+                &cpu_col_refs, lifting_log,
+            );
+
+        // GPU
+        let gpu_cols: Vec<CudaColumn<BaseField>> =
+            col_data.iter().map(|c| c.iter().copied().collect()).collect();
+        let gpu_col_refs: Vec<&CudaColumn<BaseField>> = gpu_cols.iter().collect();
+        let gpu_hashes =
+            <CudaBackend as MerkleOpsLifted<Poseidon252MerkleHasher>>::build_leaves(
+                &gpu_col_refs, lifting_log,
+            );
+        let gpu_result: Vec<FieldElement252> = gpu_hashes.to_cpu();
+
+        assert_eq!(cpu_hashes.len(), gpu_result.len(), "leaf count mismatch");
+        let mut mismatches = 0;
+        for i in 0..cpu_hashes.len() {
+            if cpu_hashes[i] != gpu_result[i] {
+                if mismatches < 3 {
+                    eprintln!("[POSEIDON252_LEAF] mismatch at leaf {i}: CPU={:x} GPU={:x}",
+                        cpu_hashes[i], gpu_result[i]);
+                }
+                mismatches += 1;
+            }
+        }
+        assert_eq!(mismatches, 0, "{mismatches}/{} poseidon252 leaf hashes differ", cpu_hashes.len());
+    }
+
+    #[test]
+    fn test_poseidon252_next_layer_vs_cpu() {
+        use stwo::core::vcs_lifted::poseidon252_merkle::Poseidon252MerkleHasher;
+        use stwo::prover::backend::CpuBackend;
+        use stwo::prover::vcs_lifted::ops::MerkleOpsLifted;
+        use starknet_ff::FieldElement as FieldElement252;
+
+        init_gpu();
+
+        // Use known test vector: poseidon_hash(1, 2) from starknet-crypto
+        let left  = FieldElement252::from(1u32);
+        let right = FieldElement252::from(2u32);
+        let expected = starknet_crypto::poseidon_hash(left, right);
+
+        // Build a layer of 2 leaves, compute 1 parent
+        let leaves: Vec<FieldElement252> = vec![left, right];
+        let cpu_col: Vec<FieldElement252> = leaves.clone();
+        let cpu_parent: Vec<FieldElement252> =
+            <CpuBackend as MerkleOpsLifted<Poseidon252MerkleHasher>>::build_next_layer(&cpu_col);
+
+        assert_eq!(cpu_parent.len(), 1);
+        assert_eq!(cpu_parent[0], expected, "CPU next_layer test vector mismatch");
+
+        // GPU
+        let gpu_layer: CudaColumn<FieldElement252> = leaves.into_iter().collect();
+        let gpu_parent =
+            <CudaBackend as MerkleOpsLifted<Poseidon252MerkleHasher>>::build_next_layer(&gpu_layer);
+        let gpu_result: Vec<FieldElement252> = gpu_parent.to_cpu();
+
+        assert_eq!(gpu_result.len(), 1);
+        assert_eq!(gpu_result[0], expected,
+            "GPU poseidon_hash(1,2): expected {:x}, got {:x}", expected, gpu_result[0]);
+    }
 }
