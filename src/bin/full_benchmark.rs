@@ -28,7 +28,7 @@ fn main() {
         .args(["--query-gpu=power.draw", "--format=csv,noheader"])
         .output();
 
-    // Warmup
+    // Warmup: kernel JIT + CUDA context init
     let _ = vortexstark::prover::prove(M31(1), M31(1), 8);
 
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -36,6 +36,17 @@ fn main() {
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     let max_fib_log_n: u32 = std::env::var("VORTEX_MAX_LOG_N").ok()
         .and_then(|s| s.parse().ok()).unwrap_or(30);
+
+    // Pre-warm the pinned eval buffer to the maximum benchmark size.
+    // cudaMallocHost(4 GB) for log_n=28 (eval domain = 2^30) takes ~8-10 s on
+    // Windows; doing it here (untimed) keeps the per-prove numbers clean.
+    {
+        let t_pw = Instant::now();
+        print!("  [pre-warming eval pool to log_n={max_fib_log_n}] ... ");
+        vortexstark::prover::prewarm_eval_pool(max_fib_log_n);
+        println!("{:.1}s", t_pw.elapsed().as_secs_f64());
+    }
+
     for log_n in [20u32, 24, 28, 29, 30].iter().copied().filter(|&n| n <= max_fib_log_n) {
         let n: u64 = 1 << log_n;
         let t = Instant::now();

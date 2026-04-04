@@ -57,6 +57,27 @@ fn ensure_pool_init() {
     POOL_INIT.call_once(|| ffi::init_memory_pool());
 }
 
+/// Module-level pinned buffer pool shared by prove_lean_fused.
+/// Kept here (not inside the function) so prewarm_eval_pool can pre-size it.
+static EVAL_PINNED_POOL: std::sync::Mutex<Option<crate::device::PinnedBuffer<u32>>> =
+    std::sync::Mutex::new(None);
+
+/// Pre-allocate the pinned eval buffer for the given log_n.
+///
+/// `prove_lean_fused` needs (1 << (log_n + BLOWUP_BITS)) pinned u32s for the
+/// eval download. `cudaMallocHost` for 4 GB (log_n=28) takes ~8–10 s on
+/// Windows; calling this before the timed benchmark loop avoids charging that
+/// cost to the first large prove call.
+pub fn prewarm_eval_pool(log_n: u32) {
+    ensure_pool_init();
+    let eval_size = 1usize << (log_n + BLOWUP_BITS);
+    let mut pool = EVAL_PINNED_POOL.lock().unwrap();
+    match pool.as_mut() {
+        Some(pb) => pb.ensure_capacity(eval_size),
+        None => { *pool = Some(crate::device::PinnedBuffer::<u32>::alloc(eval_size)); }
+    }
+}
+
 /// Blowup factor: evaluation domain is 2^BLOWUP_BITS times the trace domain.
 /// 4x blowup (BLOWUP_BITS=2) gives 2 bits/query × 80 queries = 160-bit security (Model A/C).
 /// FriVerifier compatibility: log_eval_size = log_n + BLOWUP_BITS; column_bound uses
@@ -582,9 +603,8 @@ fn prove_lean_fused(a: M31, b: M31, log_n: u32, timed: bool) -> StarkProof {
 
     let _t_total = Instant::now();
 
-    // Reusable pinned buffer for eval download. First call: 855ms alloc. Subsequent: 0ms.
-    use std::sync::Mutex;
-    static EVAL_PINNED_POOL: Mutex<Option<crate::device::PinnedBuffer<u32>>> = Mutex::new(None);
+    // Reusable pinned buffer for eval download. Pre-warm via prewarm_eval_pool() to
+    // avoid charging cudaMallocHost(4 GB) to the first large timed prove call.
     let t_pa = Instant::now();
     let mut eval_full_pinned = {
         let mut pool = EVAL_PINNED_POOL.lock().unwrap();
