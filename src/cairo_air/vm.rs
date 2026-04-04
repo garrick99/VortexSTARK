@@ -764,6 +764,16 @@ fn execute_step(state: &CairoState, memory: &mut Memory) -> TraceRow {
     }
 }
 
+/// Execute one Cairo step and return the new VM state.
+///
+/// Does not build a trace row — use for pure execution (callee emulation, etc.).
+/// Identical arithmetic to `execute_step` but returns only the register update.
+#[inline(always)]
+pub fn step(state: &CairoState, memory: &mut Memory) -> CairoState {
+    let row = execute_step(state, memory);
+    CairoState { pc: row.next_pc, ap: row.next_ap, fp: row.next_fp }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
