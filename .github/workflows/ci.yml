@@ -26,7 +26,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y curl build-essential pkg-config git
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust nightly
         run: |
           curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | \
@@ -64,7 +64,7 @@ jobs:
     env:
       PATH: /home/runner/.cargo/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Remove vendor config (CI uses crates.io + public stwo-fork)
         run: rm -f .cargo/config.toml
       - name: cargo test --release --lib
